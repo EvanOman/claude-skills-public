@@ -1,0 +1,14 @@
+{
+  "name": "evan-skills",
+  "owner": {
+    "name": "Evan Oman"
+  },
+  "plugins": [
+    {
+      "name": "evan-skills",
+      "source": "./",
+      "description": "Claude Code skills for research, development, and content creation",
+      "version": "1.0.0"
+    }
+  ]
+}
