@@ -31,6 +31,7 @@ Skills are then available as `/evan-skills:skill-name` (e.g., `/evan-skills:slid
 | Pystd | `/evan-skills:pystd` | Apply Python project standards: uv, ruff, ty, just, GitHub Actions CI. Includes pyproject.toml, Justfile, and CI templates. |
 | Tsstd | `/evan-skills:tsstd` | Apply TypeScript project standards: Biome, strict tsc, Vitest, just, GitHub Actions CI. Includes tsconfig.json, biome.json, Justfile, and CI templates. |
 | Bootstrap App | `/evan-skills:bootstrap-app` | Scaffold a FastAPI + Tailwind mobile-first web app with dark mode, async SQLite, and the full Astral toolchain. |
+| Explorable | `/evan-skills:explorable` | Build an interactive pedagogical web app ("explorable") to develop intuition for how a system or algorithm works step-by-step. Intuition-first design workflow, traced-execution animations, cycling defaults, no build step. |
 | Review | `/evan-skills:review` | Code review using a sub-agent with a structured rubric (correctness, security, error handling, quality, testing, docs). |
 | RVM | `/evan-skills:rvm` | Review-Merge workflow: review changes, fix issues, push, and merge in one pass. |
 | Handoff | `/evan-skills:handoff` | Generate a structured handoff note capturing session state, completed work, in-flight tasks, and next steps for a future agent. |
