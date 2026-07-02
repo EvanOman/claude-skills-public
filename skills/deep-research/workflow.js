@@ -19,7 +19,12 @@ export const meta = {
 //   ],
 // }
 
-const { topic, context, outputDir, date, partitions } = args
+// Tolerate args arriving as a JSON-encoded string (caller mistake, but cheap to absorb)
+const input = typeof args === 'string' ? JSON.parse(args) : args
+if (!input || !Array.isArray(input.partitions) || input.partitions.length === 0) {
+  return { error: 'Invalid args: expected { topic, context, outputDir, date, partitions: [...] }. See the header comment in workflow.js.' }
+}
+const { topic, context, outputDir, date, partitions } = input
 
 const REPORT_SCHEMA = {
   type: 'object',
