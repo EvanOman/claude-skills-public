@@ -72,9 +72,13 @@ Common partition patterns (pick the one that fits):
 1. **Case studies / real-world examples** -- ground the research in what others have actually done
 2. **Alternative perspectives / contrarian views** -- challenge the default framing with 8-12 different lenses on the problem
 
-### Recency discipline (fast-moving domains)
+### Recency discipline (scope it to the domain)
 
-For topics where the ground shifts yearly (AI tooling, models, frameworks): put a **hard, dated recency constraint in the `context` arg** that every agent inherits -- "cite only sources published in <current year>; tools without meaningful updates this year are irrelevant" -- not a soft preference. And do not name older tools or papers as examples in partition questions except to exclude them: **named examples in prompts become citations in output**.
+Match the source-age policy to how fast the topic moves; state it explicitly in the `context` arg either way.
+
+- **Fast-moving domains (AI tooling, models, frameworks, current tech practice):** put a **hard, dated recency constraint in the `context` arg** that every agent inherits -- "cite only sources published in <current year>; tools without meaningful updates this year are irrelevant" -- not a soft preference. And do not name older tools or papers as examples in partition questions except to exclude them: **named examples in prompts become citations in output**.
+- **Historical or stable domains (history, mathematics, settled science, biography):** recency does not apply and can actively hurt -- older scholarship, primary sources, and period documents are often the best evidence. Constrain for source *quality and authority* instead (primary over secondary, scholarly over pop).
+- **Mixed topics** (e.g., "the history of X up to its current state"): split the recency rule per partition -- historical partitions get the quality constraint, current-state partitions get the dated recency constraint.
 
 ### File layout
 
