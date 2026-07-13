@@ -22,7 +22,7 @@ By default the tools are **symlinked** into `~/.claude/bin/`, so a `git pull` of
 
 ### Recommended: keep the index fresh automatically
 
-Add an async `Stop` hook to `~/.claude/settings.json` so the index updates in the background after every Claude Code turn (cc-index is incremental, so this only touches changed sessions; `flock -n` skips the run if another session is already indexing):
+Add an async `Stop` hook to `~/.claude/settings.json` so the index refreshes in the background while you work — at most once per hour (the guard skips the run when the index is under 60 minutes old, and `flock -n` skips it if another session is already indexing). Event-driven beats a cron/systemd timer here: it costs nothing when no sessions are active, and stays at most an hour stale while you're working.
 
 ```json
 {
@@ -30,7 +30,7 @@ Add an async `Stop` hook to `~/.claude/settings.json` so the index updates in th
     "Stop": [{
       "hooks": [{
         "type": "command",
-        "command": "flock -n \"$HOME/.claude/usage-data/cc-index.lock\" \"$HOME/.claude/bin/cc-index\" >/dev/null 2>&1 || true",
+        "command": "f=\"$HOME/.claude/usage-data/sessions.db\"; { [ ! -f \"$f\" ] || [ -n \"$(find \"$f\" -mmin +60)\" ]; } && flock -n \"$HOME/.claude/usage-data/cc-index.lock\" \"$HOME/.claude/bin/cc-index\" >/dev/null 2>&1 || true",
         "timeout": 120,
         "async": true
       }]
@@ -38,6 +38,8 @@ Add an async `Stop` hook to `~/.claude/settings.json` so the index updates in th
   }
 }
 ```
+
+cc-index is cheap (incremental by mtime — a typical run is well under a second), so if you'd rather have a truly live index, drop the `find`-based staleness guard and let it run on every turn.
 
 ### Recommended: retain transcripts longer
 
