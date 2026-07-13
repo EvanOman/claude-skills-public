@@ -28,6 +28,67 @@ CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 DB_PATH = CLAUDE_DIR / "usage-data" / "sessions.db"
 
+# Cap each individual message's contribution to all_prompts so pasted walls of
+# text can't dominate the index.
+MAX_MSG_CHARS = 2000
+
+# FTS schema: first_prompt + concatenated all_prompts, porter-stemmed.
+FTS_CREATE_SQL = """
+    CREATE VIRTUAL TABLE sessions_fts USING fts5(
+        session_id UNINDEXED,
+        first_prompt,
+        all_prompts,
+        tokenize='porter unicode61'
+    )
+"""
+
+# Strip slash-command XML wrappers but keep their inner text (the command name,
+# message, and args are all user-authored and worth indexing).
+_COMMAND_TAG_RE = re.compile(
+    r"</?(?:command-name|command-message|command-args|command-contents|local-command-stdout)>"
+)
+# System-reminder blocks are harness-injected, not user-authored — drop them whole.
+_SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+
+def extract_user_text(entry):
+    """Return user-authored text from a 'user' transcript entry for indexing.
+
+    Excludes tool_result and other non-text content blocks, drops
+    <system-reminder> blocks, and strips slash-command XML tags (keeping
+    their inner content). Returns '' when the message has no user text.
+    """
+    msg = entry.get("message", {})
+    content = msg.get("content", "")
+    parts = []
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for c in content:
+            # Only real text blocks count; tool_result / images / etc. are skipped.
+            if isinstance(c, dict) and c.get("type") == "text":
+                parts.append(c.get("text", ""))
+    text = " ".join(p for p in parts if p)
+    text = _SYSTEM_REMINDER_RE.sub(" ", text)
+    text = _COMMAND_TAG_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
+def verify_fts5():
+    """Ensure this python3's sqlite3 has FTS5 with the porter tokenizer."""
+    try:
+        test = sqlite3.connect(":memory:")
+        test.execute(
+            "CREATE VIRTUAL TABLE _fts_probe USING fts5(x, tokenize='porter unicode61')"
+        )
+        test.close()
+    except sqlite3.OperationalError as e:
+        sys.exit(
+            "ERROR: This python3's sqlite3 module lacks FTS5 with the porter "
+            f"tokenizer, which cc-index requires ({e}). Install a python3 built "
+            "against a full SQLite (FTS5 enabled)."
+        )
+
 # Map file path patterns to category tags
 PATH_CATEGORIES = [
     ("Job Search", "job-search"),
@@ -101,6 +162,7 @@ def extract_session_metadata(jsonl_path):
     skills = set()
     file_paths = set()
     first_prompt = ""
+    all_prompt_parts = []
     project_path = ""
     git_branch = ""
     msg_count = 0
@@ -140,6 +202,12 @@ def extract_session_metadata(jsonl_path):
                             if isinstance(c, dict) and c.get("type") == "text"
                         )
                     first_prompt = content[:300]
+
+                # Accumulate all user-authored text (in order) for full-text search
+                if entry.get("type") == "user" and not entry.get("isSidechain"):
+                    user_text = extract_user_text(entry)
+                    if user_text:
+                        all_prompt_parts.append(user_text[:MAX_MSG_CHARS])
 
                 # Extract skill invocations from user messages
                 if entry.get("type") == "user":
@@ -201,6 +269,7 @@ def extract_session_metadata(jsonl_path):
         "filePaths": sorted(file_paths),
         "tags": sorted(tags),
         "firstPrompt": first_prompt,
+        "allPrompts": " ".join(all_prompt_parts),
         "projectPath": project_path,
         "gitBranch": git_branch,
         "messageCount": msg_count,
@@ -209,7 +278,12 @@ def extract_session_metadata(jsonl_path):
 
 
 def init_db(db_path):
-    """Create the database and tables if they don't exist."""
+    """Create the database and tables if they don't exist.
+
+    Returns (conn, migrated). ``migrated`` is True when an older-schema DB was
+    upgraded in place (missing all_prompts column / old FTS table), signalling
+    that a full re-index is needed to populate the new columns.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
@@ -222,6 +296,7 @@ def init_db(db_path):
             project_dir TEXT,
             git_branch TEXT,
             first_prompt TEXT,
+            all_prompts TEXT,
             message_count INTEGER,
             timestamp TEXT,
             mtime REAL,
@@ -253,28 +328,36 @@ def init_db(db_path):
         CREATE INDEX IF NOT EXISTS idx_session_files_path ON session_files(file_path);
     """)
 
-    # Create standalone FTS table if it doesn't exist
-    cursor = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions_fts'"
-    )
-    if not cursor.fetchone():
-        conn.execute("""
-            CREATE VIRTUAL TABLE sessions_fts USING fts5(
-                session_id UNINDEXED,
-                first_prompt
-            )
-        """)
+    migrated = False
+
+    # Migrate an old sessions table that predates the all_prompts column.
+    existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)")]
+    if "all_prompts" not in existing_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN all_prompts TEXT")
+        migrated = True
+
+    # Create the FTS table, or migrate an old one (missing all_prompts / porter
+    # tokenizer) by dropping and rebuilding it.
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions_fts'"
+    ).fetchone()
+    if row is None:
+        conn.execute(FTS_CREATE_SQL)
+    elif "all_prompts" not in (row[0] or ""):
+        conn.execute("DROP TABLE sessions_fts")
+        conn.execute(FTS_CREATE_SQL)
+        migrated = True
 
     conn.commit()
-    return conn
+    return conn, migrated
 
 
 def rebuild_fts(conn):
     """Rebuild the FTS index from the sessions table."""
     conn.execute("DELETE FROM sessions_fts")
     conn.execute("""
-        INSERT INTO sessions_fts(session_id, first_prompt)
-        SELECT session_id, first_prompt FROM sessions
+        INSERT INTO sessions_fts(session_id, first_prompt, all_prompts)
+        SELECT session_id, first_prompt, all_prompts FROM sessions
     """)
     conn.commit()
 
@@ -291,14 +374,15 @@ def upsert_session(conn, sid, metadata, mtime, project_dir, jsonl_path):
     conn.execute("""
         INSERT OR REPLACE INTO sessions
             (session_id, project_path, project_dir, git_branch, first_prompt,
-             message_count, timestamp, mtime, jsonl_path)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             all_prompts, message_count, timestamp, mtime, jsonl_path)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         sid,
         metadata["projectPath"],
         project_dir,
         metadata["gitBranch"],
         metadata["firstPrompt"],
+        metadata["allPrompts"],
         metadata["messageCount"],
         metadata["timestamp"],
         mtime,
@@ -373,12 +457,18 @@ def main():
         conn.close()
         return
 
+    # Fail fast if FTS5 with the porter tokenizer isn't available.
+    verify_fts5()
+
     # Initialize DB (drop and recreate if --full)
     if args.full and DB_PATH.exists():
         DB_PATH.unlink()
 
-    conn = init_db(DB_PATH)
-    existing_mtimes = get_existing_mtimes(conn) if not args.full else {}
+    conn, migrated = init_db(DB_PATH)
+    if migrated:
+        print("  Detected old schema; migrated and re-indexing all sessions...")
+    # A migrated DB has NULL all_prompts on old rows, so force a full re-extraction.
+    existing_mtimes = get_existing_mtimes(conn) if (not args.full and not migrated) else {}
 
     # Scan all session files
     new_count = 0

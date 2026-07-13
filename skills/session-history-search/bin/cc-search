@@ -25,6 +25,63 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 DB_PATH = CLAUDE_DIR / "usage-data" / "sessions.db"
 HOME_PREFIX = str(Path.home()) + "/"
 
+# Invisible sentinels wrap matched terms in FTS5 snippets so we can (a) detect
+# which column matched and (b) swap them for visible highlight markers.
+_SNIP_START = "\x02"
+_SNIP_END = "\x03"
+_HL_START = "‹"  # ‹
+_HL_END = "›"    # ›
+
+
+def build_fts_query(keyword):
+    """Turn a raw user keyword string into a safe FTS5 MATCH expression.
+
+    Semantics:
+    - Space-separated barewords imply AND (FTS5's default for adjacent terms).
+    - A double-quoted span in the user's input is preserved as an FTS5 phrase.
+    - Every term is individually double-quoted so FTS5 operator syntax
+      (AND/OR/NOT/NEAR, ``*``, ``^``, ``-``, ``:``, parens) in user input is
+      treated as literal text and can never raise an FTS syntax error.
+
+    Returns '' when the input has no indexable tokens (caller should skip FTS).
+    """
+    tokens = []  # list of (is_phrase, text)
+    i, n = 0, len(keyword)
+    while i < n:
+        ch = keyword[i]
+        if ch == '"':
+            close = keyword.find('"', i + 1)
+            if close == -1:
+                # Unterminated quote: treat the remainder as loose barewords.
+                for w in keyword[i + 1:].split():
+                    tokens.append((False, w))
+                break
+            phrase = keyword[i + 1:close].strip()
+            if phrase:
+                tokens.append((True, phrase))
+            i = close + 1
+        elif ch.isspace():
+            i += 1
+        else:
+            j = i
+            while j < n and not keyword[j].isspace() and keyword[j] != '"':
+                j += 1
+            tokens.append((False, keyword[i:j]))
+            i = j
+
+    parts = []
+    for is_phrase, text in tokens:
+        # Strip embedded quotes (they'd break the wrapping phrase quotes).
+        safe = text.replace('"', " ")
+        # Drop tokens with no word characters (e.g. a lone '*' or '-') so they
+        # can't produce an empty FTS phrase / syntax error.
+        if not re.search(r"\w", safe):
+            continue
+        if is_phrase:
+            safe = " ".join(safe.split())
+        parts.append(f'"{safe}"')
+    return " ".join(parts)
+
 
 def get_db():
     """Get a SQLite connection if the database exists."""
@@ -41,18 +98,18 @@ def search_fts(keyword, project_filter=None, since=None, limit=30):
     if conn is None:
         return []
 
+    # Turn the raw keyword into a safe FTS5 expression. If nothing indexable
+    # survives sanitization, there's nothing to match.
+    fts_param = build_fts_query(keyword)
+    if not fts_param.strip():
+        conn.close()
+        return []
+
     results = []
     try:
-        # Build the query with optional filters
+        # Optional non-FTS filters.
         conditions = []
         params = []
-
-        # FTS match
-        # Escape special FTS characters and use prefix matching
-        safe_keyword = keyword.replace('"', '""')
-        fts_condition = 'sessions_fts MATCH ?'
-        # Use prefix search for partial word matching
-        fts_param = f'"{safe_keyword}"'
 
         if project_filter:
             conditions.append("s.project_path LIKE ?")
@@ -66,16 +123,26 @@ def search_fts(keyword, project_filter=None, since=None, limit=30):
         if conditions:
             extra_where = " AND " + " AND ".join(conditions)
 
+        # bm25 weights: session_id (unindexed) 0, first_prompt 3x, all_prompts 1x.
+        # snippet() excerpts each searchable column; sentinels mark the hits.
         query = f"""
             SELECT s.session_id, s.project_path, s.project_dir, s.git_branch,
-                   s.first_prompt, s.message_count, s.mtime
+                   s.first_prompt, s.message_count, s.mtime,
+                   snippet(sessions_fts, 1, ?, ?, ?, 12) AS snip_first,
+                   snippet(sessions_fts, 2, ?, ?, ?, 12) AS snip_all
             FROM sessions_fts fts
             JOIN sessions s ON s.session_id = fts.session_id
-            WHERE {fts_condition}{extra_where}
-            ORDER BY s.mtime DESC
+            WHERE sessions_fts MATCH ?{extra_where}
+            ORDER BY bm25(sessions_fts, 0, 3.0, 1.0)
             LIMIT ?
         """
-        all_params = [fts_param] + params + [limit]
+        ell = "…"
+        all_params = (
+            [_SNIP_START, _SNIP_END, ell, _SNIP_START, _SNIP_END, ell]
+            + [fts_param]
+            + params
+            + [limit]
+        )
 
         cursor = conn.execute(query, all_params)
         for row in cursor:
@@ -84,17 +151,28 @@ def search_fts(keyword, project_filter=None, since=None, limit=30):
             if not project:
                 project = str(row["project_dir"] or "").replace("-", "/")
 
+            # Prefer the first_prompt snippet when it actually matched; otherwise
+            # fall back to the all_prompts (session body) snippet.
+            snip_first = row["snip_first"] or ""
+            snip_all = row["snip_all"] or ""
+            excerpt = snip_first if _SNIP_START in snip_first else snip_all
+            if _SNIP_START not in excerpt:
+                # Neither snippet flagged a hit (rare); show whatever we have.
+                excerpt = snip_first or snip_all
+            excerpt = excerpt.replace(_SNIP_START, _HL_START).replace(_SNIP_END, _HL_END)
+            excerpt = " ".join(excerpt.split())
+
             results.append({
                 "sessionId": row["session_id"],
                 "project": project,
                 "firstPrompt": row["first_prompt"] or "",
+                "excerpt": excerpt,
                 "messageCount": row["message_count"] or 0,
                 "gitBranch": row["git_branch"] or "",
                 "dt": dt,
             })
-    except sqlite3.OperationalError as e:
-        # FTS might not be populated or keyword syntax might fail
-        # Fall back silently
+    except sqlite3.OperationalError:
+        # FTS might not be populated (old/empty index) — fall back silently.
         pass
     finally:
         conn.close()
@@ -311,6 +389,8 @@ def main():
     parser.add_argument("--sessions", "-s", action="store_true", help="Also search session summaries")
     parser.add_argument("--full", "-f", action="store_true", help="Search full transcripts (slower)")
     parser.add_argument("--recent", "-r", type=int, help="Show N most recent prompts")
+    parser.add_argument("--literal", "-l", action="store_true",
+                        help="Bypass FTS; substring scan over history.jsonl")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     args = parser.parse_args()
 
@@ -343,8 +423,12 @@ def main():
                 print()
         return
 
-    # FTS search (fast, searches first prompts in indexed sessions)
-    fts_results = search_fts(args.keyword, project_filter=args.project, since=since)
+    # FTS search (fast, searches all user prompts in indexed sessions).
+    # --literal bypasses FTS entirely and relies on the history.jsonl substring
+    # scan below.
+    fts_results = []
+    if not args.literal:
+        fts_results = search_fts(args.keyword, project_filter=args.project, since=since)
     if fts_results:
         print(f"\n── Indexed Sessions ({len(fts_results)} matches) ──\n")
         for r in fts_results:
@@ -353,10 +437,10 @@ def main():
             project = r["project"]
             msgs = r["messageCount"]
             branch = f" ({r['gitBranch']})" if r["gitBranch"] else ""
-            prompt = r["firstPrompt"][:120]
+            excerpt = (r["excerpt"] or r["firstPrompt"])[:160]
             print(f"  {time_str:>12}  [{sid}]  {project}{branch}  ({msgs} msgs)")
-            if prompt:
-                print(f"               {prompt}")
+            if excerpt:
+                print(f"               {excerpt}")
             print()
 
     # History keyword search

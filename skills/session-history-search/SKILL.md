@@ -14,10 +14,11 @@ Search and review past Claude Code sessions. Four CLI tools are installed to `~/
 Run the setup script to install the CLI tools:
 
 ```bash
-bash "$(dirname "$0")/setup.sh"
+bash "$(dirname "$0")/setup.sh"           # symlinks bin/* into ~/.claude/bin (default)
+bash "$(dirname "$0")/setup.sh" --copy    # copies instead of symlinking
 ```
 
-Or manually copy the scripts from this skill's `bin/` directory to `~/.claude/bin/` and make them executable.
+By default the tools are **symlinked** into `~/.claude/bin/`, so a `git pull` of this repo updates them with no re-install. Use `--copy` if you don't keep the repo checked out (a standalone copy that won't track upstream fixes). Either way, make sure `~/.claude/bin` is on your `PATH`.
 
 ## Tools
 
@@ -35,24 +36,37 @@ cc-sessions --project-summary      # Group by project with session counts and to
 cc-sessions --json                 # Machine-readable output
 ```
 
-### `cc-index` — Build/update the session tag index
+### `cc-index` — Build/update the search + tag index
 ```bash
 cc-index                           # Index new/changed sessions (incremental)
-cc-index --full                    # Re-index everything from scratch
+cc-index --full                    # Rebuild the whole index from scratch
 cc-index --stats                   # Show tag and skill distribution
 ```
 
-Tags are derived automatically from file paths touched and skills invoked — no manual tagging needed. Run `cc-index` periodically to keep the index current.
+`cc-index` builds two things: the derived tag/skill index (tags come automatically from file paths touched and skills invoked — no manual tagging) and the full-text search index that `cc-search` queries. The search index covers **every user prompt in every session**, not just the first.
 
-### `cc-search` — Search by keyword
+Run `cc-index` periodically (or before a search) to pick up new sessions. Run `cc-index --full` after upgrading the tools, since a schema or tokenizer change means the old index needs a clean rebuild.
+
+### `cc-search` — Full-text search across all prompts
 ```bash
-cc-search "kubernetes"             # Search all prompts for keyword
-cc-search "deploy" --project inbox # Filter by project
+cc-search "Oman family tree"       # Stemmed AND across terms (all three, any order, anywhere)
+cc-search '"family tree" Henry'    # Exact phrase "family tree" AND term Henry
+cc-search "deploy" --project inbox # Filter by project (substring match on project name)
 cc-search "bug" --days 7           # Last 7 days only
 cc-search "MCP" --sessions         # Also search session summaries (from sessions-index)
-cc-search "error" --full           # Search full transcripts (slower, finds matches in assistant responses too)
+cc-search "error" --full           # Also search full transcripts (slower; matches assistant responses too)
+cc-search "https://..." --literal  # Legacy substring scan over history.jsonl (exact-string / URL matches)
 cc-search --recent 20              # Show 20 most recent prompts (no keyword needed)
 ```
+
+**Search semantics** (default, FTS-backed):
+
+- **Bareword terms are stemmed tokens combined with implicit AND.** `cc-search "Oman family tree"` matches sessions whose prompts contain all three terms, in any order, anywhere in any user prompt. Stemming means `families` matches `family`, `deploying` matches `deploy`, etc. (SQLite FTS5, porter stemmer, unicode61 tokenizer.)
+- **Double-quote a phrase inside the query for an exact phrase match.** `cc-search '"family tree" Henry'` requires the contiguous phrase `family tree` and, separately, the term `Henry`.
+- **Results are BM25-ranked.** Matches in a session's **first prompt are weighted 3x** over matches elsewhere in the session, so the sessions a topic was actually *about* rank above sessions that merely mention it in passing. Each hit shows a `snippet()` excerpt of the matching text.
+- **Matching is token-based, not substring.** Searching `oman` will **not** match `evanoman.com` — that's a single different token. When you need a raw substring (URLs, IDs, file paths, code fragments), use `--literal`, which scans `~/.claude/history.jsonl` directly for the exact string.
+
+All flags compose with the search: `--project`, `--days`, `--sessions`, `--full`, `--recent`, and `--literal`.
 
 ### `cc-transcript` — Read a session transcript
 ```bash
@@ -74,17 +88,18 @@ Parse `$ARGUMENTS` to determine what the user wants:
 3. Summarize: what projects were touched, what was accomplished, how much effort (message counts, durations)
 
 ### "Find the session where I [did X / discussed Y / fixed Z]"
-1. Run `cc-search "keyword" --sessions` to find matching sessions
-2. If no matches, try `cc-search "keyword" --full` for deeper search
-3. Present matches with session IDs and context
-4. Offer to show the full transcript with `cc-transcript <id>`
+1. Run `cc-search "term1 term2 term3"` with a few distinctive words from the request — they AND together and stem, so extra words narrow the results rather than breaking them. Top hits are the sessions the topic was central to (first-prompt matches rank 3x).
+2. If nothing lands, loosen (drop a term) or add `--sessions` to also match session summaries; use `--full` to reach into assistant responses.
+3. For an exact string that got tokenized apart (a URL, an ID, `evanoman.com`), use `--literal`.
+4. Present matches with session IDs and their snippet excerpts.
+5. Offer to show the full transcript with `cc-transcript <id>`.
 
 ### "Show me recent sessions [for project X]"
 1. Run `cc-sessions --count 20` or `cc-sessions --project X --count 20`
 2. Present as a clean list
 
 ### "What was the context of [that conversation about X]?"
-1. Search for it: `cc-search "X" --sessions --full`
+1. Search for it: `cc-search "X" --sessions --full` (add distinctive terms; they AND together)
 2. Once found, read the transcript: `cc-transcript <id> --summary` first, then `--tail 20` for recent context
 3. Summarize the conversation's arc: what was asked, what was done, what was the outcome
 
@@ -103,12 +118,16 @@ The tools query these automatically, but for manual exploration:
 
 | Source | Path | What's in it |
 |--------|------|-------------|
-| History | `~/.claude/history.jsonl` | Every user prompt with timestamp, project, session ID |
-| Session transcripts | `~/.claude/projects/<project>/<uuid>.jsonl` | Full conversation logs |
-| Session index | `~/.claude/projects/<project>/sessions-index.json` | Summaries, message counts (may be stale) |
+| History | `~/.claude/history.jsonl` | Every user prompt with timestamp, project, session ID. Backing store for `cc-search --literal`. |
+| Session transcripts | `~/.claude/projects/<project>/<uuid>.jsonl` | Full conversation logs (read by `cc-transcript`; searched with `cc-search --full`) |
+| Session index | `~/.claude/projects/<project>/sessions-index.json` | Per-session summaries, message counts (may be stale) |
+| Usage database | `~/.claude/usage-data/sessions.db` | Durations, token counts, tool usage — the richer metadata behind `cc-sessions --long` |
+| Session memory | `~/.claude/projects/<project>/memory/` | Persisted per-project auto-memory notes |
 
 ## Tips
 
+- If a search comes up empty for something recent, run `cc-index` first — the search index only covers sessions that have been indexed.
+- Search is token-based and stemmed. Prefer a couple of distinctive words (they AND together) over one long phrase, and reach for `--literal` when you need an exact substring like a URL or ID.
 - Session IDs are UUIDs. You only need the first 8 characters for prefix matching.
 - `cc-transcript` outputs to stdout — pipe to `less` or redirect to a file for long sessions.
 - The `--long` flag on `cc-sessions` pulls from usage-data which has richer metadata than sessions-index.
