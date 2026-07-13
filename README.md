@@ -43,6 +43,7 @@ Skills are then available as `/evan-skills:skill-name` (e.g., `/evan-skills:slid
 | Skill | Command | Description |
 |-------|---------|-------------|
 | Add Skill | `/evan-skills:add-skill` | Meta-skill for creating new Claude Code skills. Guides you through structure, frontmatter, and design principles. |
+| Graduate Skill | `/evan-skills:graduate-skill` | Graduate a private local skill into this repo: scrub for secrets/personal paths, move, symlink back so the repo is the source of truth, update README, commit and push. |
 | Design Polish | `/evan-skills:design-polish` | Polish frontend design with distinctive aesthetics. Asks for a style vibe (Refined, Bold, Warm, Technical) then applies a complete design system. |
 
 ## Not Included: Deployment Pipeline Skills
