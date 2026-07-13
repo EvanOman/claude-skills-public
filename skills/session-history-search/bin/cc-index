@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""Build a searchable SQLite index of Claude Code sessions with derived tags.
+
+Scans session transcripts to extract:
+- Skills/commands invoked
+- File paths touched (Read/Write/Edit)
+- Derived category tags based on file path patterns
+
+Writes index to ~/.claude/usage-data/sessions.db
+
+Usage:
+  cc-index                # Index new/changed sessions (incremental)
+  cc-index --full         # Re-index everything
+  cc-index --stats        # Show tag/skill distribution
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+CLAUDE_DIR = Path.home() / ".claude"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+DB_PATH = CLAUDE_DIR / "usage-data" / "sessions.db"
+
+# Map file path patterns to category tags
+PATH_CATEGORIES = [
+    ("Job Search", "job-search"),
+    ("job-research", "job-search"),
+    ("job-scan", "job-search"),
+    ("cover-letter", "job-search"),
+    ("Application Materials", "job-search"),
+    ("Role Analysis", "job-search"),
+    ("01_Active", "job-search"),
+    ("Research/", "research"),
+    ("Research -", "research"),
+    ("deep-research", "research"),
+    ("article-research", "research"),
+    ("Omega Point", "work"),
+    ("AI-Work", "work"),
+    ("DE-Work", "work"),
+    ("Side Projects", "side-project"),
+    ("Presentations", "presentation"),
+    ("Talk Ideas", "presentation"),
+    ("Meetups", "meetup"),
+    ("AI Revolution", "ai-topics"),
+    ("Professional Thoughts", "reflection"),
+    ("skills/", "skill-development"),
+    ("SKILL.md", "skill-development"),
+]
+
+# Map skill names to category tags
+SKILL_CATEGORIES = {
+    "/job-research": "job-search",
+    "/job-scan": "job-search",
+    "/job-status": "job-search",
+    "job-research": "job-search",
+    "job-scan": "job-search",
+    "job-status": "job-search",
+    "/deep-research": "research",
+    "deep-research": "research",
+    "/article-research": "research",
+    "article-research": "research",
+    "/write": "writing",
+    "write": "writing",
+    "/cover-letter": "job-search",
+    "cover-letter": "job-search",
+    "/review": "code-review",
+    "review": "code-review",
+    "/deploy": "devops",
+    "deploy": "devops",
+    "/install-service": "devops",
+    "install-service": "devops",
+    "/design-polish": "frontend",
+    "design-polish": "frontend",
+    "/bootstrap-app": "new-project",
+    "bootstrap-app": "new-project",
+    "/slides": "presentation",
+    "slides": "presentation",
+    "/bulletize": "note-taking",
+    "bulletize": "note-taking",
+    "/note": "note-taking",
+    "note": "note-taking",
+    "/handoff": "handoff",
+    "handoff": "handoff",
+    "/clip": "reading",
+    "clip": "reading",
+    "/readwise": "reading",
+    "readwise": "reading",
+    "sessions": "introspection",
+}
+
+
+def extract_session_metadata(jsonl_path):
+    """Extract skills, file paths, and derive tags from a session transcript."""
+    skills = set()
+    file_paths = set()
+    first_prompt = ""
+    project_path = ""
+    git_branch = ""
+    msg_count = 0
+    timestamp = None
+
+    try:
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Track timestamp
+                ts = entry.get("timestamp", "")
+                if ts and not timestamp:
+                    timestamp = ts
+
+                # Count messages
+                if entry.get("type") in ("user", "assistant") and not entry.get("isSidechain"):
+                    msg_count += 1
+
+                # Extract project info
+                if not project_path:
+                    project_path = entry.get("cwd", "")
+                    git_branch = entry.get("gitBranch", "")
+
+                # Extract first user prompt
+                if not first_prompt and entry.get("type") == "user" and not entry.get("isSidechain"):
+                    content = entry.get("message", {}).get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(
+                            c.get("text", "") for c in content
+                            if isinstance(c, dict) and c.get("type") == "text"
+                        )
+                    first_prompt = content[:300]
+
+                # Extract skill invocations from user messages
+                if entry.get("type") == "user":
+                    content = entry.get("message", {}).get("content", "")
+                    if isinstance(content, list):
+                        text = " ".join(
+                            c.get("text", "") for c in content
+                            if isinstance(c, dict) and c.get("type") == "text"
+                        )
+                    elif isinstance(content, str):
+                        text = content
+                    else:
+                        text = ""
+
+                    for m in re.finditer(r"<command-name>(/[^<]+)</command-name>", text):
+                        skills.add(m.group(1))
+
+                # Extract tool_use entries for file paths and Skill calls
+                msg = entry.get("message", {})
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "tool_use":
+                            name = item.get("name", "")
+                            inp = item.get("input", {})
+                            if name in ("Write", "Edit", "Read", "MultiEdit") and "file_path" in inp:
+                                file_paths.add(inp["file_path"])
+                            if name == "Skill":
+                                skill_name = inp.get("skill", "")
+                                if skill_name:
+                                    skills.add(skill_name)
+
+    except (OSError, UnicodeDecodeError):
+        pass
+
+    # Derive category tags
+    tags = set()
+
+    # From skills
+    for skill in skills:
+        cat = SKILL_CATEGORIES.get(skill)
+        if cat:
+            tags.add(cat)
+
+    # From file paths
+    for fp in file_paths:
+        for pattern, cat in PATH_CATEGORIES:
+            if pattern in fp:
+                tags.add(cat)
+
+    # From project path
+    if project_path:
+        for pattern, cat in PATH_CATEGORIES:
+            if pattern in project_path:
+                tags.add(cat)
+
+    return {
+        "skills": sorted(skills),
+        "filePaths": sorted(file_paths),
+        "tags": sorted(tags),
+        "firstPrompt": first_prompt,
+        "projectPath": project_path,
+        "gitBranch": git_branch,
+        "messageCount": msg_count,
+        "timestamp": timestamp,
+    }
+
+
+def init_db(db_path):
+    """Create the database and tables if they don't exist."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            project_path TEXT,
+            project_dir TEXT,
+            git_branch TEXT,
+            first_prompt TEXT,
+            message_count INTEGER,
+            timestamp TEXT,
+            mtime REAL,
+            jsonl_path TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS session_skills (
+            session_id TEXT REFERENCES sessions(session_id),
+            skill TEXT,
+            PRIMARY KEY (session_id, skill)
+        );
+
+        CREATE TABLE IF NOT EXISTS session_tags (
+            session_id TEXT REFERENCES sessions(session_id),
+            tag TEXT,
+            PRIMARY KEY (session_id, tag)
+        );
+
+        CREATE TABLE IF NOT EXISTS session_files (
+            session_id TEXT REFERENCES sessions(session_id),
+            file_path TEXT,
+            PRIMARY KEY (session_id, file_path)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_timestamp ON sessions(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_path);
+        CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag);
+        CREATE INDEX IF NOT EXISTS idx_session_skills_skill ON session_skills(skill);
+        CREATE INDEX IF NOT EXISTS idx_session_files_path ON session_files(file_path);
+    """)
+
+    # Create standalone FTS table if it doesn't exist
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions_fts'"
+    )
+    if not cursor.fetchone():
+        conn.execute("""
+            CREATE VIRTUAL TABLE sessions_fts USING fts5(
+                session_id UNINDEXED,
+                first_prompt
+            )
+        """)
+
+    conn.commit()
+    return conn
+
+
+def rebuild_fts(conn):
+    """Rebuild the FTS index from the sessions table."""
+    conn.execute("DELETE FROM sessions_fts")
+    conn.execute("""
+        INSERT INTO sessions_fts(session_id, first_prompt)
+        SELECT session_id, first_prompt FROM sessions
+    """)
+    conn.commit()
+
+
+def get_existing_mtimes(conn):
+    """Get session_id -> mtime mapping for incremental indexing."""
+    cursor = conn.execute("SELECT session_id, mtime FROM sessions")
+    return dict(cursor.fetchall())
+
+
+def upsert_session(conn, sid, metadata, mtime, project_dir, jsonl_path):
+    """Insert or replace a session and its related data."""
+    # Upsert main session row
+    conn.execute("""
+        INSERT OR REPLACE INTO sessions
+            (session_id, project_path, project_dir, git_branch, first_prompt,
+             message_count, timestamp, mtime, jsonl_path)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        sid,
+        metadata["projectPath"],
+        project_dir,
+        metadata["gitBranch"],
+        metadata["firstPrompt"],
+        metadata["messageCount"],
+        metadata["timestamp"],
+        mtime,
+        str(jsonl_path),
+    ))
+
+    # Replace skills
+    conn.execute("DELETE FROM session_skills WHERE session_id = ?", (sid,))
+    for skill in metadata["skills"]:
+        conn.execute(
+            "INSERT OR IGNORE INTO session_skills (session_id, skill) VALUES (?, ?)",
+            (sid, skill),
+        )
+
+    # Replace tags
+    conn.execute("DELETE FROM session_tags WHERE session_id = ?", (sid,))
+    for tag in metadata["tags"]:
+        conn.execute(
+            "INSERT OR IGNORE INTO session_tags (session_id, tag) VALUES (?, ?)",
+            (sid, tag),
+        )
+
+    # Replace file paths
+    conn.execute("DELETE FROM session_files WHERE session_id = ?", (sid,))
+    for fp in metadata["filePaths"]:
+        conn.execute(
+            "INSERT OR IGNORE INTO session_files (session_id, file_path) VALUES (?, ?)",
+            (sid, fp),
+        )
+
+
+def show_stats(conn):
+    """Show tag and skill distribution from the database."""
+    total = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    if total == 0:
+        print("No sessions indexed. Run 'cc-index' first.")
+        return
+
+    print(f"\n{'Tag':<25} {'Sessions':>8}")
+    print("─" * 35)
+    cursor = conn.execute("""
+        SELECT tag, COUNT(*) as cnt FROM session_tags
+        GROUP BY tag ORDER BY cnt DESC
+    """)
+    for tag, count in cursor:
+        print(f"  {tag:<23} {count:>8}")
+
+    print(f"\n{'Skill':<25} {'Sessions':>8}")
+    print("─" * 35)
+    cursor = conn.execute("""
+        SELECT skill, COUNT(*) as cnt FROM session_skills
+        GROUP BY skill ORDER BY cnt DESC LIMIT 20
+    """)
+    for skill, count in cursor:
+        print(f"  {skill:<23} {count:>8}")
+
+    print(f"\nTotal indexed sessions: {total}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build session tag index (SQLite)")
+    parser.add_argument("--full", action="store_true", help="Re-index everything")
+    parser.add_argument("--stats", action="store_true", help="Show tag distribution")
+    args = parser.parse_args()
+
+    if args.stats:
+        if not DB_PATH.exists():
+            print("No database found. Run 'cc-index' first.")
+            return
+        conn = sqlite3.connect(str(DB_PATH))
+        show_stats(conn)
+        conn.close()
+        return
+
+    # Initialize DB (drop and recreate if --full)
+    if args.full and DB_PATH.exists():
+        DB_PATH.unlink()
+
+    conn = init_db(DB_PATH)
+    existing_mtimes = get_existing_mtimes(conn) if not args.full else {}
+
+    # Scan all session files
+    new_count = 0
+    skip_count = 0
+    batch_size = 50
+    batch_count = 0
+
+    conn.execute("BEGIN")
+
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            sid = jsonl_file.stem
+            mtime = jsonl_file.stat().st_mtime
+
+            # Skip if already indexed and not modified
+            if sid in existing_mtimes and existing_mtimes[sid] >= mtime:
+                skip_count += 1
+                continue
+
+            print(f"  Indexing {sid[:8]}...", end="", flush=True)
+            metadata = extract_session_metadata(jsonl_file)
+            upsert_session(conn, sid, metadata, mtime, str(project_dir.name), jsonl_file)
+            new_count += 1
+            batch_count += 1
+
+            # Commit in batches for performance
+            if batch_count >= batch_size:
+                conn.execute("COMMIT")
+                conn.execute("BEGIN")
+                batch_count = 0
+
+            tags_str = ", ".join(metadata["tags"]) if metadata["tags"] else "no tags"
+            skills_str = ", ".join(metadata["skills"]) if metadata["skills"] else ""
+            print(f" [{tags_str}]" + (f" skills: {skills_str}" if skills_str else ""))
+
+    conn.execute("COMMIT")
+
+    # Rebuild FTS index
+    if new_count > 0:
+        print("  Rebuilding FTS index...", flush=True)
+        rebuild_fts(conn)
+
+    conn.close()
+
+    print(f"\nDone. Indexed {new_count} new/updated sessions, skipped {skip_count} unchanged.")
+    total = new_count + skip_count
+    print(f"Total sessions in index: {total}")
+
+
+if __name__ == "__main__":
+    main()

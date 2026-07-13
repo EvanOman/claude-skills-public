@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Extract a readable transcript from a Claude Code session JSONL file.
+
+Usage:
+  cc-transcript <session-id>              # Find and render session by ID (prefix match)
+  cc-transcript <session-id> --tools      # Include tool calls and results
+  cc-transcript <session-id> --raw        # Output raw messages as JSON
+  cc-transcript <session-id> --user-only  # Only show user messages
+  cc-transcript <session-id> --summary    # Just show first/last messages and stats
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+CLAUDE_DIR = Path.home() / ".claude"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+
+
+def find_session_file(session_id_prefix):
+    """Find the session JSONL file by session ID prefix."""
+    if not PROJECTS_DIR.exists():
+        return None
+
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            if jsonl_file.stem.startswith(session_id_prefix):
+                return jsonl_file
+
+    return None
+
+
+def parse_content(content):
+    """Extract text from message content (handles both string and list formats)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif item.get("type") == "tool_use":
+                    parts.append(f"[Tool: {item.get('name', '?')}]")
+                elif item.get("type") == "tool_result":
+                    result_content = item.get("content", "")
+                    if isinstance(result_content, str):
+                        parts.append(f"[Tool Result: {result_content[:200]}]")
+                    elif isinstance(result_content, list):
+                        for rc in result_content:
+                            if isinstance(rc, dict) and rc.get("type") == "text":
+                                parts.append(f"[Tool Result: {rc.get('text', '')[:200]}]")
+        return "\n".join(parts)
+    return str(content)
+
+
+def load_transcript(jsonl_path, include_tools=False, user_only=False):
+    """Load and parse a session transcript."""
+    messages = []
+    with open(jsonl_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = entry.get("type", "")
+            if msg_type not in ("user", "assistant"):
+                continue
+
+            # Skip sidechain messages (sub-agent comms)
+            if entry.get("isSidechain", False):
+                continue
+
+            role = entry.get("message", {}).get("role", msg_type)
+            content = entry.get("message", {}).get("content", "")
+            timestamp = entry.get("timestamp", "")
+
+            if user_only and role != "user":
+                continue
+
+            text = parse_content(content)
+
+            # Skip tool results in non-tools mode
+            if not include_tools:
+                if isinstance(content, list):
+                    # Filter out tool_use and tool_result blocks
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            if item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                    text = "\n".join(text_parts)
+
+            if not text.strip():
+                continue
+
+            messages.append({
+                "role": role,
+                "text": text,
+                "timestamp": timestamp,
+            })
+
+    return messages
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Read Claude Code session transcripts")
+    parser.add_argument("session_id", help="Session ID (prefix match)")
+    parser.add_argument("--tools", "-t", action="store_true", help="Include tool calls")
+    parser.add_argument("--raw", action="store_true", help="Output raw JSON messages")
+    parser.add_argument("--user-only", "-u", action="store_true", help="Only user messages")
+    parser.add_argument("--summary", "-s", action="store_true", help="Show summary only")
+    parser.add_argument("--tail", type=int, help="Show only last N messages")
+    args = parser.parse_args()
+
+    # Find the session file
+    session_file = find_session_file(args.session_id)
+    if not session_file:
+        print(f"No session found matching '{args.session_id}'", file=sys.stderr)
+        print(f"Tip: use 'cc-sessions' to list recent sessions and get IDs", file=sys.stderr)
+        sys.exit(1)
+
+    # The encoded dirname is ambiguous (dashes replace both "/" and "_"),
+    # so pull the real cwd from the transcript itself.
+    project_dir = None
+    with open(session_file) as f:
+        for line in f:
+            try:
+                cwd = json.loads(line).get("cwd")
+            except json.JSONDecodeError:
+                continue
+            if cwd:
+                project_dir = cwd
+                break
+    if not project_dir:
+        project_dir = session_file.parent.name.replace("-", "/")
+    file_size_mb = session_file.stat().st_size / (1024 * 1024)
+    print(f"Session: {session_file.stem}", file=sys.stderr)
+    print(f"Project: {project_dir}", file=sys.stderr)
+    print(f"File: {session_file} ({file_size_mb:.1f} MB)", file=sys.stderr)
+    print(file=sys.stderr)
+
+    messages = load_transcript(session_file, include_tools=args.tools, user_only=args.user_only)
+
+    if not messages:
+        print("No messages found in transcript.")
+        return
+
+    if args.summary:
+        first = messages[0]
+        last = messages[-1]
+        user_count = sum(1 for m in messages if m["role"] == "user")
+        asst_count = sum(1 for m in messages if m["role"] == "assistant")
+
+        print(f"Messages: {len(messages)} ({user_count} user, {asst_count} assistant)")
+        if first["timestamp"] and last["timestamp"]:
+            print(f"Duration: {first['timestamp']} → {last['timestamp']}")
+        print(f"\nFirst message:")
+        print(f"  {first['text'][:300]}")
+        print(f"\nLast message:")
+        print(f"  {last['text'][:300]}")
+        return
+
+    if args.tail:
+        messages = messages[-args.tail:]
+
+    if args.raw:
+        print(json.dumps(messages, indent=2))
+        return
+
+    # Render readable transcript
+    for msg in messages:
+        role = msg["role"].upper()
+        text = msg["text"]
+
+        if role == "USER":
+            print(f"{'─' * 60}")
+            print(f"USER:")
+            print(text)
+            print()
+        else:
+            print(f"ASSISTANT:")
+            # Truncate very long assistant messages for readability
+            if len(text) > 2000:
+                print(text[:2000])
+                print(f"\n  ... [{len(text) - 2000} chars truncated] ...")
+            else:
+                print(text)
+            print()
+
+
+if __name__ == "__main__":
+    main()

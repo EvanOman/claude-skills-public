@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""Search Claude Code session history by keyword, project, and date range.
+
+Usage:
+  cc-search <keyword>                    # Search FTS index + history
+  cc-search <keyword> --project <path>   # Filter by project path (substring match)
+  cc-search <keyword> --days 7           # Only last N days
+  cc-search <keyword> --sessions         # Also search session summaries
+  cc-search --recent 20                  # Show 20 most recent prompts (no keyword needed)
+  cc-search <keyword> --full             # Search full session transcripts (slower)
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+CLAUDE_DIR = Path.home() / ".claude"
+HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+DB_PATH = CLAUDE_DIR / "usage-data" / "sessions.db"
+HOME_PREFIX = str(Path.home()) + "/"
+
+
+def get_db():
+    """Get a SQLite connection if the database exists."""
+    if DB_PATH.exists():
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        return conn
+    return None
+
+
+def search_fts(keyword, project_filter=None, since=None, limit=30):
+    """Search the FTS index for matching sessions."""
+    conn = get_db()
+    if conn is None:
+        return []
+
+    results = []
+    try:
+        # Build the query with optional filters
+        conditions = []
+        params = []
+
+        # FTS match
+        # Escape special FTS characters and use prefix matching
+        safe_keyword = keyword.replace('"', '""')
+        fts_condition = 'sessions_fts MATCH ?'
+        # Use prefix search for partial word matching
+        fts_param = f'"{safe_keyword}"'
+
+        if project_filter:
+            conditions.append("s.project_path LIKE ?")
+            params.append(f"%{project_filter}%")
+
+        if since:
+            conditions.append("s.mtime >= ?")
+            params.append(since.timestamp())
+
+        extra_where = ""
+        if conditions:
+            extra_where = " AND " + " AND ".join(conditions)
+
+        query = f"""
+            SELECT s.session_id, s.project_path, s.project_dir, s.git_branch,
+                   s.first_prompt, s.message_count, s.mtime
+            FROM sessions_fts fts
+            JOIN sessions s ON s.session_id = fts.session_id
+            WHERE {fts_condition}{extra_where}
+            ORDER BY s.mtime DESC
+            LIMIT ?
+        """
+        all_params = [fts_param] + params + [limit]
+
+        cursor = conn.execute(query, all_params)
+        for row in cursor:
+            dt = datetime.fromtimestamp(row["mtime"], tz=timezone.utc) if row["mtime"] else None
+            project = (row["project_path"] or "").replace(HOME_PREFIX, "~/")
+            if not project:
+                project = str(row["project_dir"] or "").replace("-", "/")
+
+            results.append({
+                "sessionId": row["session_id"],
+                "project": project,
+                "firstPrompt": row["first_prompt"] or "",
+                "messageCount": row["message_count"] or 0,
+                "gitBranch": row["git_branch"] or "",
+                "dt": dt,
+            })
+    except sqlite3.OperationalError as e:
+        # FTS might not be populated or keyword syntax might fail
+        # Fall back silently
+        pass
+    finally:
+        conn.close()
+
+    return results
+
+
+def load_history(keyword=None, project_filter=None, since=None):
+    """Load and filter history.jsonl entries."""
+    if not HISTORY_FILE.exists():
+        return []
+
+    results = []
+    with open(HISTORY_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            # Filter by date
+            ts = entry.get("timestamp", 0)
+            if ts > 1e12:  # milliseconds
+                ts = ts / 1000
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            if since and dt < since:
+                continue
+
+            # Filter by project
+            project = entry.get("project", "")
+            if project_filter and project_filter.lower() not in project.lower():
+                continue
+
+            # Filter by keyword
+            display = entry.get("display", "")
+            if keyword and keyword.lower() not in display.lower():
+                # Also check pasted contents
+                pasted = entry.get("pastedContents", {})
+                pasted_text = " ".join(
+                    p.get("content", "") for p in pasted.values() if isinstance(p, dict)
+                )
+                if keyword.lower() not in pasted_text.lower():
+                    continue
+
+            results.append({
+                "timestamp": dt,
+                "project": project,
+                "display": display[:200],
+                "sessionId": entry.get("sessionId", ""),
+            })
+
+    return results
+
+
+def search_session_summaries(keyword, project_filter=None, since=None):
+    """Search sessions-index.json files across all projects."""
+    results = []
+    if not PROJECTS_DIR.exists():
+        return results
+
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+
+        if project_filter:
+            # Convert dir name back to path for matching
+            dir_path = str(project_dir.name).replace("-", "/")
+            if project_filter.lower() not in dir_path.lower():
+                continue
+
+        index_file = project_dir / "sessions-index.json"
+        if not index_file.exists():
+            continue
+
+        try:
+            with open(index_file) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        for entry in data.get("entries", []):
+            summary = entry.get("summary", "")
+            first_prompt = entry.get("firstPrompt", "")
+            text = f"{summary} {first_prompt}"
+
+            if keyword and keyword.lower() not in text.lower():
+                continue
+
+            created = entry.get("created", "")
+            if created:
+                try:
+                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    if since and dt < since:
+                        continue
+                except ValueError:
+                    dt = None
+            else:
+                dt = None
+
+            results.append({
+                "sessionId": entry.get("sessionId", ""),
+                "project": entry.get("projectPath", str(project_dir.name)),
+                "summary": summary,
+                "firstPrompt": first_prompt[:150],
+                "messageCount": entry.get("messageCount", 0),
+                "created": dt,
+                "modified": entry.get("modified", ""),
+                "gitBranch": entry.get("gitBranch", ""),
+            })
+
+    return results
+
+
+def search_full_transcripts(keyword, project_filter=None, since=None, max_results=20):
+    """Search full session JSONL transcripts for keyword. Slower but comprehensive."""
+    results = []
+    if not PROJECTS_DIR.exists():
+        return results
+
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+
+        if project_filter:
+            dir_path = str(project_dir.name).replace("-", "/")
+            if project_filter.lower() not in dir_path.lower():
+                continue
+
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            if len(results) >= max_results:
+                return results
+
+            # Check file modification time for date filter
+            if since:
+                mtime = datetime.fromtimestamp(jsonl_file.stat().st_mtime, tz=timezone.utc)
+                if mtime < since:
+                    continue
+
+            try:
+                matches_in_file = []
+                with open(jsonl_file) as f:
+                    for line_num, line in enumerate(f):
+                        if keyword.lower() in line.lower():
+                            try:
+                                msg = json.loads(line)
+                                msg_type = msg.get("type", "")
+                                if msg_type in ("user", "assistant"):
+                                    content = msg.get("message", {}).get("content", "")
+                                    if isinstance(content, list):
+                                        content = " ".join(
+                                            c.get("text", "") for c in content
+                                            if isinstance(c, dict) and c.get("type") == "text"
+                                        )
+                                    # Find the keyword in context
+                                    idx = content.lower().find(keyword.lower())
+                                    if idx >= 0:
+                                        start = max(0, idx - 80)
+                                        end = min(len(content), idx + len(keyword) + 80)
+                                        snippet = content[start:end]
+                                        if start > 0:
+                                            snippet = "..." + snippet
+                                        if end < len(content):
+                                            snippet = snippet + "..."
+                                        matches_in_file.append({
+                                            "role": msg_type,
+                                            "snippet": snippet,
+                                            "line": line_num,
+                                        })
+                            except json.JSONDecodeError:
+                                continue
+
+                if matches_in_file:
+                    session_id = jsonl_file.stem
+                    results.append({
+                        "sessionId": session_id,
+                        "project": str(project_dir.name).replace("-", "/"),
+                        "file": str(jsonl_file),
+                        "matches": matches_in_file[:5],  # Cap matches per file
+                        "totalMatches": len(matches_in_file),
+                    })
+            except (OSError, UnicodeDecodeError):
+                continue
+
+    return results
+
+
+def format_dt(dt):
+    if dt is None:
+        return "unknown"
+    now = datetime.now(tz=timezone.utc)
+    diff = now - dt
+    if diff.days == 0:
+        hours = diff.seconds // 3600
+        if hours == 0:
+            mins = diff.seconds // 60
+            return f"{mins}m ago"
+        return f"{hours}h ago"
+    elif diff.days == 1:
+        return "yesterday"
+    elif diff.days < 7:
+        return f"{diff.days}d ago"
+    else:
+        return dt.strftime("%Y-%m-%d")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Search Claude Code session history")
+    parser.add_argument("keyword", nargs="?", help="Search keyword")
+    parser.add_argument("--project", "-p", help="Filter by project path (substring)")
+    parser.add_argument("--days", "-d", type=int, help="Only search last N days")
+    parser.add_argument("--sessions", "-s", action="store_true", help="Also search session summaries")
+    parser.add_argument("--full", "-f", action="store_true", help="Search full transcripts (slower)")
+    parser.add_argument("--recent", "-r", type=int, help="Show N most recent prompts")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    args = parser.parse_args()
+
+    if not args.keyword and not args.recent:
+        parser.print_help()
+        sys.exit(1)
+
+    since = None
+    if args.days:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=args.days)
+
+    # Search history
+    if args.recent:
+        history = load_history(project_filter=args.project, since=since)
+        history.sort(key=lambda x: x["timestamp"], reverse=True)
+        history = history[:args.recent]
+
+        if args.json:
+            for h in history:
+                h["timestamp"] = h["timestamp"].isoformat()
+            print(json.dumps(history, indent=2))
+        else:
+            for h in history:
+                time_str = format_dt(h["timestamp"])
+                project = h["project"].replace(HOME_PREFIX, "~/")
+                display = h["display"].replace("\n", " ")[:120]
+                sid = h["sessionId"][:8] if h["sessionId"] else "no-id"
+                print(f"  {time_str:>12}  [{sid}]  {project}")
+                print(f"               {display}")
+                print()
+        return
+
+    # FTS search (fast, searches first prompts in indexed sessions)
+    fts_results = search_fts(args.keyword, project_filter=args.project, since=since)
+    if fts_results:
+        print(f"\n── Indexed Sessions ({len(fts_results)} matches) ──\n")
+        for r in fts_results:
+            time_str = format_dt(r["dt"])
+            sid = r["sessionId"][:8]
+            project = r["project"]
+            msgs = r["messageCount"]
+            branch = f" ({r['gitBranch']})" if r["gitBranch"] else ""
+            prompt = r["firstPrompt"][:120]
+            print(f"  {time_str:>12}  [{sid}]  {project}{branch}  ({msgs} msgs)")
+            if prompt:
+                print(f"               {prompt}")
+            print()
+
+    # History keyword search
+    history = load_history(keyword=args.keyword, project_filter=args.project, since=since)
+    history.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    if history:
+        print(f"\n── History ({len(history)} matches) ──\n")
+        for h in history[:30]:
+            time_str = format_dt(h["timestamp"])
+            project = h["project"].replace(HOME_PREFIX, "~/")
+            display = h["display"].replace("\n", " ")[:120]
+            sid = h["sessionId"][:8] if h["sessionId"] else "no-id"
+            print(f"  {time_str:>12}  [{sid}]  {project}")
+            print(f"               {display}")
+            print()
+        if len(history) > 30:
+            print(f"  ... and {len(history) - 30} more matches")
+
+    # Session summaries
+    if args.sessions:
+        sessions = search_session_summaries(args.keyword, project_filter=args.project, since=since)
+        sessions.sort(key=lambda x: x.get("created") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+        if sessions:
+            print(f"\n── Sessions ({len(sessions)} matches) ──\n")
+            for s in sessions[:20]:
+                time_str = format_dt(s["created"])
+                project = s["project"].replace(HOME_PREFIX, "~/")
+                summary = s["summary"][:120] if s["summary"] else s["firstPrompt"][:120]
+                sid = s["sessionId"][:8]
+                msgs = s["messageCount"]
+                branch = f" ({s['gitBranch']})" if s["gitBranch"] else ""
+                print(f"  {time_str:>12}  [{sid}]  {project}{branch}  ({msgs} msgs)")
+                print(f"               {summary}")
+                print()
+
+    # Full transcript search
+    if args.full:
+        print(f"\n── Full Transcript Search ──\n")
+        transcript_results = search_full_transcripts(
+            args.keyword, project_filter=args.project, since=since
+        )
+        if transcript_results:
+            for r in transcript_results:
+                project = r["project"].replace(HOME_PREFIX, "~/")
+                sid = r["sessionId"][:8]
+                print(f"  [{sid}]  {project}  ({r['totalMatches']} matches)")
+                for m in r["matches"]:
+                    snippet = m["snippet"].replace("\n", " ")
+                    print(f"    {m['role']:>9}: {snippet}")
+                print()
+        else:
+            print("  No matches found in transcripts.")
+
+    if not fts_results and not history and not (args.sessions and sessions) and not (args.full and transcript_results):
+        print(f"No matches for '{args.keyword}'")
+
+
+if __name__ == "__main__":
+    main()

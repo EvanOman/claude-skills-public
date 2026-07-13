@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""List recent Claude Code sessions with summaries.
+
+Usage:
+  cc-sessions                     # Last 15 sessions across all projects
+  cc-sessions --project <path>    # Filter by project (substring)
+  cc-sessions --days 3            # Only last N days
+  cc-sessions --long              # Show more detail per session
+  cc-sessions --project-summary   # Group by project, show session counts
+  cc-sessions --tag job-search    # Filter by derived tag (from cc-index)
+  cc-sessions --skill deep-research  # Filter by skill invoked
+  cc-sessions --tags              # Show available tags
+  cc-sessions --files <path>      # Filter by files touched (substring match)
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+CLAUDE_DIR = Path.home() / ".claude"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+HOME_PREFIX = str(Path.home()) + "/"
+SESSION_META_DIR = CLAUDE_DIR / "usage-data" / "session-meta"
+FACETS_DIR = CLAUDE_DIR / "usage-data" / "facets"
+DB_PATH = CLAUDE_DIR / "usage-data" / "sessions.db"
+
+
+def get_db():
+    """Get a SQLite connection if the database exists."""
+    if DB_PATH.exists():
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        return conn
+    return None
+
+
+def load_sessions_from_db(project_filter=None, since=None, tag_filter=None,
+                          skill_filter=None, files_filter=None):
+    """Load sessions from SQLite database with SQL-level filtering."""
+    conn = get_db()
+    if conn is None:
+        return []
+
+    conditions = []
+    params = []
+
+    if project_filter:
+        conditions.append("s.project_path LIKE ?")
+        params.append(f"%{project_filter}%")
+
+    if since:
+        # Use mtime for date filtering (more reliable than timestamp text)
+        conditions.append("s.mtime >= ?")
+        params.append(since.timestamp())
+
+    if tag_filter:
+        conditions.append("""
+            s.session_id IN (
+                SELECT session_id FROM session_tags WHERE LOWER(tag) = LOWER(?)
+            )
+        """)
+        params.append(tag_filter)
+
+    if skill_filter:
+        conditions.append("""
+            s.session_id IN (
+                SELECT session_id FROM session_skills WHERE LOWER(skill) LIKE LOWER(?)
+            )
+        """)
+        params.append(f"%{skill_filter}%")
+
+    if files_filter:
+        conditions.append("""
+            s.session_id IN (
+                SELECT session_id FROM session_files WHERE file_path LIKE ?
+            )
+        """)
+        params.append(f"%{files_filter}%")
+
+    where = ""
+    if conditions:
+        where = "WHERE " + " AND ".join(conditions)
+
+    query = f"""
+        SELECT s.session_id, s.project_path, s.project_dir, s.git_branch,
+               s.first_prompt, s.message_count, s.timestamp, s.mtime, s.jsonl_path
+        FROM sessions s
+        {where}
+        ORDER BY s.mtime DESC
+    """
+
+    results = []
+    try:
+        cursor = conn.execute(query, params)
+        for row in cursor:
+            dt = datetime.fromtimestamp(row["mtime"], tz=timezone.utc) if row["mtime"] else None
+
+            # Get tags for this session
+            tag_cursor = conn.execute(
+                "SELECT tag FROM session_tags WHERE session_id = ?",
+                (row["session_id"],)
+            )
+            tags = [r[0] for r in tag_cursor]
+
+            # Get skills for this session
+            skill_cursor = conn.execute(
+                "SELECT skill FROM session_skills WHERE session_id = ?",
+                (row["session_id"],)
+            )
+            skills = [r[0] for r in skill_cursor]
+
+            project_display = row["project_path"] or ""
+            if project_display:
+                project_display = project_display.replace(HOME_PREFIX, "~/")
+            else:
+                project_display = str(row["project_dir"] or "").replace("-", "/")
+
+            results.append({
+                "sessionId": row["session_id"],
+                "project": project_display,
+                "summary": "",
+                "firstPrompt": row["first_prompt"] or "",
+                "messageCount": row["message_count"] or 0,
+                "created": "",
+                "modified": "",
+                "dt": dt,
+                "gitBranch": row["git_branch"] or "",
+                "projectDir": row["project_dir"] or "",
+                "tags": tags,
+                "skills": skills,
+            })
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+
+    return results
+
+
+def load_all_sessions(project_filter=None, since=None, tag_filter=None,
+                      skill_filter=None, files_filter=None):
+    """Load sessions, using SQLite when filters are active, JSONL scanning otherwise.
+
+    Sources (in priority order):
+    1. SQLite DB (fast, used when tag/skill/files filters are active)
+    2. sessions-index.json (has summaries but may be stale)
+    3. Raw JSONL session files (always current, but no summaries)
+    """
+    # If any indexed filter is active, use the database
+    if tag_filter or skill_filter or files_filter:
+        return load_sessions_from_db(
+            project_filter=project_filter, since=since,
+            tag_filter=tag_filter, skill_filter=skill_filter,
+            files_filter=files_filter,
+        )
+
+    # Otherwise, use the existing JSONL-scanning approach to catch unindexed sessions
+    # But enrich with DB data when available
+    sessions_by_id = {}
+
+    if not PROJECTS_DIR.exists():
+        return []
+
+    # Try to get tag/skill data from DB for enrichment
+    db_tags = {}
+    db_skills = {}
+    conn = get_db()
+    if conn:
+        try:
+            for row in conn.execute("SELECT session_id, tag FROM session_tags"):
+                db_tags.setdefault(row[0], []).append(row[1])
+            for row in conn.execute("SELECT session_id, skill FROM session_skills"):
+                db_skills.setdefault(row[0], []).append(row[1])
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+
+    # Source 1: sessions-index.json files (richest data when available)
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+
+        if project_filter:
+            dir_path = str(project_dir.name).replace("-", "/")
+            if project_filter.lower() not in dir_path.lower():
+                continue
+
+        index_file = project_dir / "sessions-index.json"
+        if index_file.exists():
+            try:
+                with open(index_file) as f:
+                    data = json.load(f)
+                for entry in data.get("entries", []):
+                    sid = entry.get("sessionId", "")
+                    if not sid:
+                        continue
+                    created = entry.get("created", "")
+                    modified = entry.get("modified", "")
+                    dt = None
+                    for ts in (modified, created):
+                        if ts:
+                            try:
+                                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                                break
+                            except ValueError:
+                                pass
+                    if since and dt and dt < since:
+                        continue
+                    sessions_by_id[sid] = {
+                        "sessionId": sid,
+                        "project": entry.get("projectPath", "").replace(HOME_PREFIX, "~/"),
+                        "summary": entry.get("summary", ""),
+                        "firstPrompt": entry.get("firstPrompt", ""),
+                        "messageCount": entry.get("messageCount", 0),
+                        "created": created,
+                        "modified": modified,
+                        "dt": dt,
+                        "gitBranch": entry.get("gitBranch", ""),
+                        "projectDir": str(project_dir),
+                        "tags": db_tags.get(sid, []),
+                        "skills": db_skills.get(sid, []),
+                    }
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Source 2: Raw JSONL files (catches sessions not in stale index)
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            sid = jsonl_file.stem
+            if sid in sessions_by_id:
+                continue  # Already have richer data from index
+
+            stat = jsonl_file.stat()
+            dt = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+            if since and dt < since:
+                continue
+
+            if project_filter:
+                dir_path = str(project_dir.name).replace("-", "/")
+                if project_filter.lower() not in dir_path.lower():
+                    continue
+
+            # Extract first user message and project path from JSONL
+            first_prompt = ""
+            project_path = str(project_dir.name).replace("-", "/")
+            git_branch = ""
+            msg_count = 0
+            try:
+                with open(jsonl_file) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            if entry.get("type") in ("user", "assistant") and not entry.get("isSidechain"):
+                                msg_count += 1
+                            if not first_prompt and entry.get("type") == "user" and not entry.get("isSidechain"):
+                                content = entry.get("message", {}).get("content", "")
+                                if isinstance(content, list):
+                                    content = " ".join(
+                                        c.get("text", "") for c in content
+                                        if isinstance(c, dict) and c.get("type") == "text"
+                                    )
+                                first_prompt = content[:200]
+                                project_path = entry.get("cwd", project_path)
+                                git_branch = entry.get("gitBranch", "")
+                            # Don't read the entire file — just enough for metadata
+                            if first_prompt and msg_count > 50:
+                                break
+                        except json.JSONDecodeError:
+                            continue
+            except (OSError, UnicodeDecodeError):
+                continue
+
+            sessions_by_id[sid] = {
+                "sessionId": sid,
+                "project": project_path.replace(HOME_PREFIX, "~/"),
+                "summary": "",
+                "firstPrompt": first_prompt,
+                "messageCount": msg_count,
+                "created": "",
+                "modified": "",
+                "dt": dt,
+                "gitBranch": git_branch,
+                "projectDir": str(project_dir),
+                "tags": db_tags.get(sid, []),
+                "skills": db_skills.get(sid, []),
+            }
+
+    return list(sessions_by_id.values())
+
+
+def load_session_meta(session_id):
+    """Load rich metadata from usage-data/session-meta if available."""
+    if not SESSION_META_DIR.exists():
+        return None
+    meta_file = SESSION_META_DIR / f"{session_id}.json"
+    if not meta_file.exists():
+        return None
+    try:
+        with open(meta_file) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def load_session_facets(session_id):
+    """Load qualitative facets from usage-data/facets if available."""
+    if not FACETS_DIR.exists():
+        return None
+    facets_file = FACETS_DIR / f"{session_id}.json"
+    if not facets_file.exists():
+        return None
+    try:
+        with open(facets_file) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def format_dt(dt):
+    if dt is None:
+        return "unknown"
+    now = datetime.now(tz=timezone.utc)
+    diff = now - dt
+    if diff.days == 0:
+        hours = diff.seconds // 3600
+        if hours == 0:
+            mins = diff.seconds // 60
+            return f"{mins}m ago"
+        return f"{hours}h ago"
+    elif diff.days == 1:
+        return "yesterday"
+    elif diff.days < 7:
+        return f"{diff.days}d ago"
+    else:
+        return dt.strftime("%Y-%m-%d")
+
+
+def format_duration(minutes):
+    if minutes < 1:
+        return "<1m"
+    if minutes < 60:
+        return f"{int(minutes)}m"
+    hours = minutes / 60
+    if hours < 24:
+        return f"{hours:.1f}h"
+    return f"{hours / 24:.1f}d"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="List recent Claude Code sessions")
+    parser.add_argument("--project", "-p", help="Filter by project path (substring)")
+    parser.add_argument("--days", "-d", type=int, help="Only show last N days")
+    parser.add_argument("--count", "-n", type=int, default=15, help="Number of sessions to show")
+    parser.add_argument("--long", "-l", action="store_true", help="Show detailed info per session")
+    parser.add_argument("--project-summary", action="store_true", help="Group by project")
+    parser.add_argument("--tag", "-t", help="Filter by tag (e.g., job-search, research, work)")
+    parser.add_argument("--skill", help="Filter by skill invoked (substring match)")
+    parser.add_argument("--tags", action="store_true", help="Show available tags and their counts")
+    parser.add_argument("--files", help="Filter by files touched (substring match on file paths)")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    args = parser.parse_args()
+
+    if args.tags:
+        # Show available tags from SQLite DB
+        conn = get_db()
+        if not conn:
+            print("No database found. Run 'cc-index' first to build the index.")
+            return
+        try:
+            cursor = conn.execute("""
+                SELECT tag, COUNT(*) as cnt FROM session_tags
+                GROUP BY tag ORDER BY cnt DESC
+            """)
+            print(f"\n{'Tag':<25} {'Sessions':>8}")
+            print("─" * 35)
+            for tag, count in cursor:
+                print(f"  {tag:<23} {count:>8}")
+            print()
+        except sqlite3.OperationalError:
+            print("No tag data found. Run 'cc-index' first.")
+        finally:
+            conn.close()
+        return
+
+    since = None
+    if args.days:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=args.days)
+
+    sessions = load_all_sessions(
+        project_filter=args.project, since=since,
+        tag_filter=args.tag, skill_filter=args.skill,
+        files_filter=args.files,
+    )
+    sessions.sort(key=lambda x: x.get("dt") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+    if args.project_summary:
+        # Group by project
+        projects = {}
+        for s in sessions:
+            p = s["project"]
+            if p not in projects:
+                projects[p] = {"count": 0, "total_messages": 0, "latest": None}
+            projects[p]["count"] += 1
+            projects[p]["total_messages"] += s["messageCount"]
+            if projects[p]["latest"] is None:
+                projects[p]["latest"] = s["dt"]
+
+        sorted_projects = sorted(projects.items(), key=lambda x: x[1]["latest"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        print(f"\n{'Project':<50} {'Sessions':>8} {'Messages':>8} {'Latest':>12}")
+        print("─" * 82)
+        for project, info in sorted_projects:
+            time_str = format_dt(info["latest"])
+            print(f"  {project:<48} {info['count']:>8} {info['total_messages']:>8} {time_str:>12}")
+        print()
+        return
+
+    if args.json:
+        for s in sessions[:args.count]:
+            if s["dt"]:
+                s["dt"] = s["dt"].isoformat()
+        print(json.dumps(sessions[:args.count], indent=2))
+        return
+
+    sessions = sessions[:args.count]
+
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    for s in sessions:
+        time_str = format_dt(s["dt"])
+        sid = s["sessionId"][:8]
+        project = s["project"]
+        msgs = s["messageCount"]
+        branch = f" ({s['gitBranch']})" if s["gitBranch"] else ""
+        summary = s["summary"][:120] if s["summary"] else s["firstPrompt"][:120]
+
+        tags = s.get("tags", [])
+        tag_str = f"  [{', '.join(tags)}]" if tags else ""
+        print(f"  {time_str:>12}  [{sid}]  {project}{branch}  ({msgs} msgs){tag_str}")
+        if summary:
+            print(f"               {summary}")
+
+        if args.long:
+            meta = load_session_meta(s["sessionId"])
+            if meta:
+                duration = meta.get("duration_minutes", 0)
+                tokens_in = meta.get("input_tokens", 0)
+                tokens_out = meta.get("output_tokens", 0)
+                tools = meta.get("tool_counts", {})
+                files_mod = meta.get("files_modified", 0)
+                lines_add = meta.get("lines_added", 0)
+                commits = meta.get("git_commits", 0)
+
+                tool_str = ", ".join(f"{k}:{v}" for k, v in sorted(tools.items(), key=lambda x: -x[1])[:5])
+                print(f"               duration: {format_duration(duration)}  tokens: {tokens_in + tokens_out:,}  files: {files_mod}  lines: {lines_add}  commits: {commits}")
+                if tool_str:
+                    print(f"               tools: {tool_str}")
+
+            facets = load_session_facets(s["sessionId"])
+            if facets:
+                goal = facets.get("goal_category", "")
+                outcome = facets.get("outcome", "")
+                friction = facets.get("friction", "")
+                if goal or outcome:
+                    print(f"               goal: {goal}  outcome: {outcome}")
+                if friction:
+                    print(f"               friction: {friction[:100]}")
+
+        print()
+
+
+if __name__ == "__main__":
+    main()
