@@ -20,6 +20,33 @@ bash "$(dirname "$0")/setup.sh" --copy    # copies instead of symlinking
 
 By default the tools are **symlinked** into `~/.claude/bin/`, so a `git pull` of this repo updates them with no re-install. Use `--copy` if you don't keep the repo checked out (a standalone copy that won't track upstream fixes). Either way, make sure `~/.claude/bin` is on your `PATH`.
 
+### Recommended: keep the index fresh automatically
+
+Add an async `Stop` hook to `~/.claude/settings.json` so the index updates in the background after every Claude Code turn (cc-index is incremental, so this only touches changed sessions; `flock -n` skips the run if another session is already indexing):
+
+```json
+{
+  "hooks": {
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "flock -n \"$HOME/.claude/usage-data/cc-index.lock\" \"$HOME/.claude/bin/cc-index\" >/dev/null 2>&1 || true",
+        "timeout": 120,
+        "async": true
+      }]
+    }]
+  }
+}
+```
+
+### Recommended: retain transcripts longer
+
+Claude Code deletes session transcripts after 30 days by default, which silently shrinks what this skill can search (the FTS index only covers transcripts that still exist on disk). Raise the retention in `~/.claude/settings.json`:
+
+```json
+{ "cleanupPeriodDays": 3650 }
+```
+
 ## Tools
 
 ### `cc-sessions` — List recent sessions
