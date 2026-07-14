@@ -37,6 +37,7 @@ Skills are then available as `/evan-skills:skill-name` (e.g., `/evan-skills:slid
 | Handoff | `/evan-skills:handoff` | Generate a structured handoff note capturing session state, completed work, in-flight tasks, and next steps for a future agent. |
 | Session History Search | `/evan-skills:session-history-search` | Search, list, and review past Claude Code sessions. Includes CLI tools (`cc-sessions`, `cc-search`, `cc-transcript`, `cc-index`) for BM25-ranked full-prompt search, project filtering, tag-based discovery, and full transcript reading. |
 | Prep Public | `/evan-skills:prep-public` | Prepare a project for public GitHub release. Scans for secrets, cleans paths, sets up .gitignore/.env.example/LICENSE/README. |
+| Overmind | `/evan-skills:overmind` | Enter orchestration mode: the premium main-loop model becomes the central brain and fans execution out to cheaper worker backends (Codex CLI on ChatGPT quota, Claude subagents, opencode/GLM). Structured briefs, quota pre-flight, trust-then-verify review loop. |
 
 ### Meta
 
