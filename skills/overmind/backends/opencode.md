@@ -45,7 +45,16 @@ export WORKER_DIR=/path/to/project      # the project the worker edits — alway
 
 Dispatch N parallel workers as **N separate harness-tracked background Bash calls**
 (one `run` each), never as one background call that forks N `"$W" run ... &` children
-with `wait`. The nested form leaves the children parented to a shell the harness may
-reap — all N die at launch with empty `/tmp/worker.*.log` files and no sessions
-registered. Symptom: `opencode session list` shows nothing new, target repos untouched.
-Idempotent briefs make the re-dispatch safe.
+with `wait`. The nested form's children **hang silently instead of running** — 0-byte
+`/tmp/worker.*.log` files, no sessions registered, target repos untouched — and the
+processes stay alive for hours (observed: 24h) quietly holding opencode state that can
+block later workers. Before re-dispatching after any suspected dispatch failure,
+**hunt and kill the orphans**:
+
+```bash
+ps -eo pid,etime,args | grep 'opencode run' | grep -v grep   # old etime = zombie
+kill <pids>    # your own hung workers — safe to kill by pid
+```
+
+Then re-dispatch; idempotent briefs make that safe. Three or so concurrent workers
+(separately dispatched) are proven fine.
