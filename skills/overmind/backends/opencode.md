@@ -40,3 +40,12 @@ export WORKER_DIR=/path/to/project      # the project the worker edits — alway
   "newest session" heuristic is unreliable under concurrency.
 - The pattern is model-agnostic: add any provider to `~/.config/opencode/opencode.json`
   and set `WORKER_MODEL=provider/model` to swap the worker's identity.
+
+## Parallel dispatch (learned the hard way)
+
+Dispatch N parallel workers as **N separate harness-tracked background Bash calls**
+(one `run` each), never as one background call that forks N `"$W" run ... &` children
+with `wait`. The nested form leaves the children parented to a shell the harness may
+reap — all N die at launch with empty `/tmp/worker.*.log` files and no sessions
+registered. Symptom: `opencode session list` shows nothing new, target repos untouched.
+Idempotent briefs make the re-dispatch safe.
