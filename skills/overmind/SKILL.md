@@ -118,7 +118,11 @@ explicit opt-in (see backends/claude.md).
 The worker is capable but it is not you. After every handoff:
 
 1. **Read the diff** it produced (`git diff` in its workdir), not just its summary.
-   Summaries can be rosy.
+   Summaries can be rosy. Capture `git status --porcelain` **before** dispatching into
+   any repo — user repos often carry unrelated uncommitted work, and without the
+   pre-dispatch snapshot you can't tell worker overreach from pre-existing dirt
+   (each false alarm costs a full investigation cycle). Non-git workdirs get no diff
+   at all: enumerate the worker's `Edit`/`Write` ops from its log instead.
 2. **Run the VERIFY command yourself.** "Tests pass" is a claim until you see it.
 3. **Check it against the brief** — did it do what you asked, or something adjacent?
 
