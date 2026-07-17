@@ -1,90 +1,120 @@
 ---
 name: graduate-skill
-description: Graduate a private local skill into Evan's public GitHub skills repo, making the repo the single source of truth via symlinks. Use when the user wants to "graduate this skill", "publish this skill to my public skills", "move a skill to the public repo", or promote a personal ~/.claude/skills skill to the shared claude-skills-public repo.
-disable-model-invocation: true
-allowed-tools: Bash(ls *), Bash(git *), Bash(mv *), Bash(ln *), Bash(chmod *), Bash(mkdir *), Bash(readlink *), Bash(diff *), Bash(realpath *), Read, Write, Edit, Glob, Grep
+description: Promote a privately owned skill into Evan's public skills repository, update the canonical agent-config registry, scrub and validate the public payload, and publish managed links to both Claude and Codex. Use when the user asks to graduate, publish, open-source, or move a personal skill into the public skills repo.
 ---
 
-# Graduate a Skill to the Public Repo
+# Graduate a Skill
 
-Promote a private skill from `~/.claude/skills/<name>/` into `~/dev/claude-skills-public/skills/<name>/`, then symlink it back so the repo is the single source of truth. `<name>` is the skill to graduate (ask if not given).
+Move a skill from its canonical private repository owner into
+`/home/evan/dev/claude-skills-public/skills/<name>`, then update agent-config so both harnesses
+discover that public owner.
 
-Repo path: `~/dev/claude-skills-public` (branch `main`).
+Use these fixed locations:
 
-**HARD RULE — never `git add -A` / `git add .` in that repo.** Multiple Claude sessions may share the checkout. Stage only the exact paths this graduation touches. Do not `checkout`/`switch`/`reset`/`rebase` there.
+- public skills repository: `/home/evan/dev/claude-skills-public`
+- ownership registry: `/home/evan/dev/agent-config/registry/skills.toml`
+- publisher: `/home/evan/dev/agent-config/scripts/sync-skills`
 
-Run the phases in order. Stop and ask the user at the two gates (scrub findings, final ship).
+## Hard rules
 
-## Phase 1: Preflight
+- Treat an ordinary owning repository as the source of truth. Harness install directories, plugin
+  caches, marketplace checkouts, dependency trees, and generated worktrees are never sources.
+- Use installed links only as evidence for locating an owner; reconcile them against the registry.
+- Preserve unrelated work. Never switch, reset, or rebase a shared checkout, and never stage all
+  changes. Stage only paths changed by this graduation.
+- Stop at both human gates: scrub approval and final ship approval.
 
-- `~/.claude/skills/<name>/` exists, is a real directory, and is **not already a symlink** (`readlink` returns nothing). If it's a symlink, it's already graduated — stop.
-- `~/dev/claude-skills-public` exists and `git -C ~/dev/claude-skills-public branch --show-current` is `main`.
-- `git -C ~/dev/claude-skills-public status --short` — note any unrelated uncommitted changes (concurrent session). Proceed, but stage only your own paths later.
-- If `~/dev/claude-skills-public/skills/<name>/` already exists: **drift reconciliation** — `diff -ru` the two dirs, show the user, ask which side wins before continuing. Don't overwrite silently.
+## 1. Establish ownership
 
-## Phase 2: Scrub (CRITICAL)
+Read the registry entry for `<name>`.
 
-Scan **every file in the skill dir** (SKILL.md, bin/, references/, scripts/, assets/) for leaks. This is per-skill-directory, not per-project.
+- If registered, use its `source` as the candidate owner and confirm it resolves to an ordinary Git
+  repository containing `SKILL.md`.
+- If unregistered, ask the user to identify the private owning repository. Do not infer a harness
+  install directory as the owner. Plan a new registry entry with the intended harnesses.
+- If the registry, installed links, and filesystem disagree, show the mismatch and ask which ordinary
+  repository is authoritative before changing anything.
+- If the source already resolves to the public destination, report that it is already graduated and
+  stop.
 
-Grep for:
-- **Secrets/keys:** `sk-ant-`, `sk-`, `AKIA`, `ghp_`, `gho_`, `Bearer`, `token=`, `password`, `secret`, `credential`, `-----BEGIN`, high-entropy base64/hex >32 chars, `.pem`/`.key` files.
-- **Local/personal:** `/home/<user>/`, `/Users/<user>/`, `C:\Users\`; personal email addresses (gmail/personal domains, `@` greps); real names in comments; internal hostnames, IPs, Tailscale/ngrok hosts.
-- **Employer/internal:** employer names, codenames, internal project references, internal URLs.
+Record `git status --short`, current branch, and repository root for the source, public repository,
+and agent-config. Note unrelated changes and work around them.
 
-**Genericize, don't just delete.** Preferred fixes:
-- Hardcoded home paths in Python → module constant `HOME_PREFIX = str(Path.home()) + "/"`, then `path.replace(HOME_PREFIX, "~/")` for display (this exact pattern is used in the repo's `session-history-search` bins). In shell, use `$HOME`/`~`. Keep the tool functional, just not machine-specific.
-- Personal email/name only needed as an example → replace with a placeholder.
+If the public destination already exists, compare it with the source and ask the user which content
+wins. Never overwrite a divergent destination silently.
 
-Present all findings (severity + file:line + proposed fix) to the user. **Some personal references are intentional** (a skill may legitimately reference Evan's vault or workflow) — that's a human call. **GATE: get the user's OK on the scrub before moving.** If a real live secret is found, tell the user to revoke it first.
+## 2. Scrub the complete payload
 
-Apply approved fixes in place (still under `~/.claude/skills/<name>/`).
+Scan every file in the canonical source, including scripts, references, assets, examples, and agent
+metadata. Look for:
 
-## Phase 3: Move
+- credentials, tokens, private keys, authorization headers, and high-entropy secret-like values;
+- personal paths, emails, names, private hosts, IPs, tailnet addresses, and internal URLs;
+- employer names, codenames, private project references, and proprietary examples;
+- harness-home paths or provider-specific mechanics presented as portable workflow.
 
-Source isn't a git repo, so plain move + add is fine:
+Genericize machine-specific implementation without breaking it: derive paths from the environment,
+use placeholders in examples, and move legitimate provider mechanics into provider-specific
+metadata or references. Some personal facts may be intentional; do not decide that silently.
 
+Present findings as severity, file and line, exposure risk, and proposed fix.
+
+**SCRUB GATE:** obtain explicit approval before applying scrub changes or copying anything into the
+public repository. If a live secret is found, require revocation or rotation before continuing.
+
+Apply only approved fixes in the canonical source and run its relevant tests.
+
+## 3. Prepare the ownership transfer
+
+Copy the approved source into the public destination while preserving executable bits. Do not copy
+Git metadata, caches, generated output, or unrelated repository files.
+
+Then:
+
+1. Validate the copied skill with the available skill validator.
+2. Run its bundled scripts in a safe help, check, or fixture mode as appropriate.
+3. Scan `SKILL.md` with agent-config's portability scanner.
+4. Add or update `agents/openai.yaml` when Codex UI metadata is missing or stale.
+5. Update the public repository's skill table using its existing format.
+6. Update the registry entry so `source` is the public destination and its `harnesses` accurately
+   names every supported harness.
+7. Remove the old tracked source from its owning repository only after the public copy validates.
+
+Do not hand-create links in either harness home. Preview publication through the registry:
+
+```bash
+/home/evan/dev/agent-config/scripts/sync-skills --dry-run
 ```
-mv ~/.claude/skills/<name> ~/dev/claude-skills-public/skills/<name>
-chmod +x ~/dev/claude-skills-public/skills/<name>/bin/*   # only if bin/ exists
-```
 
-## Phase 4: Symlink Back
+Resolve conflicts or unexpected removals before proceeding.
 
-```
-ln -s ~/dev/claude-skills-public/skills/<name> ~/.claude/skills/<name>
-```
+## 4. Review and ship
 
-If the skill has a `bin/` of CLI tools, symlink each tool into `~/.claude/bin/` too:
-```
-ln -s ~/dev/claude-skills-public/skills/<name>/bin/<tool> ~/.claude/bin/<tool>
-```
-If a `~/.claude/bin/<tool>` already exists: `diff` it against the repo copy first. If identical, replace with the symlink. If it differs, show the user and ask before replacing.
+Show the user:
 
-## Phase 5: README
+- status and full scoped diff for every affected repository;
+- the complete new public skill payload, including untracked files;
+- validator, portability, and script/test results;
+- the skill-sync dry-run and the exact paths it will update;
+- the proposed commits and push order.
 
-Add one row to the skills table in `~/dev/claude-skills-public/README.md`, matching the existing format:
-`| <Title Case Name> | \`/evan-skills:<name>\` | <one-line description> |`
-Pick the right section (Research & Content, Development Workflow, or Meta).
+**SHIP GATE:** obtain explicit approval before publishing managed links, committing, or pushing.
+Clarify whether approval covers all affected repositories and both harness installations.
 
-## Phase 6: Verify
+After approval:
 
-- `readlink ~/.claude/skills/<name>` resolves to the repo dir.
-- `Read` SKILL.md through the symlink path — readable.
-- For each bin tool: run `~/.claude/bin/<tool> --help` (or equivalent) and confirm exit 0.
+1. Run `/home/evan/dev/agent-config/scripts/sync-skills` to publish the registry state.
+2. Run it again with `--check` to verify both managed skill forests.
+3. Stage only the public skill, its public index row, the old owner's removed paths, and the registry
+   entry. Never use a repository-wide add.
+4. Commit each owning repository with a concise message and push the public payload before the
+   registry pointer that depends on it.
+5. Report commit IDs, push results, and final sync verification.
 
-## Phase 7: Ship
+If any step fails, stop and report the partial state. Do not improvise destructive rollback.
 
-- Show the user the full diff: `git -C ~/dev/claude-skills-public status --short` and `git -C ~/dev/claude-skills-public diff` plus the new untracked skill dir.
-- **GATE: explicit user confirmation to commit + push.**
-- Stage only this graduation's paths (never `-A`):
-  ```
-  git -C ~/dev/claude-skills-public add skills/<name> README.md
-  ```
-- Commit with a concise message, e.g. `Graduate <name> skill to public repo`.
-- `git -C ~/dev/claude-skills-public push`.
+## Reversal
 
-## Reversal (un-graduate)
-
-1. `rm ~/.claude/skills/<name>` (removes the symlink only) and any `~/.claude/bin/<tool>` symlinks.
-2. Copy the dir back: `cp -r ~/dev/claude-skills-public/skills/<name> ~/.claude/skills/<name>`.
-3. `git -C ~/dev/claude-skills-public rm -r skills/<name>`, revert the README row, commit, push.
+Reverse graduation through ownership, not harness homes: restore the skill to an ordinary private
+owner, point the registry back to it, preview and run `sync-skills`, remove the public copy through
+Git, and ship the scoped repository changes behind the same explicit gate.

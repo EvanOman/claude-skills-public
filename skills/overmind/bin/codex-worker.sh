@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # codex-worker — scriptable delegation interface to OpenAI Codex CLI (`codex exec`).
-# Used by the codex-worker skill: the orchestrator (Claude) writes briefs, this script
-# runs them on a Codex worker and returns SESSION id + final message + token usage.
+# The orchestrator writes a self-contained brief; this script runs it in a standalone
+# Codex session and returns the session id, final message, and token usage.
 #
 # Verbs:
 #   run  [-C dir] [-m model] [-p profile] [-s sandbox] [--full-access] [--schema f] [--label name] <brief|->
@@ -19,7 +19,7 @@ REGISTRY="$STATE_DIR/registry.tsv"
 
 die() { echo "codex-worker: $*" >&2; exit 1; }
 
-command -v codex >/dev/null || die "codex CLI not found (bun install -g @openai/codex)"
+command -v codex >/dev/null || die "codex CLI not found; install the official Codex CLI"
 command -v jq >/dev/null || die "jq not found"
 
 extract_and_report() {
@@ -51,7 +51,7 @@ verb="${1:-}"; shift || true
 
 case "$verb" in
   run)
-    workdir="$PWD" model="" profile="worker" sandbox="" schema="" label="task" extra=()
+    workdir="$PWD" model="" profile="" sandbox="" schema="" label="task" extra=()
     while [[ $# -gt 0 ]]; do
       case "$1" in
         -C) workdir="$2"; shift 2 ;;
@@ -67,8 +67,8 @@ case "$verb" in
     done
     brief="${1:-}"
     [[ -n "$brief" ]] || die "run: missing brief (use '-' to read stdin)"
-    args=(exec -p "$profile" -C "$workdir" --skip-git-repo-check --json
-          -c 'skills.enabled=false')
+    args=(exec -C "$workdir" --skip-git-repo-check --json)
+    [[ -n "$profile" ]] && args+=(-p "$profile")
     [[ -n "$model" ]] && args+=(-m "$model")
     [[ -n "$sandbox" ]] && args+=(-s "$sandbox")
     [[ -n "$schema" ]] && args+=(--output-schema "$schema")
@@ -88,9 +88,9 @@ case "$verb" in
     [[ -n "$sid" && -n "$prompt" ]] || die "usage: cont <session-id> <prompt|->"
     log="$STATE_DIR/pending.$$.jsonl"; errf="$STATE_DIR/pending.$$.err"
     if [[ "$prompt" == "-" ]]; then
-      codex exec resume "$sid" --json --skip-git-repo-check -c 'skills.enabled=false' - > "$log" 2> "$errf"
+      codex exec resume "$sid" --json --skip-git-repo-check - > "$log" 2> "$errf"
     else
-      printf '%s' "$prompt" | codex exec resume "$sid" --json --skip-git-repo-check -c 'skills.enabled=false' - > "$log" 2> "$errf"
+      printf '%s' "$prompt" | codex exec resume "$sid" --json --skip-git-repo-check - > "$log" 2> "$errf"
     fi
     code=$?
     # resume re-reports the same thread id; reuse extract path (appends registry row)

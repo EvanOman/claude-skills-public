@@ -1,0 +1,7 @@
+interface:
+  display_name: "Graduate Skill"
+  short_description: "Publish a skill from its canonical owner"
+  default_prompt: "Use $graduate-skill to publish this private skill through the shared registry."
+
+policy:
+  allow_implicit_invocation: false

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # worker.sh — thin wrapper that lets an orchestrator drive an opencode worker.
 #
-# The orchestrator (a premium model like Fable) keeps the judgment; this script
-# submits well-specified briefs to a cheaper-but-capable worker model (GLM-5.2 by
-# default) running inside opencode, and hands back the worker's output + session id.
+# The orchestrator keeps the judgment; this script submits well-specified briefs to
+# the configured worker model running inside opencode and returns output plus session id.
 #
 # Verbs:
 #   worker.sh run   "<brief>"              Fresh EPHEMERAL worker (clean context). Prints SESSION=<id>.

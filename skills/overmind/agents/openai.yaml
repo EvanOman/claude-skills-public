@@ -1,0 +1,7 @@
+interface:
+  display_name: "Overmind"
+  short_description: "Delegate and verify coordinated worker tasks"
+  default_prompt: "Use $overmind to orchestrate this mission with isolated workers."
+
+policy:
+  allow_implicit_invocation: false

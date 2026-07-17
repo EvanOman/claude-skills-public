@@ -1,6 +1,6 @@
 # Backend: opencode — GLM-5.2 via opencode CLI
 
-Wrapper: `~/.claude/skills/overmind/bin/opencode-worker.sh`. Metered API
+Wrapper: `bin/opencode-worker.sh` relative to the overmind skill root. Metered API
 (~$1.4/$4.4 per Mtok on GLM-5.2) — cheap but not free; check `stats`. One-time setup
 (z.ai key, provider config) is documented in `../reference/opencode-setup.md` — read it
 if `run` errors about a missing key.
@@ -8,7 +8,7 @@ if `run` errors about a missing key.
 ## Verbs
 
 ```bash
-W=~/.claude/skills/overmind/bin/opencode-worker.sh
+W="<skill-root>/bin/opencode-worker.sh"
 export WORKER_DIR=/path/to/project      # the project the worker edits — always set
 
 "$W" run  "<brief>"                # fresh worker, clean context → prints SESSION=<id>
