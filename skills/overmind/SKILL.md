@@ -18,15 +18,20 @@ writing a precise brief.
 
 Read only the selected backend reference before first dispatch:
 
-- `backends/codex.md` — default; prefer native, subscription-backed Codex delegation, with a Codex
-  CLI fallback when native delegation is unavailable.
-- `backends/claude.md` — native Claude subagents when their harness capabilities or context are
-  specifically useful.
+- `backends/codex.md` — Codex workers: native Codex delegation inside Codex, the official Codex MCP
+  bridge inside Claude, then a Codex CLI fallback.
+- `backends/claude.md` — Claude workers: native Claude subagents inside Claude and Claude's
+  daemon-backed background-agent CLI from Codex.
 - `backends/opencode.md` — metered external-model workers when the user requests them or native
   capacity is unavailable.
 
-An explicit user choice wins. Otherwise use native Codex delegation. Preserve provider and billing
-facts inside backend references rather than assuming a fixed model version in this core workflow.
+An explicit user choice wins. Otherwise prefer the active harness's native registry: Codex workers
+in Codex, Claude workers in Claude. Crossing harnesses does not make the worker a native registry
+entry in the parent harness. When the bundled Overmind lifecycle MCP server is configured, prefer
+its common `spawn`, `list`, `status`, `wait`, `result`, `followup`, `interrupt`, and `cleanup`
+operations for cross-harness work; otherwise use the selected backend's provider-specific bridge.
+Read `mcp/README.md` for installation and capability details. Preserve provider and billing facts
+inside backend references rather than assuming a fixed model version here.
 
 When useful, run `bin/usage-check.sh` from this skill directory before a large fan-out. Treat its
 output as advisory because quota snapshots can be stale. If the selected backend lacks headroom,
@@ -58,6 +63,15 @@ equivalent isolated checkout. Never let workers race in a shared checkout.
 Before dispatch into an existing checkout, record its status so pre-existing changes remain
 distinguishable from worker output. Give workers the narrowest permissions and directory scope that
 can complete the brief.
+
+## Use exactly one background owner
+
+For every dispatch, exactly one layer owns background execution. A native registry owns its agent;
+the Overmind lifecycle bridge owns the provider job behind its durable Overmind ID; a synchronous
+MCP bridge stays a harness-tracked tool call; `claude --bg` owns its daemon session; and a CLI wrapper
+stays in the foreground of one harness-managed background command. Never add shell `&`, `nohup`,
+`disown`, or a nested fan-out beneath one of those layers. Save the lifecycle identifier returned by
+the owning layer and use that layer to inspect, continue, stop, and collect the result.
 
 ## Manage worker state
 
