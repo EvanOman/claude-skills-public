@@ -164,6 +164,20 @@ assert_contains "$status_output" 'STATE=done'
 assert_contains "$status_output" 'NAME=fake-one'
 [[ "$(run_worker last 00000001)" == 'FAKE_OK' ]]
 
+full_status_output=$(run_worker status 00000001-0000-4000-8000-000000000001)
+assert_contains "$full_status_output" 'ID=00000001'
+
+set +e
+short_prefix_output=$(run_worker status 0000000 2>&1)
+short_prefix_code=$?
+uuid_prefix_output=$(run_worker status 00000001-0000 2>&1)
+uuid_prefix_code=$?
+set -e
+[[ "$short_prefix_code" == 2 ]]
+[[ "$uuid_prefix_code" == 2 ]]
+assert_contains "$short_prefix_output" 'expected 8-character daemon ID or full session UUID'
+assert_contains "$uuid_prefix_output" 'expected 8-character daemon ID or full session UUID'
+
 set +e
 failure_output=$(run_worker run --wait -m haiku 'FAIL NOW' 2>&1)
 failure_code=$?
@@ -197,5 +211,33 @@ assert_contains "$wait_output" 'stopped by test'
 list_output=$(run_worker list)
 assert_contains "$list_output" $'ID\tSTATE\tNAME\tCWD\tSESSION'
 assert_contains "$list_output" $'00000003\tdone'
+
+# Resolution must reject duplicate exact identifiers before invoking Claude,
+# especially for destructive operations.
+mkdir -p "$JOBS_DIR/duplicate-short"
+jq '.sessionId="aaaaaaaa-0000-4000-8000-000000000001" |
+  .resumeSessionId=.sessionId' \
+  "$JOBS_DIR/00000001/state.json" >"$JOBS_DIR/duplicate-short/state.json"
+calls_before=$(wc -l <"$CALLS")
+set +e
+ambiguous_stop_output=$(run_worker stop 00000001 2>&1)
+ambiguous_stop_code=$?
+set -e
+[[ "$ambiguous_stop_code" == 1 ]]
+assert_contains "$ambiguous_stop_output" 'ambiguous job ID: 00000001 matched 2 jobs'
+[[ "$(wc -l <"$CALLS")" == "$calls_before" ]]
+
+mkdir -p "$JOBS_DIR/duplicate-session"
+jq '.daemonShort="000000aa"' \
+  "$JOBS_DIR/00000001/state.json" >"$JOBS_DIR/duplicate-session/state.json"
+calls_before=$(wc -l <"$CALLS")
+set +e
+ambiguous_rm_output=$(run_worker rm 00000001-0000-4000-8000-000000000001 2>&1)
+ambiguous_rm_code=$?
+set -e
+[[ "$ambiguous_rm_code" == 1 ]]
+assert_contains "$ambiguous_rm_output" \
+  'ambiguous job ID: 00000001-0000-4000-8000-000000000001 matched 2 jobs'
+[[ "$(wc -l <"$CALLS")" == "$calls_before" ]]
 
 printf 'claude-worker fake tests: PASS\n'

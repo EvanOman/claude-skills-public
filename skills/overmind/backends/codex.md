@@ -15,7 +15,8 @@ absolute working directory, and label. Keep the returned Overmind job ID and use
 `overmind_wait`, `overmind_result`, `overmind_followup`, `overmind_interrupt`, and
 `overmind_cleanup`. The provider's Codex thread ID remains visible in the job record. Continuation
 starts only after the current turn is terminal; live steering and thread fork remain native-Codex
-capabilities.
+capabilities. The bridge refuses dispatch unless `codex login status` confirms ChatGPT auth, then
+ignores custom user configuration and pins the built-in OpenAI provider for the worker turn.
 
 ## Codex to Codex: native delegation
 

@@ -55,7 +55,8 @@ Use this path for an actual Claude worker. Do not substitute a native Codex suba
 Codex has a better-integrated registry; that changes the requested provider.
 
 When the Overmind MCP server is available, call `overmind_spawn` with `provider: "claude"`, an
-explicit model, the complete brief, absolute working directory, and label. Keep the returned
+explicit model, the complete brief, absolute working directory, and label. It refuses dispatch
+unless the sanitized Claude CLI reports a logged-in `claude.ai` subscription. Keep the returned
 Overmind job ID and use the common lifecycle tools for status, waiting, results, follow-up,
 interruption, and cleanup. The provider's Claude daemon ID remains visible in the job record.
 

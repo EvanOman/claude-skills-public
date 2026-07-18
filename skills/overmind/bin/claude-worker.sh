@@ -64,7 +64,10 @@ require_value() {
 validate_id() {
   local id="$1"
   [[ -n "$id" ]] || usage_error "missing job ID"
-  [[ "$id" =~ ^[[:alnum:]_.-]+$ ]] || usage_error "invalid job ID: $id"
+  if [[ ! "$id" =~ ^[[:xdigit:]]{8}$ && \
+        ! "$id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+    usage_error "invalid job ID (expected 8-character daemon ID or full session UUID): $id"
+  fi
 }
 
 read_prompt() {
@@ -89,26 +92,6 @@ run_claude() {
   fi
 }
 
-state_file_for_id() {
-  local id="$1" candidate session daemon
-  candidate="$CLAUDE_JOBS_DIR/$id/state.json"
-  if [[ -f "$candidate" ]]; then
-    printf '%s\n' "$candidate"
-    return 0
-  fi
-
-  for candidate in "$CLAUDE_JOBS_DIR"/*/state.json; do
-    [[ -f "$candidate" ]] || continue
-    session=$(jq -r '.sessionId // .resumeSessionId // empty' "$candidate" 2>/dev/null) || continue
-    daemon=$(jq -r '.daemonShort // empty' "$candidate" 2>/dev/null) || continue
-    if [[ "$id" == "$session" || "$id" == "$daemon" ]]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
 agents_json() {
   local output
   if ! output=$(run_claude default agents --json --all 2>/dev/null); then
@@ -118,30 +101,49 @@ agents_json() {
 }
 
 state_json_for_id() {
-  local id="$1" state_file all
-  if state_file=$(state_file_for_id "$id"); then
-    jq -c . "$state_file" 2>/dev/null && return 0
+  local id="$1" all matches count
+  local -a state_files=()
+
+  shopt -s nullglob
+  state_files=("$CLAUDE_JOBS_DIR"/*/state.json)
+  shopt -u nullglob
+  if (( ${#state_files[@]} > 0 )); then
+    matches=$(jq -cs --arg id "$id" '[.[] | select(
+      (.daemonShort // "") == $id or
+      (.id // "") == $id or
+      (.sessionId // .resumeSessionId // "") == $id
+    )]' "${state_files[@]}" 2>/dev/null) || return 1
+    count=$(jq -r 'length' <<<"$matches")
+    if (( count == 1 )); then
+      jq -c '.[0]' <<<"$matches"
+      return 0
+    elif (( count > 1 )); then
+      printf 'claude-worker: ambiguous job ID: %s matched %d jobs\n' "$id" "$count" >&2
+      return 1
+    fi
   fi
 
   all=$(agents_json) || return 1
-  jq -ce --arg id "$id" '
-    first(.[] | select(
-      (.id // "") == $id or
-      (.sessionId // "") == $id or
-      ((.sessionId // "") | startswith($id))
-    ))
-  ' <<<"$all" 2>/dev/null
+  matches=$(jq -c --arg id "$id" '[.[] | select(
+    (.daemonShort // "") == $id or
+    (.id // "") == $id or
+    (.sessionId // .resumeSessionId // "") == $id
+  )]' <<<"$all" 2>/dev/null) || return 1
+  count=$(jq -r 'length' <<<"$matches")
+  if (( count == 1 )); then
+    jq -c '.[0]' <<<"$matches"
+    return 0
+  elif (( count > 1 )); then
+    printf 'claude-worker: ambiguous job ID: %s matched %d jobs\n' "$id" "$count" >&2
+  fi
+  return 1
 }
 
 short_id_for() {
   local id="$1" state_json short
   if state_json=$(state_json_for_id "$id"); then
     short=$(jq -r '.daemonShort // .id // ((.sessionId // "")[0:8]) // empty' <<<"$state_json")
-    [[ -n "$short" ]] && printf '%s\n' "$short" && return 0
-  fi
-  if [[ "$id" =~ ^[[:xdigit:]]{8} ]]; then
-    printf '%s\n' "${id:0:8}"
-    return 0
+    [[ "$short" =~ ^[[:xdigit:]]{8}$ ]] && printf '%s\n' "$short" && return 0
   fi
   return 1
 }
@@ -234,7 +236,10 @@ show_last() {
     [[ -n "$detail" ]] && printf 'DETAIL=%s\n' "$detail" >&2
   fi
 
-  short=$(short_id_for "$id") || short="$id"
+  short=$(short_id_for "$id") || {
+    printf 'claude-worker: cannot resolve daemon ID for job: %s\n' "$id" >&2
+    return 1
+  }
   if ! run_claude default logs "$short"; then
     printf 'claude-worker: no result or readable logs for %s\n' "$id" >&2
     return 1
@@ -253,7 +258,10 @@ interrupt_wait() {
 
 wait_for_job() {
   local id="$1" state_json state detail short
-  short=$(short_id_for "$id") || short="$id"
+  short=$(short_id_for "$id") || {
+    printf 'claude-worker: cannot resolve daemon ID for job: %s\n' "$id" >&2
+    return 1
+  }
   WAIT_JOB_ID="$short"
   trap 'interrupt_wait 130 INT' INT
   trap 'interrupt_wait 143 TERM' TERM
@@ -371,7 +379,7 @@ case "$verb" in
     full_session=$(full_session_for "$original_id") || fail "cannot resolve session for job: $original_id"
     workdir=$(cwd_for "$original_id") || fail "cannot resolve working directory for job: $original_id"
     [[ -d "$workdir" ]] || fail "continuation working directory no longer exists: $workdir"
-    old_short=$(short_id_for "$original_id") || old_short="${original_id:0:8}"
+    old_short=$(short_id_for "$original_id") || fail "cannot resolve daemon ID for job: $original_id"
     cd -- "$workdir" || fail "cannot enter directory: $workdir"
 
     launch_report=$(launch_and_report "$auth_mode" "$workdir" "" "$old_short" \
@@ -416,7 +424,7 @@ case "$verb" in
   logs|stop|rm)
     (( $# == 1 )) || usage_error "$verb: expected <id>"
     validate_id "$1"
-    short=$(short_id_for "$1") || short="$1"
+    short=$(short_id_for "$1") || fail "cannot resolve daemon ID for job: $1"
     run_claude default "$verb" "$short"
     ;;
 
