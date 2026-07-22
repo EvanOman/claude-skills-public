@@ -19,6 +19,28 @@ brief-writing, architecture calls, and reviewing what comes back. Hand the *typi
 file edits, running tests, mechanical implementation — to a worker. Every worker is a
 strong engineer who cannot read your mind and does not share your context.
 
+## Stay in the control plane
+
+Keep decomposition, architecture, synthesis, brief-writing, integration, and review in
+the main loop. Delegate bounded evidence gathering, diagnosis, implementation, and test
+triage that a worker can complete and verify independently. Keep work inline only when
+it requires cross-cutting judgment or depends heavily on conversational context; the
+cost of writing a brief is not an exception.
+
+Before every main-loop tool call, classify it:
+
+- Use lifecycle calls to dispatch, steer, follow up, wait for, inspect, or collect workers.
+- Use one targeted read of a known path or value only when needed to make a brief concrete,
+  or take a required pre-dispatch safety snapshot.
+- Delegate a second logical query, a search that may branch on its result, a multi-file or
+  multi-resource scan, or work that could produce an independently useful report or artifact.
+
+Treat combined shell commands as their underlying logical operations; bundling commands
+does not bypass this gate. Once workers are active, do not fill their latency with
+dispatched or queued worker work. Dispatch more work when capacity exists; at saturation,
+hold the next brief, steer or follow up with an owner, or wait. Use returned evidence for
+architecture and synthesis rather than repeating discovery.
+
 This file is the invariant core: the discipline is identical for every backend. The
 mechanics of each backend live in `backends/<name>.md` — **read a backend's file before
 first using it in a session**, and only for the backend you chose.
@@ -77,10 +99,10 @@ DONE WHEN:   The observable definition of done — the worker's target to hill-c
 VERIFY:      The exact command(s) that prove it.
 ```
 
-If you can't write DONE WHEN and VERIFY concretely, the task isn't ready to delegate —
-decompose further or do the design step yourself first. Delegate execution, never your
-unstated judgment. Batch related mechanical work into one brief rather than many
-round-trips.
+If you can't write DONE WHEN and VERIFY concretely, decompose further or dispatch a
+read-only investigator before assigning execution. Delegate execution, never your
+unstated judgment. Batch related mechanical work when it shares context; do not split
+one bounded task merely to maximize worker count.
 
 ## Worker lifecycle: fresh, continue, or fork
 
@@ -95,6 +117,11 @@ SendMessage). The decision logic is backend-independent:
   poisoned one.
 - **Default to fresh, ephemeral workers.** Persistence is a deliberate choice for
   genuinely stateful chains. Long-lived sessions drift and cost more per turn.
+
+Require the worker that starts verification to own it through a terminal result. Treat
+a handoff that says a check is still running as incomplete: continue the same worker and
+wait through its lifecycle owner instead of shell-polling, duplicating the check, or
+immediately replacing the worker.
 
 ## Parallel fan-out
 
@@ -115,7 +142,8 @@ explicit opt-in (see backends/claude.md).
 
 ## Trust, then verify — every time, every backend
 
-The worker is capable but it is not you. After every handoff:
+The worker is capable but it is not you. Begin verification after handoff and limit it
+to artifact inspection and the named acceptance checks. After every handoff:
 
 1. **Read the diff** it produced (`git diff` in its workdir), not just its summary.
    Summaries can be rosy. Capture `git status --porcelain` **before** dispatching into
@@ -126,6 +154,9 @@ The worker is capable but it is not you. After every handoff:
 2. **Run the VERIFY command yourself.** "Tests pass" is a claim until you see it.
 3. **Check it against the brief** — did it do what you asked, or something adjacent?
 
+Do not repeat the worker's exploratory search or diagnosis. Send unexpected findings
+back to an owner as a focused follow-up.
+
 If it's wrong, decide *why* it missed — usually the brief was underspecified. Tighten
 the brief and continue the same worker (it sees its own attempt). **Two failed passes
 on the same task = stop delegating it.** Rewrite the brief or take it inline; never
@@ -135,17 +166,16 @@ loop a confused worker a third time.
 
 Keep YOUR tokens for: planning, decomposition, brief-writing, diff review, architecture
 calls, debugging what stumps the worker, and cross-file coherence. Don't read whole
-files a worker can read itself. Do it inline instead of delegating when the task needs
-full conversation context, cross-file design coherence, or when writing the brief would
-cost more than the work.
+files a worker can read itself. Work inline only when the task needs full conversation
+context or cross-file design coherence.
 
 ## Mode durability
 
-Instructions loaded once decay as context grows (context rot) — in a long session you
-will drift back toward implementing things yourself. That's expected, not a failure of
-discipline; the remedy is re-invocation. If you catch yourself editing files a worker
-could handle, or the user says "aren't you supposed to be delegating?", re-invoke this
-skill to re-assert the mode.
+Instructions loaded once decay as context grows (context rot). Reapply the control-plane
+and tool-call gate after context compaction, a goal or mission change, or a long
+continuation. Re-invoke this skill when the main loop starts doing delegable discovery,
+diagnosis, implementation, or test triage, or when the user asks to restore overmind
+behavior.
 
 ## Backends
 
