@@ -36,6 +36,9 @@ Require every main-loop tool call to fit one of these classes:
   when capacity exists and that fact is the final missing input before immediate dispatch.
   This allowance is one operation per brief; it does not reset with each tool call.
 - Verify returned work through the post-handoff artifact and evidence checks below.
+- Use inline execution operations only when the explicit two-pass circuit breaker below
+  authorizes them and lifecycle evidence confirms every prior worker and check owner for
+  that brief is terminal or cancelled. This class never overrides saturation.
 
 Treat combined shell commands as their underlying logical operations; bundling commands
 does not bypass this gate. Delegate any further, branching, or multi-resource discovery
