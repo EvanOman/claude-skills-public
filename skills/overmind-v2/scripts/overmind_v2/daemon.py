@@ -50,6 +50,7 @@ class Daemon:
         self.stop_event = threading.Event()
         self.server: socket.socket | None = None
         self._threads: set[threading.Thread] = set()
+        self._connections: set[socket.socket] = set()
         self._threads_lock = threading.Lock()
         self._lock_fd: int | None = None
         self._owns_socket = False
@@ -177,6 +178,7 @@ class Daemon:
             return
         finally:
             with self._threads_lock:
+                self._connections.discard(connection)
                 self._threads.discard(threading.current_thread())
 
     def serve(self) -> int:
@@ -200,6 +202,7 @@ class Daemon:
                 daemon=True,
             )
             with self._threads_lock:
+                self._connections.add(connection)
                 self._threads.add(thread)
             thread.start()
         self.close()
@@ -216,6 +219,20 @@ class Daemon:
             except OSError:
                 pass
             self.server = None
+        with self._threads_lock:
+            connections = list(self._connections)
+            threads = list(self._threads)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
+        deadline = time.monotonic() + 2
+        for thread in threads:
+            if thread is threading.current_thread():
+                continue
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self._owns_socket:
             try:
                 self.socket_path.unlink()

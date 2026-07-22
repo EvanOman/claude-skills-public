@@ -439,16 +439,61 @@ class ClaudeProvider(Provider):
 
     @staticmethod
     def _parse_job_id(output: str) -> str | None:
-        matches = re.findall(
-            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|\b[0-9a-fA-F]{8}\b",
-            output,
+        identifier = (
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+            r"|[0-9a-fA-F]{8}"
         )
-        return matches[0] if matches else None
+        for raw_line in output.splitlines():
+            line = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw_line).strip()
+            exact = re.fullmatch(identifier, line)
+            if exact:
+                return exact.group(0)
+            labelled = re.search(
+                rf"\b(?:job|agent)(?:\s+id)?\s*[:=]\s*({identifier})\b",
+                line,
+                re.IGNORECASE,
+            )
+            if labelled:
+                return labelled.group(1)
+        return None
+
+    def _agents(self) -> list[dict[str, Any]]:
+        completed = subprocess.run(
+            [self.binary, "agents", "--json", "--all"],
+            text=True,
+            capture_output=True,
+            env=self._env(),
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode:
+            return []
+        try:
+            value = json.loads(completed.stdout)
+        except ValueError:
+            return []
+        return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+    def _recover_agent_id(self, job: dict[str, Any]) -> str | None:
+        launch_name = f"overmind-{job['short_id']}"
+        matches = [
+            item
+            for item in self._agents()
+            if item.get("name") == launch_name and item.get("cwd") == job["cwd"]
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda item: float(item.get("startedAt", 0) or 0))
+        selected = matches[-1]
+        identifier = selected.get("id") or selected.get("daemonShort")
+        if not identifier and selected.get("sessionId"):
+            identifier = str(selected["sessionId"])[:8]
+        return str(identifier)[:8] if identifier else None
 
     def launch(
         self, job: dict[str, Any], brief: str, *, resume_thread: str | None = None
     ) -> dict[str, Any]:
-        capabilities = self.probe()
+        capabilities = job.get("capabilities") or {}
         if (
             not capabilities.get("available")
             or capabilities.get("billing_class") != "subscription-native"
@@ -466,7 +511,7 @@ class ClaudeProvider(Provider):
             "--permission-mode",
             "dontAsk",
             "--name",
-            job["label"],
+            f"overmind-{job['short_id']}",
             "--",
             brief,
         ]
@@ -489,6 +534,8 @@ class ClaudeProvider(Provider):
             )
         provider_job_id = self._parse_job_id(completed.stdout + completed.stderr)
         if not provider_job_id:
+            provider_job_id = self._recover_agent_id(job)
+        if not provider_job_id:
             raise OvermindError("Claude launch returned no background job ID")
         config_root = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
         short_id = provider_job_id[:8]
@@ -505,6 +552,19 @@ class ClaudeProvider(Provider):
         }
 
     def reconcile(self, job: dict[str, Any]) -> dict[str, Any]:
+        if not job.get("provider_job_id"):
+            recovered = self._recover_agent_id(job)
+            if recovered:
+                config_root = Path(
+                    os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")
+                )
+                return {
+                    "state": "running",
+                    "provider_job_id": recovered,
+                    "provider_state_path": str(
+                        config_root / "jobs" / recovered / "state.json"
+                    ),
+                }
         state_path = Path(job.get("provider_state_path") or "")
         if not state_path.is_file():
             if time.time() - float(job.get("updated_at", 0)) < 5:
@@ -658,7 +718,7 @@ class CodexProvider(Provider):
     def launch(
         self, job: dict[str, Any], brief: str, *, resume_thread: str | None = None
     ) -> dict[str, Any]:
-        capabilities = self.probe()
+        capabilities = job.get("capabilities") or {}
         if (
             not capabilities.get("available")
             or capabilities.get("billing_class") != "subscription-native"
@@ -735,7 +795,10 @@ class CodexProvider(Provider):
         }
 
     def reconcile(self, job: dict[str, Any]) -> dict[str, Any]:
-        path = Path(job.get("provider_state_path") or "")
+        path = Path(
+            job.get("provider_state_path")
+            or (Path(job["brief_path"]).parent / "codex-state.json")
+        )
         if not path.is_file():
             return {"state": "unknown", "error": "Codex provider state is unavailable"}
         value = parse_json(path.read_text(encoding="utf-8"))

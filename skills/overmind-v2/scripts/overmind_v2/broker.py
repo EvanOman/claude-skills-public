@@ -471,20 +471,6 @@ class Broker:
 
     def reconcile_nonterminal(self) -> None:
         for job in self.store.nonterminal_jobs():
-            if job["state"] in {"queued", "starting"} and not (
-                job.get("provider_job_id")
-                or job.get("provider_state_path")
-                or job.get("runner_pid")
-            ):
-                self.store.update_job(
-                    job["id"],
-                    kind="job.recovery_unknown",
-                    state="unknown",
-                    fields={
-                        "error": "broker restarted before launch identity was durable"
-                    },
-                )
-                continue
             try:
                 reconciled = self._reconcile_job(job["id"])
                 if reconciled["state"] not in TERMINAL_STATES:
@@ -585,6 +571,18 @@ class Broker:
             return bool(jobs) and all(job["state"] in TERMINAL_STATES for job in jobs)
         raise OvermindError(f"invalid await condition: {condition}")
 
+    @staticmethod
+    def _public_events(
+        events: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for event in events:
+            value = dict(event)
+            if "state" in value:
+                value["event_state"] = value.pop("state")
+            result.append(value)
+        return result
+
     def await_jobs(
         self,
         params: Mapping[str, Any],
@@ -627,7 +625,7 @@ class Broker:
                     "timed_out": not satisfied,
                     "cursor": latest,
                     "counts": dict(sorted(counts.items())),
-                    "events": events,
+                    "events": self._public_events(events),
                     "jobs": [self._job_snapshot(job) for job in jobs],
                     "suggested_next": "collect" if satisfied else "await",
                 }
@@ -637,7 +635,7 @@ class Broker:
                     progress(
                         {
                             "cursor": cursor,
-                            "events": events,
+                            "events": self._public_events(events),
                             "counts": dict(Counter(job["state"] for job in jobs)),
                         }
                     )
@@ -648,7 +646,7 @@ class Broker:
             if progress and not events and time.monotonic() < deadline:
                 # A bounded heartbeat detects a caller that closed its socket
                 # without manufacturing a duplicate event cursor.
-                progress({"heartbeat": True})
+                progress({"heartbeat": True, "last_cursor": cursor})
 
     def collect(self, params: Mapping[str, Any]) -> dict[str, Any]:
         max_jobs = max(1, min(int(params.get("max_jobs", 32)), 100))
