@@ -8,6 +8,8 @@
 - Event and wait contract
 - Provider contract
 - Recovery and safety
+- MCP Tasks compatibility
+- Known boundaries
 - Agent-native capability map
 
 ## Runtime layout
@@ -85,6 +87,32 @@ Use SQLite WAL transactions and a busy timeout. On broker start, reconcile only 
 Never duplicate a launch during recovery. Preserve unobservable work as `unknown`. Verify process
 identity before signaling locally managed processes. Stop and forget require a canonical UUID or an
 unambiguous short ID.
+
+## MCP Tasks compatibility
+
+The broker ledger, not an MCP connection, is the durable source of truth. The current adapter uses
+ordinary tool calls, progress notifications, and resumable broker cursors. It deliberately does not
+advertise MCP Tasks yet: the `2025-11-25` task primitive is experimental and requestor-polled, while
+the proposed `2026-07-28` protocol moves Tasks into a negotiated extension with a breaking lifecycle
+change. See the [current Tasks specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks)
+and the [Tasks extension overview](https://modelcontextprotocol.io/extensions/tasks/overview).
+
+Once both harness clients negotiate the same stable Tasks extension, add it as a transport adapter:
+map task creation to `run` or `run-many`, task inspection to `show`, result retrieval to `collect`,
+and cancellation to `stop`. Keep groups, provider identities, artifacts, billing evidence, and event
+cursors in the broker so reconnects and cross-harness handoffs do not depend on one client's task
+registry.
+
+## Known boundaries
+
+- Broker lifecycle records are shared across harnesses, but they do not become entries in each
+  harness's native in-process subagent registry.
+- Codex capability discovery reports app-server availability, while execution currently uses the
+  subscription-authenticated `codex exec --json` adapter.
+- A provider interrupt can be retried after a crash. The broker verifies local process identity, but
+  exactly-once provider-side stop or deletion requires provider-native idempotency support.
+- `forget` removes terminal broker metadata; provider-native transcript deletion remains a separate,
+  explicit operation.
 
 ## Agent-native capability map
 
