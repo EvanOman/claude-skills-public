@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from collections import Counter
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import (
+    AmbiguousIdError,
     ConflictError,
     NotFoundError,
     OvermindError,
@@ -49,6 +51,8 @@ class Broker:
     def close(self, timeout: float = 5.0) -> None:
         self._closing.set()
         self._notify()
+        for provider in set(self.providers.values()):
+            provider.close()
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
             with self._watchers_lock:
@@ -112,6 +116,13 @@ class Broker:
             return self.providers[name]
         except KeyError as error:
             raise NotFoundError(f"provider not found: {name}") from error
+
+    @staticmethod
+    def _should_watch(job: Mapping[str, Any]) -> bool:
+        payload = job.get("provider_payload")
+        fake = payload.get("fake") if isinstance(payload, Mapping) else None
+        mode = fake.get("mode") if isinstance(fake, Mapping) else None
+        return not (job.get("provider") == "fake" and mode in {"hold", "stale-process"})
 
     @staticmethod
     def _validate_cwd(value: Any) -> str:
@@ -323,7 +334,14 @@ class Broker:
                         errors.append(error)
             if errors:
                 errors.sort(key=lambda error: str(error))
-                raise OvermindError(str(errors[0])) from errors[0]
+                partial = self._launch_response(
+                    entity["group_id"], entity["job_ids"], True, False
+                )
+                partial["partial_launch"] = True
+                partial["errors"] = [str(error) for error in errors]
+                raise OvermindError(
+                    str(errors[0]), code="partial_launch", data=partial
+                ) from errors[0]
         return self._launch_response(
             entity["group_id"],
             entity["job_ids"],
@@ -371,17 +389,39 @@ class Broker:
                     resume_thread=spec.get("resume_thread"),
                 )
             )
+            actual_billing = update.get("billing_class")
+            if (
+                actual_billing is not None
+                and str(actual_billing) != job["billing_class"]
+                and not job.get("allow_billing_class_change")
+            ):
+                detail = (
+                    "provider billing fallback changed "
+                    f"{job['billing_class']} to {actual_billing}; explicit opt-in is required"
+                )
+                if str(update.get("state", "running")) not in TERMINAL_STATES:
+                    try:
+                        provider.interrupt({**job, **update})
+                    except Exception:
+                        pass
+                self._apply_observation(
+                    job_id,
+                    {**update, "state": "failed", "error": detail},
+                    kind="job.billing_rejected",
+                )
+                raise OvermindError(detail, code="billing_class_changed")
             self._apply_observation(job_id, update, kind="job.launched")
             job = self.store.get_job(job_id)
-            if job["state"] not in TERMINAL_STATES:
+            if job["state"] not in TERMINAL_STATES and self._should_watch(job):
                 self._watch(job_id)
         except Exception as error:
-            self.store.update_job(
-                job_id,
-                kind="job.launch_failed",
-                state="failed",
-                fields={"error": str(error)},
-            )
+            if self.store.get_job(job_id)["state"] != "failed":
+                self.store.update_job(
+                    job_id,
+                    kind="job.launch_failed",
+                    state="failed",
+                    fields={"error": str(error)},
+                )
             self._notify()
             raise
 
@@ -389,13 +429,6 @@ class Broker:
         self, job_id: str, observation: Mapping[str, Any], *, kind: str
     ) -> dict[str, Any]:
         current = self.store.get_job(job_id)
-        actual_billing = observation.get("billing_class")
-        if actual_billing is not None and str(actual_billing) != current["billing_class"]:
-            if not current.get("allow_billing_class_change"):
-                raise OvermindError(
-                    "provider billing fallback changed "
-                    f"{current['billing_class']} to {actual_billing}; explicit opt-in is required"
-                )
         state = str(observation.get("state", current["state"]))
         if state not in {
             "queued",
@@ -444,8 +477,10 @@ class Broker:
                 recorded_evidence = True
         usage = observation.get("usage")
         if isinstance(usage, dict) and usage:
-            self.store.add_usage(job_id, current["provider"], usage)
-            recorded_evidence = True
+            recorded_evidence = (
+                self.store.add_usage(job_id, current["provider"], usage)
+                or recorded_evidence
+            )
         if recorded_evidence:
             self._notify()
         return current
@@ -501,7 +536,10 @@ class Broker:
         for job in self.store.nonterminal_jobs():
             try:
                 reconciled = self._reconcile_job(job["id"])
-                if reconciled["state"] not in TERMINAL_STATES:
+                if (
+                    reconciled["state"] not in TERMINAL_STATES
+                    and self._should_watch(reconciled)
+                ):
                     self._watch(job["id"])
             except Exception as error:
                 self.store.update_job(
@@ -514,6 +552,8 @@ class Broker:
 
     def jobs(self, params: Mapping[str, Any]) -> dict[str, Any]:
         filters = dict(params)
+        if filters.get("since_cursor") is not None and filters.get("after_cursor") is None:
+            filters["after_cursor"] = filters["since_cursor"]
         if filters.get("group") and not filters.get("group_id"):
             _, filters["group_id"] = self.store.resolve(
                 str(filters.pop("group")), kind="group"
@@ -526,7 +566,11 @@ class Broker:
         }
 
     def _resolve_target(
-        self, target: Any, *, kind: str | None = None
+        self,
+        target: Any,
+        *,
+        kind: str | None = None,
+        destructive: bool = False,
     ) -> tuple[str, str]:
         if isinstance(target, Mapping):
             group_id = target.get("group_id", target.get("groupId"))
@@ -536,13 +580,35 @@ class Broker:
             if group_id:
                 if kind == "job":
                     raise OvermindError("a job target is required")
-                return self.store.resolve(str(group_id), kind="group")
+                identifier = str(group_id)
+                if destructive:
+                    self._require_safe_mutation_id(identifier)
+                return self.store.resolve(identifier, kind="group")
             if job_id:
                 if kind == "group":
                     raise OvermindError("a group target is required")
-                return self.store.resolve(str(job_id), kind="job")
+                identifier = str(job_id)
+                if destructive:
+                    self._require_safe_mutation_id(identifier)
+                return self.store.resolve(identifier, kind="job")
             raise OvermindError("target requires group_id or job_id")
-        return self.store.resolve(str(target), kind=kind)
+        identifier = str(target)
+        if destructive:
+            self._require_safe_mutation_id(identifier)
+        return self.store.resolve(identifier, kind=kind)
+
+    @staticmethod
+    def _require_safe_mutation_id(identifier: str) -> None:
+        full_uuid = re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
+            identifier,
+        )
+        short_id = re.fullmatch(r"[0-9a-fA-F]{8}", identifier)
+        if not (full_uuid or short_id):
+            raise AmbiguousIdError(
+                "mutation target requires a full UUID or exact 8-character short ID; "
+                f"{identifier!r} is ambiguous"
+            )
 
     def show(self, params: Mapping[str, Any]) -> dict[str, Any]:
         identifier = params.get("id", params.get("target"))
@@ -551,7 +617,7 @@ class Broker:
         kind, entity_id = self._resolve_target(identifier)
         if kind == "job":
             job = self.store.get_job(entity_id)
-            if job["state"] not in TERMINAL_STATES:
+            if params.get("fresh") and job["state"] not in TERMINAL_STATES:
                 job = self._reconcile_job(entity_id)
             return {
                 "kind": "job",
@@ -675,8 +741,14 @@ class Broker:
                     self._condition.wait(timeout=max(0.0, min(remaining, 0.25)))
             if progress and not events and time.monotonic() < deadline:
                 # A bounded heartbeat detects a caller that closed its socket
-                # without manufacturing a duplicate event cursor.
-                progress({"heartbeat": True, "last_cursor": cursor})
+                # without manufacturing a lifecycle event.
+                progress(
+                    {
+                        "heartbeat": True,
+                        "cursor": cursor,
+                        "counts": dict(Counter(job["state"] for job in jobs)),
+                    }
+                )
 
     def collect(self, params: Mapping[str, Any]) -> dict[str, Any]:
         max_jobs = max(1, min(int(params.get("max_jobs", 32)), 100))
@@ -708,12 +780,18 @@ class Broker:
         else:
             raise OvermindError("collect requires target, targets, or job_ids")
         results = []
-        for job in jobs[:max_jobs]:
+        selected_jobs = (
+            jobs
+            if bool(params.get("include_nonterminal", False))
+            else [job for job in jobs if job["state"] in TERMINAL_STATES]
+        )
+        for job in selected_jobs[:max_jobs]:
             preview = None
             truncated = False
             path = job.get("result_path")
             if path and Path(path).is_file() and preview_bytes:
-                raw = Path(path).read_bytes()
+                with Path(path).open("rb") as stream:
+                    raw = stream.read(preview_bytes + 1)
                 preview = raw[:preview_bytes].decode("utf-8", errors="ignore")
                 truncated = len(raw) > preview_bytes
             results.append(
@@ -739,11 +817,18 @@ class Broker:
         prompt = str(params.get("prompt", ""))
         if not identifier or not prompt.strip():
             raise OvermindError("reply requires job id and prompt")
-        _, job_id = self._resolve_target(identifier, kind="job")
+        _, job_id = self._resolve_target(identifier, kind="job", destructive=True)
         parent = self.store.get_job(job_id)
         if not (parent.get("provider_thread_id") or parent.get("provider_job_id")):
             raise ConflictError(
                 "provider thread ID is unavailable; continuation was not created"
+            )
+        if (
+            parent["state"] not in TERMINAL_STATES
+            and not parent.get("capabilities", {}).get("steer")
+        ):
+            raise ConflictError(
+                "parent job is still running and provider does not support live steering"
             )
         child_params = {
             "provider": parent["provider"],
@@ -778,7 +863,10 @@ class Broker:
         existing = self.store.lookup_idempotency("stop", request_payload, key)
         if existing:
             return existing
-        target, jobs = self._target_jobs(target_value)
+        kind, entity_id = self._resolve_target(target_value, destructive=True)
+        target, jobs = self._target_jobs(
+            {f"{kind}_id": entity_id}
+        )
         results = []
         for job in jobs:
             if job["state"] in TERMINAL_STATES:
@@ -825,7 +913,7 @@ class Broker:
         existing = self.store.lookup_idempotency("forget", request_payload, key)
         if existing:
             return existing
-        kind, entity_id = self._resolve_target(target_value)
+        kind, entity_id = self._resolve_target(target_value, destructive=True)
         if kind == "job":
             self.store.forget_job(entity_id)
         else:

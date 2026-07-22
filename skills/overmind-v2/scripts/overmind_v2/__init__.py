@@ -20,6 +20,17 @@ BILLING_CLASSES = frozenset({"subscription-native", "explicit-metered", "unknown
 class OvermindError(RuntimeError):
     """A concise error safe to return through the local RPC boundary."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "overmind_error",
+        data: object | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.data = data
+
 
 class ConflictError(OvermindError):
     """An idempotency key or state precondition conflicts with durable state."""

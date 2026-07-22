@@ -61,7 +61,6 @@ class Store:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=10000")
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
         return connection
 
@@ -87,6 +86,11 @@ class Store:
             connection.close()
 
     def _initialize(self) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+        finally:
+            connection.close()
         with self.transaction(immediate=True) as connection:
             connection.executescript(
                 f"""
@@ -555,16 +559,23 @@ class Store:
 
     def add_usage(
         self, job_id: str, provider: str, evidence: Mapping[str, Any]
-    ) -> None:
+    ) -> bool:
+        encoded = canonical_json(dict(evidence))
         with self.transaction(immediate=True) as connection:
             row = connection.execute(
                 "SELECT group_id FROM jobs WHERE id=?", (job_id,)
             ).fetchone()
             if row is None:
                 raise NotFoundError(f"job not found: {job_id}")
+            duplicate = connection.execute(
+                "SELECT 1 FROM usage WHERE job_id=? AND provider=? AND evidence_json=? LIMIT 1",
+                (job_id, provider, encoded),
+            ).fetchone()
+            if duplicate is not None:
+                return False
             connection.execute(
                 "INSERT INTO usage(job_id,provider,evidence_json,created_at) VALUES (?,?,?,?)",
-                (job_id, provider, canonical_json(dict(evidence)), time.time()),
+                (job_id, provider, encoded, time.time()),
             )
             self._event(
                 connection,
@@ -574,6 +585,7 @@ class Store:
                 kind="usage.recorded",
                 payload={"provider": provider, "evidence": dict(evidence)},
             )
+            return True
 
     def usage(self, job_id: str) -> list[dict[str, Any]]:
         with self.connection() as connection:
@@ -638,7 +650,11 @@ class Store:
         return [self._decode_job(row) for row in rows]
 
     def group_jobs(self, group_id: str) -> list[dict[str, Any]]:
-        return self.list_jobs({"group_id": group_id, "limit": 5000})
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM jobs WHERE group_id=? ORDER BY created_at", (group_id,)
+            ).fetchall()
+        return [self._decode_job(row) for row in rows]
 
     def nonterminal_jobs(self) -> list[dict[str, Any]]:
         placeholders = ",".join("?" for _ in TERMINAL_STATES)
@@ -695,6 +711,10 @@ class Store:
             if row["state"] not in TERMINAL_STATES:
                 raise ConflictError(f"cannot forget nonterminal job {job_id}")
             connection.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+            connection.execute(
+                "DELETE FROM idempotency WHERE entity_json LIKE ?",
+                (f"%{job_id}%",),
+            )
             self._event(
                 connection,
                 entity_type="job",
@@ -717,6 +737,10 @@ class Store:
             ).rowcount
             if not deleted:
                 raise NotFoundError(f"group not found: {group_id}")
+            connection.execute(
+                "DELETE FROM idempotency WHERE entity_json LIKE ?",
+                (f"%{group_id}%",),
+            )
             self._event(
                 connection,
                 entity_type="group",

@@ -126,6 +126,9 @@ class Provider:
     def interrupt(self, job: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
+    def close(self) -> None:
+        pass
+
 
 class ExternalCommandProvider(Provider):
     """One-shot JSON provider command used for injected provider adapters."""
@@ -135,6 +138,9 @@ class ExternalCommandProvider(Provider):
     def __init__(self, name: str, executable: str) -> None:
         self.name = name
         self.executable = executable
+        self._closed = False
+        self._processes: set[subprocess.Popen[str]] = set()
+        self._processes_lock = threading.Lock()
 
     def _available(self) -> bool:
         return shutil.which(self.executable) is not None
@@ -144,27 +150,61 @@ class ExternalCommandProvider(Provider):
             raise OvermindError(
                 f"{self.name} provider executable is unavailable: {self.executable}"
             )
-        completed = subprocess.run(
+        with self._processes_lock:
+            if self._closed:
+                raise OvermindError(f"{self.name} provider is shutting down")
+        process = subprocess.Popen(
             [self.executable, action],
-            input=json.dumps(request, separators=(",", ":")),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            capture_output=True,
-            check=False,
-            timeout=30,
             env=dict(os.environ),
         )
-        if completed.returncode:
-            detail = completed.stderr.strip() or completed.stdout.strip()
+        with self._processes_lock:
+            if self._closed:
+                process.terminate()
+            self._processes.add(process)
+        try:
+            stdout, stderr = process.communicate(
+                json.dumps(request, separators=(",", ":")), timeout=30
+            )
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.communicate()
+            raise OvermindError(
+                f"{self.name} provider {action} timed out"
+            ) from error
+        finally:
+            with self._processes_lock:
+                self._processes.discard(process)
+        if process.returncode:
+            detail = stderr.strip() or stdout.strip()
             raise OvermindError(
                 detail
-                or f"{self.name} provider {action} exited {completed.returncode}"
+                or f"{self.name} provider {action} exited {process.returncode}"
             )
-        response = parse_json(completed.stdout)
+        response = parse_json(stdout)
         if not response:
             raise OvermindError(
                 f"{self.name} provider {action} returned no JSON object"
             )
         return response
+
+    def close(self) -> None:
+        with self._processes_lock:
+            self._closed = True
+            processes = list(self._processes)
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        deadline = time.monotonic() + 1
+        for process in processes:
+            try:
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
     @staticmethod
     def _request(
@@ -620,6 +660,11 @@ class ClaudeProvider(Provider):
         usage = value.get("usage")
         if isinstance(usage, dict):
             update["usage"] = usage
+        elif isinstance(value.get("tokens"), (int, float)):
+            update["usage"] = {
+                "tokens": value["tokens"],
+                "source": "claude-state",
+            }
         detail = value.get("detail", value.get("error"))
         if detail:
             update["error"] = str(detail)
@@ -896,11 +941,14 @@ def ensure_billing(
     desired = requested or actual
     if desired not in BILLING_CLASSES:
         raise OvermindError(f"invalid billing class: {desired}")
+    supported = capabilities.get("billing_classes")
+    if isinstance(supported, list) and desired in supported:
+        return desired
     if desired != actual and not allow_billing_change:
         raise OvermindError(
             f"provider billing class is {actual}, not {desired}; explicit opt-in is required"
         )
-    return desired
+    return actual
 
 
 def _codex_runner(arguments: argparse.Namespace) -> int:

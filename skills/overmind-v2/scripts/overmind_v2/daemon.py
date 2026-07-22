@@ -162,16 +162,21 @@ class Daemon:
                             {"id": request_id, "ok": True, "result": result},
                         )
                     except Exception as error:
+                        error_payload: dict[str, Any] = {
+                            "type": type(error).__name__,
+                            "message": str(error),
+                        }
+                        if isinstance(error, OvermindError):
+                            error_payload["code"] = error.code
+                            if error.data is not None:
+                                error_payload["data"] = error.data
                         self._send(
                             writer,
                             write_lock,
                             {
                                 "id": request_id,
                                 "ok": False,
-                                "error": {
-                                    "type": type(error).__name__,
-                                    "message": str(error),
-                                },
+                                "error": error_payload,
                             },
                         )
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -213,6 +218,7 @@ class Daemon:
             return
         self._closed = True
         self.stop_event.set()
+        deadline = time.monotonic() + 2
         if self.server is not None:
             try:
                 self.server.close()
@@ -229,8 +235,7 @@ class Daemon:
                 pass
             connection.close()
         if self.broker is not None:
-            self.broker.close(timeout=5)
-        deadline = time.monotonic() + 2
+            self.broker.close(timeout=max(0.0, deadline - time.monotonic()))
         for thread in threads:
             if thread is threading.current_thread():
                 continue
