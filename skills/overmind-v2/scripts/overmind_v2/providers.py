@@ -113,8 +113,141 @@ class Provider:
     def reconcile(self, job: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
+    def continue_job(
+        self, job: dict[str, Any], brief: str, parent: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.launch(
+            job,
+            brief,
+            resume_thread=parent.get("provider_thread_id")
+            or parent.get("provider_job_id"),
+        )
+
     def interrupt(self, job: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
+
+
+class ExternalCommandProvider(Provider):
+    """One-shot JSON provider command used for injected provider adapters."""
+
+    production = False
+
+    def __init__(self, name: str, executable: str) -> None:
+        self.name = name
+        self.executable = executable
+
+    def _available(self) -> bool:
+        return shutil.which(self.executable) is not None
+
+    def _call(self, action: str, request: dict[str, Any]) -> dict[str, Any]:
+        if not self._available():
+            raise OvermindError(
+                f"{self.name} provider executable is unavailable: {self.executable}"
+            )
+        completed = subprocess.run(
+            [self.executable, action],
+            input=json.dumps(request, separators=(",", ":")),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+            env=dict(os.environ),
+        )
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise OvermindError(
+                detail
+                or f"{self.name} provider {action} exited {completed.returncode}"
+            )
+        response = parse_json(completed.stdout)
+        if not response:
+            raise OvermindError(
+                f"{self.name} provider {action} returned no JSON object"
+            )
+        return response
+
+    @staticmethod
+    def _request(
+        job: dict[str, Any], brief: str | None = None
+    ) -> dict[str, Any]:
+        request = dict(job.get("provider_payload") or {})
+        public_job = {
+            key: value
+            for key, value in job.items()
+            if key not in {"capabilities", "provider_payload"}
+        }
+        public_job.update(request)
+        request["job"] = public_job
+        request["billing_class"] = job.get("billing_class")
+        if job.get("provider_job_id"):
+            request["provider_job_id"] = job["provider_job_id"]
+        if brief is not None:
+            request["brief"] = brief
+        return request
+
+    @staticmethod
+    def _observation(response: dict[str, Any]) -> dict[str, Any]:
+        observation = dict(response)
+        artifacts = list(observation.get("artifacts") or [])
+        for kind, key in (("result", "result_path"), ("provider-log", "log_path")):
+            path = observation.get(key)
+            if path and not any(item.get("path") == path for item in artifacts):
+                artifacts.append({"kind": kind, "path": path})
+        if artifacts:
+            observation["artifacts"] = artifacts
+        return observation
+
+    def probe(self) -> dict[str, Any]:
+        if not self._available():
+            return {
+                "available": False,
+                "reason": f"provider executable is unavailable: {self.executable}",
+                "billing_class": "unknown",
+            }
+        response = self._call("capabilities", {})
+        classes = response.get("billing_classes")
+        if not response.get("billing_class") and isinstance(classes, list):
+            response["billing_class"] = (
+                "subscription-native"
+                if "subscription-native" in classes
+                else (classes[0] if classes else "unknown")
+            )
+        return response
+
+    def launch(
+        self, job: dict[str, Any], brief: str, *, resume_thread: str | None = None
+    ) -> dict[str, Any]:
+        action = "continue" if resume_thread else "launch"
+        request = self._request(job, brief)
+        if resume_thread:
+            request["provider_job_id"] = resume_thread
+        return self._observation(self._call(action, request))
+
+    def continue_job(
+        self, job: dict[str, Any], brief: str, parent: dict[str, Any]
+    ) -> dict[str, Any]:
+        request = self._request(job, brief)
+        provider_job_id = parent.get("provider_job_id")
+        if not provider_job_id:
+            raise OvermindError("parent provider job identity is unavailable")
+        request["provider_job_id"] = provider_job_id
+        return self._observation(self._call("continue", request))
+
+    def reconcile(self, job: dict[str, Any]) -> dict[str, Any]:
+        if not self._available():
+            return {
+                "state": "unknown",
+                "error": f"{self.name} provider is unavailable for reconciliation",
+            }
+        return self._observation(self._call("reconcile", self._request(job)))
+
+    def interrupt(self, job: dict[str, Any]) -> dict[str, Any]:
+        if not self._available():
+            return {
+                "state": "unknown",
+                "error": f"{self.name} provider is unavailable for interruption",
+            }
+        return self._observation(self._call("interrupt", self._request(job)))
 
 
 class FakeProvider(Provider):
@@ -264,7 +397,6 @@ class ClaudeProvider(Provider):
             and status.get("loggedIn") is True
             and status.get("authMethod") == "claude.ai"
             and status.get("apiProvider") == "firstParty"
-            and bool(status.get("subscriptionType"))
         )
         version = subprocess.run(
             [self.binary, "--version"],
@@ -679,8 +811,13 @@ def provider_registry() -> dict[str, Provider]:
         "claude": ClaudeProvider(),
         "codex": CodexProvider(),
     }
-    if os.environ.get("OVERMIND_V2_FAKE_PROVIDER"):
-        providers["fake"] = FakeProvider()
+    fake = os.environ.get("OVERMIND_V2_FAKE_PROVIDER")
+    if fake:
+        providers["fake"] = (
+            FakeProvider()
+            if fake.strip().lower() in {"1", "true", "yes", "builtin"}
+            else ExternalCommandProvider("fake", fake)
+        )
     return providers
 
 
@@ -750,9 +887,18 @@ def _codex_runner(arguments: argparse.Namespace) -> int:
     child: subprocess.Popen[str] | None = None
     child_identity: str | None = None
     interrupted = False
+    escalation_started = False
+
+    def escalate_stop(pid: int, identity: str) -> None:
+        time.sleep(5)
+        if process_matches(pid, identity):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def stop_child(_number: int, _frame: Any) -> None:
-        nonlocal interrupted
+        nonlocal escalation_started, interrupted
         interrupted = True
         if child is None or child.poll() is not None:
             return
@@ -761,6 +907,14 @@ def _codex_runner(arguments: argparse.Namespace) -> int:
                 os.killpg(child.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            if not escalation_started:
+                escalation_started = True
+                threading.Thread(
+                    target=escalate_stop,
+                    args=(child.pid, child_identity),
+                    name=f"codex-stop-escalation-{child.pid}",
+                    daemon=True,
+                ).start()
 
     previous = signal.signal(signal.SIGTERM, stop_child)
     event_fd = os.open(event_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

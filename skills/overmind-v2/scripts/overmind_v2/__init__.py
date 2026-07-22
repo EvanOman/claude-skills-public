@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 PROTOCOL = "overmind-v2"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STATES = (
     "queued",
     "starting",

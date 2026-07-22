@@ -113,6 +113,8 @@ class Store:
                     log_path TEXT,
                     error TEXT,
                     capabilities_json TEXT NOT NULL DEFAULT '{{}}',
+                    provider_payload_json TEXT NOT NULL DEFAULT '{{}}',
+                    allow_billing_class_change INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     terminal_at REAL
@@ -156,6 +158,18 @@ class Store:
                 );
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "provider_payload_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN provider_payload_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            if "allow_billing_class_change" not in columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN allow_billing_class_change INTEGER NOT NULL DEFAULT 0"
+                )
             row = connection.execute(
                 "SELECT version FROM schema_meta LIMIT 1"
             ).fetchone()
@@ -163,10 +177,15 @@ class Store:
                 connection.execute(
                     "INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
-            elif row["version"] != SCHEMA_VERSION:
+            elif int(row["version"]) > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"unsupported Overmind schema {row['version']}; expected {SCHEMA_VERSION}"
                 )
+            elif int(row["version"]) < SCHEMA_VERSION:
+                connection.execute(
+                    "UPDATE schema_meta SET version=?", (SCHEMA_VERSION,)
+                )
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         os.chmod(self.db_path, 0o600)
         for sidecar in (
             self.db_path.with_name("overmind.db-wal"),
@@ -187,7 +206,7 @@ class Store:
         with self._connect() as connection:
             for _ in range(100):
                 identifier = new_uuid()
-                short_id = identifier[:12]
+                short_id = identifier[:8]
                 exists = connection.execute(
                     f"SELECT 1 FROM {table} WHERE short_id=?", (short_id,)
                 ).fetchone()
@@ -266,8 +285,9 @@ class Store:
                 connection.execute(
                     """INSERT INTO jobs(
                          id,short_id,group_id,parent_job_id,provider,label,cwd,model,
-                         billing_class,state,brief_path,capabilities_json,created_at,updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         billing_class,state,brief_path,capabilities_json,
+                         provider_payload_json,allow_billing_class_change,created_at,updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         job["id"],
                         job["short_id"],
@@ -281,6 +301,8 @@ class Store:
                         "queued",
                         job["brief_path"],
                         canonical_json(job.get("capabilities", {})),
+                        canonical_json(job.get("provider_payload", {})),
+                        int(bool(job.get("allow_billing_class_change", False))),
                         now,
                         now,
                     ),
@@ -359,6 +381,12 @@ class Store:
     def _decode_job(row: sqlite3.Row) -> dict[str, Any]:
         value = dict(row)
         value["capabilities"] = json.loads(value.pop("capabilities_json") or "{}")
+        value["provider_payload"] = json.loads(
+            value.pop("provider_payload_json") or "{}"
+        )
+        value["allow_billing_class_change"] = bool(
+            value.get("allow_billing_class_change")
+        )
         return value
 
     def get_job(self, job_id: str) -> dict[str, Any]:
@@ -393,7 +421,7 @@ class Store:
                 ).fetchone()
                 if row:
                     return entity_kind, str(row["id"])
-                if len(identifier) >= 8 and re_safe_id(identifier):
+                if identifier and re_safe_id(identifier):
                     rows = connection.execute(
                         f"SELECT id FROM {table} WHERE id LIKE ?", (identifier + "%",)
                     ).fetchall()
@@ -428,6 +456,15 @@ class Store:
                 raise ConflictError(
                     f"job {job_id} is {row['state']}; expected {sorted(allowed_states)}"
                 )
+            if (
+                row["state"] in TERMINAL_STATES
+                and state is not None
+                and state != row["state"]
+            ):
+                # Provider observations can race a stop/reconcile operation.
+                # Lifecycle terminality is monotonic, so a stale observation
+                # must never resurrect or rewrite the terminal outcome.
+                return self._decode_job(row)
             if state is not None:
                 updates["state"] = state
                 if state in TERMINAL_STATES:
@@ -443,6 +480,7 @@ class Store:
                 "result_path",
                 "log_path",
                 "error",
+                "billing_class",
                 "terminal_at",
                 "updated_at",
             }
@@ -550,10 +588,32 @@ class Store:
         filters = dict(filters or {})
         clauses: list[str] = []
         values: list[Any] = []
-        for key in ("group_id", "state", "provider", "label"):
+        for key in ("group_id", "label"):
             if filters.get(key) is not None:
                 clauses.append(f"j.{key}=?")
                 values.append(filters[key])
+        for key in ("state", "provider"):
+            selected = filters.get(key)
+            if isinstance(selected, (list, tuple, set)):
+                selected = [str(item) for item in selected]
+                if selected:
+                    clauses.append(
+                        f"j.{key} IN (" + ",".join("?" for _ in selected) + ")"
+                    )
+                    values.extend(selected)
+            elif selected is not None:
+                clauses.append(f"j.{key}=?")
+                values.append(selected)
+        if filters.get("active"):
+            clauses.append(
+                "j.state NOT IN (" + ",".join("?" for _ in TERMINAL_STATES) + ")"
+            )
+            values.extend(sorted(TERMINAL_STATES))
+        if filters.get("terminal"):
+            clauses.append(
+                "j.state IN (" + ",".join("?" for _ in TERMINAL_STATES) + ")"
+            )
+            values.extend(sorted(TERMINAL_STATES))
         after_cursor = filters.get("after_cursor")
         if after_cursor is not None:
             clauses.append(
@@ -561,7 +621,7 @@ class Store:
             )
             values.append(int(after_cursor))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        limit = max(1, min(int(filters.get("limit", 200)), 1000))
+        limit = max(1, min(int(filters.get("limit", 200)), 5000))
         with self._connect() as connection:
             rows = connection.execute(
                 f"SELECT j.* FROM jobs j{where} ORDER BY j.created_at LIMIT ?",
@@ -570,7 +630,7 @@ class Store:
         return [self._decode_job(row) for row in rows]
 
     def group_jobs(self, group_id: str) -> list[dict[str, Any]]:
-        return self.list_jobs({"group_id": group_id, "limit": 1000})
+        return self.list_jobs({"group_id": group_id, "limit": 5000})
 
     def nonterminal_jobs(self) -> list[dict[str, Any]]:
         placeholders = ",".join("?" for _ in TERMINAL_STATES)

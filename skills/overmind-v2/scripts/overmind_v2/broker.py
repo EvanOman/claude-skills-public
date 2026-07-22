@@ -40,6 +40,7 @@ class Broker:
         self._generation = 0
         self._watchers: dict[str, threading.Thread] = {}
         self._watchers_lock = threading.Lock()
+        self._destructive_lock = threading.RLock()
         if recover:
             self.reconcile_nonterminal()
 
@@ -50,7 +51,7 @@ class Broker:
 
     @staticmethod
     def _job_snapshot(job: Mapping[str, Any]) -> dict[str, Any]:
-        return {
+        snapshot = {
             key: job.get(key)
             for key in (
                 "id",
@@ -71,12 +72,15 @@ class Broker:
                 "terminal_at",
             )
         }
+        snapshot["job_id"] = job.get("id")
+        return snapshot
 
     def _group_snapshot(self, group: Mapping[str, Any]) -> dict[str, Any]:
         jobs = self.store.group_jobs(str(group["id"]))
         counts = Counter(job["state"] for job in jobs)
         return {
             "id": group["id"],
+            "group_id": group["id"],
             "short_id": group["short_id"],
             "label": group["label"],
             "counts": dict(sorted(counts.items())),
@@ -105,13 +109,17 @@ class Broker:
         defaults: Mapping[str, Any],
         group_id: str,
     ) -> list[dict[str, Any]]:
-        if not raw_jobs or len(raw_jobs) > 32:
-            raise OvermindError("run-many requires between 1 and 32 jobs")
+        if not raw_jobs or len(raw_jobs) > 100:
+            raise OvermindError("run-many requires between 1 and 100 jobs")
         prepared: list[dict[str, Any]] = []
+        capability_cache: dict[str, dict[str, Any]] = {}
         for index, raw in enumerate(raw_jobs):
             provider_name = str(raw.get("provider", defaults.get("provider", "")))
             provider = self._provider(provider_name)
-            capabilities = provider.probe()
+            capabilities = capability_cache.get(provider_name)
+            if capabilities is None:
+                capabilities = provider.probe()
+                capability_cache[provider_name] = capabilities
             if not capabilities.get("available"):
                 raise OvermindError(
                     f"provider {provider_name} is unavailable: "
@@ -122,8 +130,14 @@ class Broker:
                 capabilities,
                 allow_billing_change=bool(
                     raw.get(
-                        "allow_billing_change",
-                        defaults.get("allow_billing_change", False),
+                        "allow_billing_class_change",
+                        raw.get(
+                            "allow_billing_change",
+                            defaults.get(
+                                "allow_billing_class_change",
+                                defaults.get("allow_billing_change", False),
+                            ),
+                        ),
                     )
                 ),
             )
@@ -160,6 +174,19 @@ class Broker:
                     "brief_path": str(brief_path),
                     "brief": brief,
                     "capabilities": capabilities,
+                    "provider_payload": dict(raw),
+                    "allow_billing_class_change": bool(
+                        raw.get(
+                            "allow_billing_class_change",
+                            raw.get(
+                                "allow_billing_change",
+                                defaults.get(
+                                    "allow_billing_class_change",
+                                    defaults.get("allow_billing_change", False),
+                                ),
+                            ),
+                        )
+                    ),
                 }
             )
         return prepared
@@ -169,13 +196,19 @@ class Broker:
         job = dict(raw.pop("job", {})) if raw.get("job") else dict(raw)
         for key in ("idempotency_key", "group_id", "group_label"):
             job.pop(key, None)
-        label = str(params.get("label") or params.get("group_label") or "overmind-run")
+        group = params.get("group") if isinstance(params.get("group"), dict) else {}
+        label = str(
+            params.get("label")
+            or params.get("group_label")
+            or group.get("label")
+            or "overmind-run"
+        )
         return self._run_many(
             [job],
             defaults=params,
             operation="run",
             idempotency_key=params.get("idempotency_key"),
-            requested_group=params.get("group_id"),
+            requested_group=params.get("group_id") or group.get("group_id"),
             group_label=label,
         )
 
@@ -185,13 +218,14 @@ class Broker:
             isinstance(item, dict) for item in jobs
         ):
             raise OvermindError("run-many requires a jobs array")
+        group = params.get("group") if isinstance(params.get("group"), dict) else {}
         return self._run_many(
             jobs,
             defaults=params,
             operation="run-many",
             idempotency_key=params.get("idempotency_key"),
-            requested_group=params.get("group_id"),
-            group_label=str(params.get("label") or "overmind-group"),
+            requested_group=params.get("group_id") or group.get("group_id"),
+            group_label=str(params.get("label") or group.get("label") or "overmind-group"),
         )
 
     def _run_many(
@@ -214,6 +248,7 @@ class Broker:
                     "model",
                     "billing_class",
                     "allow_billing_change",
+                    "allow_billing_class_change",
                     "parent_job_id",
                     "resume_thread",
                 )
@@ -246,9 +281,25 @@ class Broker:
             idempotency_key=key,
         )
         self._notify()
-        if entity["created"]:
+        if not entity["created"]:
+            artifact_root = self.store.artifacts_dir.resolve()
             for spec in prepared:
-                self._launch_job(spec)
+                brief_path = Path(str(spec["brief_path"])).resolve()
+                if brief_path.parent.parent == artifact_root:
+                    try:
+                        brief_path.unlink()
+                        brief_path.parent.rmdir()
+                    except FileNotFoundError:
+                        pass
+        if entity["created"]:
+            errors: list[Exception] = []
+            for spec in prepared:
+                try:
+                    self._launch_job(spec)
+                except Exception as error:
+                    errors.append(error)
+            if errors:
+                raise OvermindError(str(errors[0])) from errors[0]
         return self._launch_response(
             entity["group_id"],
             entity["job_ids"],
@@ -281,10 +332,20 @@ class Broker:
         self._notify()
         provider = self._provider(str(spec["provider"]))
         try:
-            update = provider.launch(
-                self.store.get_job(job_id),
-                str(spec["brief"]),
-                resume_thread=spec.get("resume_thread"),
+            job = self.store.get_job(job_id)
+            parent = (
+                self.store.get_job(str(job["parent_job_id"]))
+                if job.get("parent_job_id")
+                else None
+            )
+            update = (
+                provider.continue_job(job, str(spec["brief"]), parent)
+                if parent is not None
+                else provider.launch(
+                    job,
+                    str(spec["brief"]),
+                    resume_thread=spec.get("resume_thread"),
+                )
             )
             self._apply_observation(job_id, update, kind="job.launched")
             job = self.store.get_job(job_id)
@@ -298,11 +359,19 @@ class Broker:
                 fields={"error": str(error)},
             )
             self._notify()
+            raise
 
     def _apply_observation(
         self, job_id: str, observation: Mapping[str, Any], *, kind: str
     ) -> dict[str, Any]:
         current = self.store.get_job(job_id)
+        actual_billing = observation.get("billing_class")
+        if actual_billing is not None and str(actual_billing) != current["billing_class"]:
+            if not current.get("allow_billing_class_change"):
+                raise OvermindError(
+                    "provider billing fallback changed "
+                    f"{current['billing_class']} to {actual_billing}; explicit opt-in is required"
+                )
         state = str(observation.get("state", current["state"]))
         if state not in {
             "queued",
@@ -325,6 +394,7 @@ class Broker:
                 "result_path",
                 "log_path",
                 "error",
+                "billing_class",
             )
             if key in observation
         }
@@ -441,11 +511,30 @@ class Broker:
             "count": len(rows),
         }
 
+    def _resolve_target(
+        self, target: Any, *, kind: str | None = None
+    ) -> tuple[str, str]:
+        if isinstance(target, Mapping):
+            group_id = target.get("group_id", target.get("groupId"))
+            job_id = target.get("job_id", target.get("jobId"))
+            if group_id and job_id:
+                raise OvermindError("target must identify either one group or one job")
+            if group_id:
+                if kind == "job":
+                    raise OvermindError("a job target is required")
+                return self.store.resolve(str(group_id), kind="group")
+            if job_id:
+                if kind == "group":
+                    raise OvermindError("a group target is required")
+                return self.store.resolve(str(job_id), kind="job")
+            raise OvermindError("target requires group_id or job_id")
+        return self.store.resolve(str(target), kind=kind)
+
     def show(self, params: Mapping[str, Any]) -> dict[str, Any]:
         identifier = params.get("id", params.get("target"))
         if not identifier:
             raise OvermindError("show requires id")
-        kind, entity_id = self.store.resolve(str(identifier))
+        kind, entity_id = self._resolve_target(identifier)
         if kind == "job":
             job = self.store.get_job(entity_id)
             if job["state"] not in TERMINAL_STATES:
@@ -469,10 +558,18 @@ class Broker:
         }
 
     def _target_jobs(self, target: Any) -> tuple[dict[str, str], list[dict[str, Any]]]:
-        kind, entity_id = self.store.resolve(str(target))
+        kind, entity_id = self._resolve_target(target)
         if kind == "group":
-            return {"kind": "group", "id": entity_id}, self.store.group_jobs(entity_id)
-        return {"kind": "job", "id": entity_id}, [self.store.get_job(entity_id)]
+            return {
+                "kind": "group",
+                "id": entity_id,
+                "group_id": entity_id,
+            }, self.store.group_jobs(entity_id)
+        return {
+            "kind": "job",
+            "id": entity_id,
+            "job_id": entity_id,
+        }, [self.store.get_job(entity_id)]
 
     @staticmethod
     def _condition_satisfied(
@@ -500,7 +597,10 @@ class Broker:
         target, jobs = self._target_jobs(target_value)
         condition = str(params.get("condition", "all_terminal"))
         cursor = int(params.get("since_cursor", 0))
-        timeout = max(0.0, min(float(params.get("timeout", 300)), 86400.0))
+        timeout = max(
+            0.0,
+            min(float(params.get("timeout", params.get("timeout_seconds", 300))), 86400.0),
+        )
         deadline = time.monotonic() + timeout
         while True:
             with self._condition:
@@ -523,6 +623,7 @@ class Broker:
                     "target": target,
                     "condition": condition,
                     "satisfied": satisfied,
+                    "condition_met": satisfied,
                     "timed_out": not satisfied,
                     "cursor": latest,
                     "counts": dict(sorted(counts.items())),
@@ -543,13 +644,33 @@ class Broker:
             remaining = deadline - time.monotonic()
             with self._condition:
                 if self._generation == generation:
-                    self._condition.wait(timeout=max(0.0, remaining))
+                    self._condition.wait(timeout=max(0.0, min(remaining, 0.25)))
+            if progress and not events and time.monotonic() < deadline:
+                # A bounded heartbeat detects a caller that closed its socket
+                # without manufacturing a duplicate event cursor.
+                progress({"heartbeat": True})
 
     def collect(self, params: Mapping[str, Any]) -> dict[str, Any]:
         max_jobs = max(1, min(int(params.get("max_jobs", 32)), 100))
-        max_chars = max(0, min(int(params.get("max_chars", 2000)), 20000))
+        preview_bytes = max(
+            0,
+            min(
+                int(params.get("preview_bytes", params.get("max_chars", 2000))),
+                20000,
+            ),
+        )
         if params.get("target") or params.get("id"):
             target, jobs = self._target_jobs(params.get("target", params.get("id")))
+        elif isinstance(params.get("targets"), list):
+            jobs = []
+            seen: set[str] = set()
+            for value in params["targets"]:
+                _, selected = self._target_jobs(value)
+                for job in selected:
+                    if job["id"] not in seen:
+                        seen.add(job["id"])
+                        jobs.append(job)
+            target = {"kind": "jobs", "id": None}
         elif isinstance(params.get("job_ids"), list):
             jobs = []
             for value in params["job_ids"][:max_jobs]:
@@ -557,17 +678,16 @@ class Broker:
                 jobs.append(self.store.get_job(job_id))
             target = {"kind": "jobs", "id": None}
         else:
-            raise OvermindError("collect requires target or job_ids")
+            raise OvermindError("collect requires target, targets, or job_ids")
         results = []
         for job in jobs[:max_jobs]:
             preview = None
             truncated = False
             path = job.get("result_path")
-            if path and Path(path).is_file() and max_chars:
-                with Path(path).open(encoding="utf-8", errors="replace") as stream:
-                    text = stream.read(max_chars + 1)
-                preview = text[:max_chars]
-                truncated = len(text) > max_chars
+            if path and Path(path).is_file() and preview_bytes:
+                raw = Path(path).read_bytes()
+                preview = raw[:preview_bytes].decode("utf-8", errors="ignore")
+                truncated = len(raw) > preview_bytes
             results.append(
                 {
                     "job": self._job_snapshot(job),
@@ -580,18 +700,20 @@ class Broker:
         return {
             "target": target,
             "results": results,
-            "bounded": {"max_jobs": max_jobs, "max_chars": max_chars},
+            "bounded": {"max_jobs": max_jobs, "preview_bytes": preview_bytes},
             "cursor": self.store.latest_cursor(),
         }
 
     def reply(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        identifier = params.get("id", params.get("job_id"))
+        identifier = params.get(
+            "target", params.get("id", params.get("job_id"))
+        )
         prompt = str(params.get("prompt", ""))
         if not identifier or not prompt.strip():
             raise OvermindError("reply requires job id and prompt")
-        _, job_id = self.store.resolve(str(identifier), kind="job")
+        _, job_id = self._resolve_target(identifier, kind="job")
         parent = self.store.get_job(job_id)
-        if not parent.get("provider_thread_id"):
+        if not (parent.get("provider_thread_id") or parent.get("provider_job_id")):
             raise ConflictError(
                 "provider thread ID is unavailable; continuation was not created"
             )
@@ -612,9 +734,14 @@ class Broker:
             requested_group=parent["group_id"],
             group_label="continuation",
         )
+        response["parent_job_id"] = parent["id"]
         return response
 
     def stop(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        with self._destructive_lock:
+            return self._stop(params)
+
+    def _stop(self, params: Mapping[str, Any]) -> dict[str, Any]:
         target_value = params.get("target", params.get("id"))
         if not target_value:
             raise OvermindError("stop requires target")
@@ -658,6 +785,10 @@ class Broker:
         return result
 
     def forget(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        with self._destructive_lock:
+            return self._forget(params)
+
+    def _forget(self, params: Mapping[str, Any]) -> dict[str, Any]:
         target_value = params.get("target", params.get("id"))
         if not target_value:
             raise OvermindError("forget requires target")
@@ -666,7 +797,7 @@ class Broker:
         existing = self.store.lookup_idempotency("forget", request_payload, key)
         if existing:
             return existing
-        kind, entity_id = self.store.resolve(str(target_value))
+        kind, entity_id = self._resolve_target(target_value)
         if kind == "job":
             self.store.forget_job(entity_id)
         else:
@@ -718,6 +849,7 @@ class Broker:
         handlers: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
             "run": self.run,
             "run-many": self.run_many,
+            "run_many": self.run_many,
             "jobs": self.jobs,
             "show": self.show,
             "collect": self.collect,
