@@ -24,22 +24,27 @@ strong engineer who cannot read your mind and does not share your context.
 Keep decomposition, architecture, synthesis, brief-writing, integration, and review in
 the main loop. Delegate bounded evidence gathering, diagnosis, implementation, and test
 triage that a worker can complete and verify independently. Keep work inline only when
-it requires cross-cutting judgment or depends heavily on conversational context; the
-cost of writing a brief is not an exception.
+it requires cross-cutting judgment, depends heavily on conversational context, or the
+two-pass circuit breaker below applies; the cost of writing a brief is not an exception.
 
-Before every main-loop tool call, classify it:
+Require every main-loop tool call to fit one of these classes:
 
 - Use lifecycle calls to dispatch, steer, follow up, wait for, inspect, or collect workers.
-- Use one targeted read of a known path or value only when needed to make a brief concrete,
-  or take a required pre-dispatch safety snapshot.
-- Delegate a second logical query, a search that may branch on its result, a multi-file or
-  multi-resource scan, or work that could produce an independently useful report or artifact.
+- Perform protocol operations explicitly required by this skill: the quota sweep, the
+  selected-backend read, and a pre-dispatch safety snapshot.
+- Use at most one targeted lookup of a known path or value per pending dispatch brief, only
+  when capacity exists and that fact is the final missing input before immediate dispatch.
+  This allowance is one operation per brief; it does not reset with each tool call.
+- Verify returned work through the post-handoff artifact and evidence checks below.
 
 Treat combined shell commands as their underlying logical operations; bundling commands
-does not bypass this gate. Once workers are active, do not fill their latency with
-dispatched or queued worker work. Dispatch more work when capacity exists; at saturation,
-hold the next brief, steer or follow up with an owner, or wait. Use returned evidence for
-architecture and synthesis rather than repeating discovery.
+does not bypass this gate. Delegate any further, branching, or multi-resource discovery
+and any work that could produce an independently useful output.
+
+When no worker slot is available, make zero repository, system, or external discovery
+calls, including targeted lookups for held briefs. Steer, follow up, wait, synthesize
+returned evidence, or prepare and hold briefs using facts already in context. Never
+execute dispatched or queued worker work inline.
 
 This file is the invariant core: the discipline is identical for every backend. The
 mechanics of each backend live in `backends/<name>.md` — **read a backend's file before
@@ -118,10 +123,14 @@ SendMessage). The decision logic is backend-independent:
 - **Default to fresh, ephemeral workers.** Persistence is a deliberate choice for
   genuinely stateful chains. Long-lived sessions drift and cost more per turn.
 
-Require the worker that starts verification to own it through a terminal result. Treat
-a handoff that says a check is still running as incomplete: continue the same worker and
-wait through its lifecycle owner instead of shell-polling, duplicating the check, or
-immediately replacing the worker.
+Require the worker that launches a check to own it through success, failure, timeout, or
+confirmed cancellation. Treat an in-flight handoff as incomplete. Transfer ownership only
+after lifecycle evidence proves that the original check is terminal or cannot still be
+running, and never allow two owners concurrently.
+
+After two failed passes on the same brief, do not retry it. Either materially re-decompose
+the work into different, independently verifiable tasks or take the remaining work inline;
+mere rewording is not a third pass.
 
 ## Parallel fan-out
 
@@ -142,32 +151,30 @@ explicit opt-in (see backends/claude.md).
 
 ## Trust, then verify — every time, every backend
 
-The worker is capable but it is not you. Begin verification after handoff and limit it
-to artifact inspection and the named acceptance checks. After every handoff:
+Capture `git status --porcelain` before dispatching into a repository so pre-existing
+changes remain distinguishable from worker output.
 
-1. **Read the diff** it produced (`git diff` in its workdir), not just its summary.
-   Summaries can be rosy. Capture `git status --porcelain` **before** dispatching into
-   any repo — user repos often carry unrelated uncommitted work, and without the
-   pre-dispatch snapshot you can't tell worker overreach from pre-existing dirt
-   (each false alarm costs a full investigation cycle). Non-git workdirs get no diff
-   at all: enumerate the worker's `Edit`/`Write` ops from its log instead.
-2. **Run the VERIFY command yourself.** "Tests pass" is a claim until you see it.
-3. **Check it against the brief** — did it do what you asked, or something adjacent?
+For implementation handoffs:
 
-Do not repeat the worker's exploratory search or diagnosis. Send unexpected findings
-back to an owner as a focused follow-up.
+1. Inspect the diff or, when no diff exists, the write log.
+2. Run the named acceptance checks in the correct work directory.
+3. Compare the result with the brief and repository constraints.
 
-If it's wrong, decide *why* it missed — usually the brief was underspecified. Tighten
-the brief and continue the same worker (it sees its own attempt). **Two failed passes
-on the same task = stop delegating it.** Rewrite the brief or take it inline; never
-loop a confused worker a third time.
+For evidence or diagnosis handoffs:
+
+1. Inspect the report and its citations.
+2. Spot-check only decision-critical or internally inconsistent evidence without repeating
+   the search.
+3. Return missing or contradictory evidence to the owner as a focused follow-up.
+
+Post-handoff verification may require multiple targeted operations, but end it when the
+named artifacts and checks are assessed. Delegate any branching diagnosis it reveals.
 
 ## Altitude discipline
 
 Keep YOUR tokens for: planning, decomposition, brief-writing, diff review, architecture
 calls, debugging what stumps the worker, and cross-file coherence. Don't read whole
-files a worker can read itself. Work inline only when the task needs full conversation
-context or cross-file design coherence.
+files a worker can read itself.
 
 ## Mode durability
 
