@@ -1,0 +1,4 @@
+interface:
+  display_name: "Overmind v2"
+  short_description: "Cross-harness subagent orchestration broker"
+  default_prompt: "Use $overmind-v2 to fan out this mission across native Claude and Codex workers, await completion, and synthesize verified results."
