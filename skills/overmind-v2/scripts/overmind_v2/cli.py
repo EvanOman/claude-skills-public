@@ -58,6 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["subscription-native", "explicit-metered", "unknown"],
         default="subscription-native",
     )
+    run.add_argument(
+        "--allow-billing-class-change",
+        action="store_true",
+        help="explicitly allow a provider fallback to a different billing class",
+    )
     run.add_argument("--idempotency-key")
 
     run_many = commands.add_parser(
@@ -66,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_many.set_defaults(operation="run_many")
     run_many.add_argument("spec", nargs="?", help="JSON array/object file, or - to read stdin")
     run_many.add_argument("--label")
+    run_many.add_argument(
+        "--allow-billing-class-change",
+        action="store_true",
+        help="explicitly allow provider fallbacks to a different billing class",
+    )
     run_many.add_argument("--idempotency-key")
 
     jobs = commands.add_parser(
@@ -203,6 +213,8 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         }
         for key in ("model", "group_id", "parent_job_id", "idempotency_key"):
             _set(params, key, getattr(args, key))
+        if args.allow_billing_class_change:
+            params["allow_billing_class_change"] = True
     elif operation == "run_many":
         if args.spec is None:
             raise OvermindError(
@@ -218,6 +230,8 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             raise OvermindError("run-many spec must be a JSON array or object", code="invalid_input")
         _set(params, "label", args.label)
         _set(params, "idempotency_key", args.idempotency_key)
+        if args.allow_billing_class_change:
+            params["allow_billing_class_change"] = True
         operation = "run-many"
     elif operation == "jobs":
         params = {}
@@ -288,33 +302,90 @@ def _job_rows(value: Any) -> list[dict[str, Any]]:
     jobs = value.get("jobs")
     if isinstance(jobs, list):
         return [item for item in jobs if isinstance(item, dict)]
+    job = value.get("job")
+    if isinstance(job, dict):
+        return [job]
     if "job_id" in value:
         return [value]
     return []
+
+
+def _record_id(record: dict[str, Any], kind: str) -> str:
+    identifier = record.get(f"{kind}_id") or record.get("id") or record.get("short_id")
+    return _display_id(identifier)
+
+
+def _artifact_hint(*records: dict[str, Any]) -> str | None:
+    for record in records:
+        for key in ("result_path", "artifact_path", "log_path"):
+            value = record.get(key)
+            if value:
+                return str(value)
+        artifacts = record.get("artifacts")
+        if isinstance(artifacts, list):
+            ordered = sorted(
+                (item for item in artifacts if isinstance(item, dict)),
+                key=lambda item: item.get("kind") != "result",
+            )
+            for item in ordered:
+                if item.get("path"):
+                    return str(item["path"])
+    return None
+
+
+def _job_table(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return []
+    lines = ["ID       STATE        PROVIDER  LABEL"]
+    for job in rows:
+        lines.append(
+            (
+                f"{_record_id(job, 'job'):<8} "
+                f"{str(job.get('state', '-')):<12} "
+                f"{str(job.get('provider', '-')):<9} "
+                f"{job.get('label', '')}"
+            ).rstrip()
+        )
+    return lines
+
+
+def _one_line(value: Any, limit: int = 240) -> str:
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def render_human(operation: str, value: Any) -> str:
     if not isinstance(value, dict):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
-    rows = _job_rows(value)
     lines: list[str] = []
-    group_id = value.get("group_id")
-    if group_id:
-        lines.append(f"GROUP {_display_id(group_id)}")
-    if rows:
-        lines.append("ID       STATE        PROVIDER  LABEL")
-        for job in rows:
+    if operation == "show":
+        group = value.get("group")
+        job = value.get("job")
+        if isinstance(group, dict):
+            counts = group.get("counts")
+            count_text = ""
+            if isinstance(counts, dict) and counts:
+                values = " ".join(
+                    f"{state}={count}" for state, count in sorted(counts.items())
+                )
+                count_text = f" [{values}]"
             lines.append(
-                f"{_display_id(job.get('job_id')):<8} "
-                f"{str(job.get('state', '-')):<12} "
-                f"{str(job.get('provider', '-')):<9} "
-                f"{job.get('label', '')}"
-            ).rstrip()
-        cursor = value.get("cursor")
-        if cursor is not None:
-            lines.append(f"CURSOR {cursor}")
-        return "\n".join(lines)
+                f"GROUP {_record_id(group, 'group')} {group.get('label', '')}{count_text}".rstrip()
+            )
+            lines.extend(_job_table(_job_rows(value)))
+        elif isinstance(job, dict):
+            lines.append(
+                f"JOB {_record_id(job, 'job')} {job.get('state', '-')} "
+                f"{job.get('provider', '-')} {job.get('label', '')}".rstrip()
+            )
+            hint = _artifact_hint(job, value)
+            if hint:
+                lines.append(f"ARTIFACT {hint}")
+        if lines:
+            if value.get("cursor") is not None:
+                lines.append(f"CURSOR {value['cursor']}")
+            return "\n".join(lines)
 
     if operation == "collect":
         items = value.get("results") or value.get("items")
@@ -322,12 +393,32 @@ def render_human(operation: str, value: Any) -> str:
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                lines.append(
-                    f"{_display_id(item.get('job_id'))} {item.get('state', '-')}: "
-                    f"{item.get('preview') or item.get('result') or ''}"
-                )
+                nested_job = item.get("job")
+                job = nested_job if isinstance(nested_job, dict) else item
+                prefix = (
+                    f"{_record_id(job, 'job')} {job.get('state', '-')} "
+                    f"{job.get('label', '')}"
+                ).rstrip()
+                preview = item.get("preview", item.get("result"))
+                if preview is not None:
+                    lines.append(f"{prefix}: {_one_line(preview)}")
+                else:
+                    hint = _artifact_hint(item, job)
+                    detail = f"[artifact: {hint}]" if hint else "[no preview]"
+                    lines.append(f"{prefix}: {detail}")
             if lines:
                 return "\n".join(lines)
+
+    rows = _job_rows(value)
+    group_id = value.get("group_id")
+    if group_id:
+        lines.append(f"GROUP {_display_id(group_id)}")
+    if rows:
+        lines.extend(_job_table(rows))
+        cursor = value.get("cursor")
+        if cursor is not None:
+            lines.append(f"CURSOR {cursor}")
+        return "\n".join(lines)
 
     if operation == "doctor":
         daemon = value.get("daemon")

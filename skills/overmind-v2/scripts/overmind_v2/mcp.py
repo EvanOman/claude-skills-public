@@ -26,6 +26,11 @@ JOB_PROPERTIES: dict[str, Any] = {
     "billing_class": {
         "enum": ["subscription-native", "explicit-metered", "unknown"]
     },
+    "allow_billing_class_change": {
+        "type": "boolean",
+        "default": False,
+        "description": "Explicitly allow fallback to a different billing class.",
+    },
 }
 
 TARGET_SCHEMA: dict[str, Any] = {
@@ -78,6 +83,13 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "label": {"type": "string"},
                 "group": {"type": "object"},
+                "allow_billing_class_change": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Explicitly allow provider fallbacks to a different billing class."
+                    ),
+                },
                 "idempotency_key": {"type": "string"},
             },
             "additionalProperties": False,
@@ -345,19 +357,43 @@ class McpServer:
         progress_token: Any,
     ) -> None:
         sequence = 0
+        last_amount: int | float = 0
+        resumable_cursor: int | float | None = None
 
         def progress(value: dict[str, Any]) -> None:
-            nonlocal sequence
+            nonlocal last_amount, resumable_cursor, sequence
             sequence += 1
             if progress_token is None:
                 return
-            cursor = value.get("cursor")
-            amount = cursor if isinstance(cursor, (int, float)) else sequence
+            candidate = value.get("cursor", value.get("last_cursor"))
+            numeric_cursor = (
+                candidate
+                if isinstance(candidate, (int, float)) and not isinstance(candidate, bool)
+                else None
+            )
+            if numeric_cursor is not None:
+                resumable_cursor = (
+                    numeric_cursor
+                    if resumable_cursor is None
+                    else max(resumable_cursor, numeric_cursor)
+                )
+                amount = max(last_amount, resumable_cursor)
+            else:
+                amount = max(last_amount, sequence)
+            last_amount = amount
             params: dict[str, Any] = {
                 "progressToken": progress_token,
                 "progress": amount,
-                "message": json.dumps(value, ensure_ascii=False, separators=(",", ":")),
             }
+            if resumable_cursor is not None:
+                if "cursor" in value:
+                    params["cursor"] = resumable_cursor
+                else:
+                    params["lastCursor"] = resumable_cursor
+            params["data"] = value
+            params["message"] = json.dumps(
+                value, ensure_ascii=False, separators=(",", ":")
+            )
             total = value.get("total")
             if isinstance(total, (int, float)):
                 params["total"] = total
