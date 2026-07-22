@@ -35,7 +35,7 @@ Skills are then available as `/evan-skills:skill-name` (e.g., `/evan-skills:slid
 | Review | `/evan-skills:review` | Code review using a sub-agent with a structured rubric (correctness, security, error handling, quality, testing, docs). |
 | RVM | `/evan-skills:rvm` | Review-Merge workflow: review changes, fix issues, push, and merge in one pass. |
 | Handoff | `/evan-skills:handoff` | Generate a structured handoff note capturing session state, completed work, in-flight tasks, and next steps for a future agent. |
-| Session History Search | `/evan-skills:session-history-search` | Search, list, and review past Claude Code sessions. Includes CLI tools (`cc-sessions`, `cc-search`, `cc-transcript`, `cc-index`) for BM25-ranked full-prompt search, project filtering, tag-based discovery, and full transcript reading. |
+| Session History Search | `/evan-skills:session-history-search` | Search, list, and review past Claude Code and Codex CLI sessions. Includes twin CLI tool families (`cc-*` for Claude Code, `cx-*` for Codex) for BM25-ranked full-prompt search, project filtering, and full transcript reading. |
 | Prep Public | `/evan-skills:prep-public` | Prepare a project for public GitHub release. Scans for secrets, cleans paths, sets up .gitignore/.env.example/LICENSE/README. |
 | Overmind | `/evan-skills:overmind` | Enter persistent orchestration mode with structured briefs, isolated workers, and verified handoffs. Uses native registries in-harness and a shared durable MCP lifecycle for Claude↔Codex dispatch, follow-up, waiting, results, interruption, and cleanup. |
 

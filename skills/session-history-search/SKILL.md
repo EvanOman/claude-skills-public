@@ -1,13 +1,18 @@
 ---
 name: session-history-search
-description: Search, list, and review past Claude Code sessions, Claude Code conversation history, and Claude Code chat logs. Use when the user asks "what did I work on", "find the session where", "show me recent sessions", "search my Claude history", "find that conversation", "what was that conversation about", "Claude Code session history", "past Claude sessions", "previous Claude conversations", "search Claude Code logs", or any question about past Claude Code work. Also useful for self-reflection on past approaches.
+description: Search, list, and review past Claude Code and Codex CLI sessions, conversation history, and chat logs. Use when the user asks "what did I work on", "find the session where", "show me recent sessions", "search my Claude history", "search my Codex history", "find that conversation", "what was that conversation about", "Claude Code session history", "Codex session history", "past Claude sessions", "previous Codex conversations", "search Claude Code logs", or any question about past Claude Code or Codex work. Also useful for self-reflection on past approaches.
 argument-hint: <search keyword, "recent", "today", "project <name>", or a question about past work>
 allowed-tools: Bash, Read, Glob, Grep, Write, Edit, AskUserQuestion
 ---
 
 # Session History Search
 
-Search and review past Claude Code sessions. Four CLI tools are installed to `~/.claude/bin/`:
+Search and review past agent sessions across two harnesses:
+
+- **`cc-*` tools** — Claude Code history (`~/.claude`)
+- **`cx-*` tools** — Codex CLI history (`~/.codex`)
+
+The two families share the same command shapes and search semantics: `*-sessions` lists, `*-index` builds the FTS index, `*-search` does BM25-ranked stemmed search over every user prompt, `*-transcript` renders a session by unique ID prefix. All are installed to `~/.claude/bin/`:
 
 ## Setup
 
@@ -16,6 +21,8 @@ Run the setup script to install the CLI tools:
 ```bash
 bash "$(dirname "$0")/setup.sh"           # symlinks bin/* into ~/.claude/bin (default)
 bash "$(dirname "$0")/setup.sh" --copy    # copies instead of symlinking
+bash "$(dirname "$0")/setup.sh" --dry-run # print what would be installed, change nothing
+bash "$(dirname "$0")/setup.sh" --bin-dir /some/dir   # install elsewhere (e.g. a temp home)
 ```
 
 By default the tools are **symlinked** into `~/.claude/bin/`, so a `git pull` of this repo updates them with no re-install. Use `--copy` if you don't keep the repo checked out (a standalone copy that won't track upstream fixes). Either way, make sure `~/.claude/bin` is on your `PATH`.
@@ -49,7 +56,7 @@ Claude Code deletes session transcripts after 30 days by default, which silently
 { "cleanupPeriodDays": 3650 }
 ```
 
-## Tools
+## Claude Code Tools (`cc-*`)
 
 ### `cc-sessions` — List recent sessions
 ```bash
@@ -107,9 +114,60 @@ cc-transcript 975b31e1 --tail 10   # Last 10 messages
 cc-transcript 975b31e1 --raw       # Raw JSON
 ```
 
+## Codex CLI Tools (`cx-*`)
+
+Mirrors of the four `cc-*` tools for Codex CLI history under `$CODEX_HOME` (default `~/.codex`), covering both `sessions/` and `archived_sessions/`. Codex has no manual setup knob for retention, and its `history.jsonl` records every prompt across sessions.
+
+### `cx-sessions` — List recent sessions
+```bash
+cx-sessions                        # Last 15 sessions
+cx-sessions --count 30             # More sessions
+cx-sessions --project alpha        # Filter by workspace path (substring match)
+cx-sessions --days 3               # Only last N days
+cx-sessions --long                 # Include model, token totals, CLI version
+cx-sessions --project-summary      # Group by workspace with session counts
+cx-sessions --json                 # Machine-readable output
+```
+
+`cx-sessions` needs no index — it scans rollout files directly (cheaply: only the sessions that make the display cut are fully parsed). Subagent sessions are labeled `[subagent]`.
+
+### `cx-index` — Build/update the search index
+```bash
+cx-index                           # Index new/changed sessions (incremental by mtime)
+cx-index --full                    # Rebuild the whole index from scratch
+cx-index --stats                   # Show workspace distribution
+```
+
+Writes an FTS5 index to `$CODEX_HOME/usage-data/sessions.db` (override with `CX_SESSIONS_DB`). Indexes **every user prompt in every session** — first prompts weighted 3x in ranking, same as `cc-search`. Secret-shaped strings (API keys, tokens) are masked before they ever reach the index.
+
+### `cx-search` — Full-text search across all prompts
+```bash
+cx-search "family tree deploy"     # Stemmed AND across terms (same semantics as cc-search)
+cx-search '"family tree" deploy'   # Exact phrase + term
+cx-search "bug" --project alpha    # Filter by workspace (substring; history hits resolved via index)
+cx-search "bug" --days 7           # Last 7 days only
+cx-search "error" --full           # Also scan full transcripts (matches assistant text too)
+cx-search "https://..." --literal  # Substring scan over ~/.codex/history.jsonl (URLs, IDs)
+cx-search --recent 20              # Show 20 most recent prompts
+```
+
+Identical search semantics to `cc-search`: porter-stemmed barewords AND together, double-quoted spans are exact phrases, results are BM25-ranked with snippet excerpts, and matching is token-based (use `--literal` for raw substrings).
+
+### `cx-transcript` — Read a session transcript
+```bash
+cx-transcript 019f8836             # Render readable transcript (unique ID prefix)
+cx-transcript 019f8836 --summary   # Just first/last messages and stats
+cx-transcript 019f8836 --tools     # Include tool calls and results
+cx-transcript 019f8836 --user-only # Only user messages
+cx-transcript 019f8836 --tail 10   # Last 10 messages
+cx-transcript 019f8836 --raw       # Messages as JSON
+```
+
+An ambiguous prefix lists the matching session IDs and exits nonzero — extend the prefix and retry. Injected context (environment blocks, AGENTS.md instructions) is filtered out; only the real conversation renders.
+
 ## Handling User Requests
 
-Parse `$ARGUMENTS` to determine what the user wants:
+Parse `$ARGUMENTS` to determine what the user wants. The recipes below are written with the `cc-*` tools; when the user asks about **Codex** sessions (or the question spans both harnesses), run the same recipe with the `cx-*` twin — the flags match.
 
 ### "What did I work on [today/this week/recently]?"
 1. Run `cc-sessions --days N --long` (1 for today, 7 for this week)
@@ -153,6 +211,17 @@ The tools query these automatically, but for manual exploration:
 | Usage database | `~/.claude/usage-data/sessions.db` | Durations, token counts, tool usage — the richer metadata behind `cc-sessions --long` |
 | Session memory | `~/.claude/projects/<project>/memory/` | Persisted per-project auto-memory notes |
 
+Codex CLI (`cx-*` tools; root is `$CODEX_HOME`, default `~/.codex`):
+
+| Source | Path | What's in it |
+|--------|------|-------------|
+| History | `~/.codex/history.jsonl` | Every user prompt with timestamp and session ID. Backing store for `cx-search --literal` / `--recent`. |
+| Session rollouts | `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` | Full conversation logs (read by `cx-transcript`; indexed by `cx-index`) |
+| Archived rollouts | `~/.codex/archived_sessions/...` | Same format; archived sessions are still listed, indexed, and searchable |
+| Search index | `~/.codex/usage-data/sessions.db` | FTS index built by `cx-index` (override location with `CX_SESSIONS_DB`) |
+
+The `cx-*` tools never read `auth.json` or any other credential file, and mask secret-shaped strings (API keys, tokens) in indexed and displayed text.
+
 ## Tips
 
 - If a search comes up empty for something recent, run `cc-index` first — the search index only covers sessions that have been indexed.
@@ -162,3 +231,5 @@ The tools query these automatically, but for manual exploration:
 - The `--long` flag on `cc-sessions` pulls from usage-data which has richer metadata than sessions-index.
 - To resume a past session: `claude --resume <session-id>` (in the terminal, not from within Claude).
 - Full transcripts can be multi-MB. Use `--summary` or `--tail` first before reading the whole thing.
+- Codex: `CODEX_HOME` relocates the data root for all `cx-*` tools (useful for testing against a copy). To resume a past Codex session: `codex resume <session-id>`.
+- Codex subagent sessions receive their task over an inter-agent channel, so they may show no first prompt — the workspace, model, and transcript body still identify them.

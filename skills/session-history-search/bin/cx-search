@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""Search Codex CLI session history by keyword, workspace, and date range.
+
+Same search semantics as cc-search: barewords are porter-stemmed tokens
+combined with implicit AND, a double-quoted span is an exact phrase, results
+are BM25-ranked with matches in a session's first prompt weighted 3x.
+
+Usage:
+  cx-search <keyword>                    # FTS search (run cx-index first) + history
+  cx-search <keyword> --project <path>   # Filter by workspace path (substring)
+  cx-search <keyword> --days 7           # Only last N days
+  cx-search <keyword> --literal          # Substring scan over history.jsonl (URLs, IDs)
+  cx-search <keyword> --full             # Also scan full transcripts (slower)
+  cx-search --recent 20                  # Show 20 most recent prompts
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from cx_common import (
+    db_path,
+    display_path,
+    format_dt,
+    history_file,
+    is_history_noise,
+    iter_session_files,
+    load_messages,
+    parse_session,
+    redact,
+    session_id_from_path,
+)
+
+# Invisible sentinels wrap matched terms in FTS5 snippets so we can (a) detect
+# which column matched and (b) swap them for visible highlight markers.
+_SNIP_START = "\x02"
+_SNIP_END = "\x03"
+_HL_START = "‹"
+_HL_END = "›"
+
+
+def build_fts_query(keyword):
+    """Turn a raw user keyword string into a safe FTS5 MATCH expression.
+
+    Semantics (identical to cc-search):
+    - Space-separated barewords imply AND.
+    - A double-quoted span in the user's input is preserved as an FTS5 phrase.
+    - Every term is individually double-quoted so FTS5 operator syntax in user
+      input is treated as literal text and can never raise a syntax error.
+
+    Returns '' when the input has no indexable tokens.
+    """
+    tokens = []  # list of (is_phrase, text)
+    i, n = 0, len(keyword)
+    while i < n:
+        ch = keyword[i]
+        if ch == '"':
+            close = keyword.find('"', i + 1)
+            if close == -1:
+                for w in keyword[i + 1:].split():
+                    tokens.append((False, w))
+                break
+            phrase = keyword[i + 1:close].strip()
+            if phrase:
+                tokens.append((True, phrase))
+            i = close + 1
+        elif ch.isspace():
+            i += 1
+        else:
+            j = i
+            while j < n and not keyword[j].isspace() and keyword[j] != '"':
+                j += 1
+            tokens.append((False, keyword[i:j]))
+            i = j
+
+    parts = []
+    for is_phrase, text in tokens:
+        safe = text.replace('"', " ")
+        if not re.search(r"\w", safe):
+            continue
+        if is_phrase:
+            safe = " ".join(safe.split())
+        parts.append(f'"{safe}"')
+    return " ".join(parts)
+
+
+def search_fts(keyword, project_filter=None, since=None, limit=30):
+    dbfile = db_path()
+    if not dbfile.exists():
+        return None  # index missing (distinct from "no matches")
+    conn = sqlite3.connect(str(dbfile))
+    conn.row_factory = sqlite3.Row
+
+    fts_param = build_fts_query(keyword)
+    if not fts_param.strip():
+        conn.close()
+        return []
+
+    results = []
+    try:
+        conditions = []
+        params = []
+        if project_filter:
+            conditions.append("s.cwd LIKE ?")
+            params.append(f"%{project_filter}%")
+        if since:
+            conditions.append("s.mtime >= ?")
+            params.append(since.timestamp())
+        extra_where = (" AND " + " AND ".join(conditions)) if conditions else ""
+
+        query = f"""
+            SELECT s.session_id, s.cwd, s.git_branch, s.model, s.first_prompt,
+                   s.message_count, s.mtime,
+                   snippet(sessions_fts, 1, ?, ?, ?, 12) AS snip_first,
+                   snippet(sessions_fts, 2, ?, ?, ?, 12) AS snip_all
+            FROM sessions_fts fts
+            JOIN sessions s ON s.session_id = fts.session_id
+            WHERE sessions_fts MATCH ?{extra_where}
+            ORDER BY bm25(sessions_fts, 0, 3.0, 1.0)
+            LIMIT ?
+        """
+        ell = "…"
+        all_params = (
+            [_SNIP_START, _SNIP_END, ell, _SNIP_START, _SNIP_END, ell]
+            + [fts_param] + params + [limit]
+        )
+        for row in conn.execute(query, all_params):
+            dt = datetime.fromtimestamp(row["mtime"], tz=timezone.utc) if row["mtime"] else None
+            snip_first = row["snip_first"] or ""
+            snip_all = row["snip_all"] or ""
+            excerpt = snip_first if _SNIP_START in snip_first else snip_all
+            if _SNIP_START not in excerpt:
+                excerpt = snip_first or snip_all
+            excerpt = excerpt.replace(_SNIP_START, _HL_START).replace(_SNIP_END, _HL_END)
+            excerpt = " ".join(excerpt.split())
+            results.append({
+                "sessionId": row["session_id"],
+                "project": display_path(row["cwd"] or ""),
+                "firstPrompt": row["first_prompt"] or "",
+                "excerpt": excerpt,
+                "messageCount": row["message_count"] or 0,
+                "gitBranch": row["git_branch"] or "",
+                "dt": dt,
+            })
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+    return results
+
+
+def session_cwd_map():
+    """session_id -> cwd from the index DB (empty when no index exists).
+
+    history.jsonl entries carry no workspace, so --project filtering of
+    history results goes through the index.
+    """
+    dbfile = db_path()
+    if not dbfile.exists():
+        return {}
+    try:
+        conn = sqlite3.connect(str(dbfile))
+        rows = conn.execute("SELECT session_id, cwd FROM sessions").fetchall()
+        conn.close()
+        return dict(rows)
+    except sqlite3.OperationalError:
+        return {}
+
+
+def load_history(keyword=None, since=None, project_filter=None):
+    """Load history.jsonl entries ({session_id, ts, text}), optionally filtered.
+
+    With project_filter, entries are kept only when their session's workspace
+    (resolved via the index) matches; entries from unindexed sessions are
+    dropped rather than shown under the wrong project.
+    """
+    cwd_map = session_cwd_map() if project_filter else {}
+    hist = history_file()
+    if not hist.exists():
+        return []
+    results = []
+    try:
+        with open(hist, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = entry.get("ts", 0)
+                if ts > 1e12:  # milliseconds
+                    ts = ts / 1000
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                if since and dt < since:
+                    continue
+                text = entry.get("text", "")
+                if is_history_noise(text):
+                    continue
+                if keyword and keyword.lower() not in text.lower():
+                    continue
+                if project_filter:
+                    cwd = cwd_map.get(entry.get("session_id", ""), "")
+                    if project_filter.lower() not in cwd.lower():
+                        continue
+                results.append({
+                    "timestamp": dt,
+                    "text": redact(text),
+                    "sessionId": entry.get("session_id", ""),
+                })
+    except OSError:
+        pass
+    return results
+
+
+def search_full_transcripts(keyword, project_filter=None, since=None, max_results=20):
+    """Substring scan over full rollout transcripts. Slower but comprehensive."""
+    results = []
+    kw = keyword.lower()
+    for path in iter_session_files():
+        if len(results) >= max_results:
+            break
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if since and datetime.fromtimestamp(mtime, tz=timezone.utc) < since:
+            continue
+        if project_filter:
+            meta = parse_session(path, meta_only=True)
+            if project_filter.lower() not in meta["cwd"].lower():
+                continue
+        # Cheap pre-filter on raw bytes before parsing messages.
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                if kw not in f.read().lower():
+                    continue
+        except OSError:
+            continue
+        matches = []
+        for msg in load_messages(path):
+            text = msg["text"]
+            idx = text.lower().find(kw)
+            if idx < 0:
+                continue
+            start = max(0, idx - 80)
+            end = min(len(text), idx + len(keyword) + 80)
+            snippet = text[start:end]
+            if start > 0:
+                snippet = "..." + snippet
+            if end < len(text):
+                snippet = snippet + "..."
+            matches.append({"role": msg["role"], "snippet": snippet})
+        if matches:
+            results.append({
+                "sessionId": session_id_from_path(path),
+                "path": str(path),
+                "matches": matches[:5],
+                "totalMatches": len(matches),
+            })
+    return results
+
+
+def print_history_entries(entries, limit=30):
+    for h in entries[:limit]:
+        time_str = format_dt(h["timestamp"])
+        display = " ".join(h["text"].split())[:120]
+        sid = h["sessionId"][:8] if h["sessionId"] else "no-id"
+        print(f"  {time_str:>12}  [{sid}]")
+        print(f"               {display}")
+        print()
+    if len(entries) > limit:
+        print(f"  ... and {len(entries) - limit} more matches")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Search Codex session history")
+    parser.add_argument("keyword", nargs="?", help="Search keyword")
+    parser.add_argument("--project", "-p", help="Filter by workspace path (substring)")
+    parser.add_argument("--days", "-d", type=int, help="Only search last N days")
+    parser.add_argument("--full", "-f", action="store_true", help="Also scan full transcripts (slower)")
+    parser.add_argument("--recent", "-r", type=int, help="Show N most recent prompts")
+    parser.add_argument("--literal", "-l", action="store_true",
+                        help="Bypass FTS; substring scan over history.jsonl")
+    parser.add_argument("--json", action="store_true", help="Output as JSON (with --recent)")
+    args = parser.parse_args()
+
+    if not args.keyword and not args.recent:
+        parser.print_help()
+        sys.exit(1)
+
+    since = None
+    if args.days:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=args.days)
+
+    if args.recent:
+        history = load_history(since=since, project_filter=args.project)
+        history.sort(key=lambda x: x["timestamp"], reverse=True)
+        history = history[: args.recent]
+        if args.json:
+            for h in history:
+                h["timestamp"] = h["timestamp"].isoformat()
+            print(json.dumps(history, indent=2))
+        else:
+            print_history_entries(history, limit=args.recent)
+        return
+
+    fts_results = []
+    if not args.literal:
+        fts_results = search_fts(args.keyword, project_filter=args.project, since=since)
+        if fts_results is None:
+            print("No search index found — run 'cx-index' first for ranked search.")
+            fts_results = []
+    if fts_results:
+        print(f"\n── Indexed Sessions ({len(fts_results)} matches) ──\n")
+        for r in fts_results:
+            time_str = format_dt(r["dt"])
+            sid = r["sessionId"][:8]
+            branch = f" ({r['gitBranch']})" if r["gitBranch"] else ""
+            excerpt = (r["excerpt"] or r["firstPrompt"])[:160]
+            print(f"  {time_str:>12}  [{sid}]  {r['project']}{branch}  ({r['messageCount']} msgs)")
+            if excerpt:
+                print(f"               {excerpt}")
+            print()
+
+    # History substring search (always on, like cc-search).
+    history = load_history(keyword=args.keyword, since=since, project_filter=args.project)
+    history.sort(key=lambda x: x["timestamp"], reverse=True)
+    if history:
+        print(f"\n── History ({len(history)} matches) ──\n")
+        print_history_entries(history)
+
+    transcript_results = []
+    if args.full:
+        print(f"\n── Full Transcript Search ──\n")
+        transcript_results = search_full_transcripts(
+            args.keyword, project_filter=args.project, since=since
+        )
+        if transcript_results:
+            for r in transcript_results:
+                print(f"  [{r['sessionId'][:8]}]  ({r['totalMatches']} matches)")
+                for m in r["matches"]:
+                    snippet = " ".join(m["snippet"].split())
+                    print(f"    {m['role']:>9}: {snippet}")
+                print()
+        else:
+            print("  No matches found in transcripts.")
+
+    if not fts_results and not history and not transcript_results:
+        print(f"No matches for '{args.keyword}'")
+
+
+if __name__ == "__main__":
+    main()

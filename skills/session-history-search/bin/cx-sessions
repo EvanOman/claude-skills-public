@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""List recent Codex CLI sessions.
+
+Scans $CODEX_HOME/sessions and archived_sessions (default ~/.codex) directly —
+no index required. Sessions are sorted by file mtime; only the sessions that
+make the cut are fully parsed, so listing stays fast even with hundreds of
+transcripts on disk.
+
+Usage:
+  cx-sessions                     # Last 15 sessions
+  cx-sessions --count 30          # More sessions
+  cx-sessions --project alpha     # Filter by workspace path (substring)
+  cx-sessions --days 3            # Only last N days
+  cx-sessions --long              # Include model, tokens, source, CLI version
+  cx-sessions --project-summary   # Group by workspace with session counts
+  cx-sessions --json              # Machine-readable output
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from cx_common import (
+    display_path,
+    format_dt,
+    iter_session_files,
+    parse_session,
+    session_id_from_path,
+)
+
+
+def collect_candidates(project_filter=None, since=None):
+    """(mtime, path, meta) for sessions passing filters, newest first.
+
+    Reads only each file's first line (session_meta) — enough for the cwd
+    filter — deferring full parses to the final display set.
+    """
+    candidates = []
+    for path in iter_session_files():
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+        if since and dt < since:
+            continue
+        meta = parse_session(path, meta_only=True)
+        if project_filter and project_filter.lower() not in meta["cwd"].lower():
+            continue
+        candidates.append((mtime, path, meta))
+
+    # Deterministic: newest first, path as tiebreak.
+    candidates.sort(key=lambda c: (-c[0], str(c[1])))
+    return candidates
+
+
+def main():
+    parser = argparse.ArgumentParser(description="List recent Codex sessions")
+    parser.add_argument("--project", "-p", help="Filter by workspace path (substring)")
+    parser.add_argument("--days", "-d", type=int, help="Only show last N days")
+    parser.add_argument("--count", "-n", type=int, default=15, help="Number of sessions to show")
+    parser.add_argument("--long", "-l", action="store_true", help="Show detailed info per session")
+    parser.add_argument("--project-summary", action="store_true", help="Group by workspace")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    args = parser.parse_args()
+
+    since = None
+    if args.days:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=args.days)
+
+    candidates = collect_candidates(project_filter=args.project, since=since)
+
+    if args.project_summary:
+        projects = {}
+        for mtime, path, meta in candidates:
+            p = display_path(meta["cwd"]) or "(unknown)"
+            info = projects.setdefault(p, {"count": 0, "latest": None})
+            info["count"] += 1
+            if info["latest"] is None:
+                info["latest"] = datetime.fromtimestamp(mtime, tz=timezone.utc)
+        print(f"\n{'Workspace':<50} {'Sessions':>8} {'Latest':>12}")
+        print("─" * 74)
+        for project, info in projects.items():
+            print(f"  {project:<48} {info['count']:>8} {format_dt(info['latest']):>12}")
+        print()
+        return
+
+    selected = candidates[: args.count]
+    sessions = []
+    for mtime, path, _meta in selected:
+        info = parse_session(path)
+        info["dt"] = datetime.fromtimestamp(mtime, tz=timezone.utc)
+        sessions.append(info)
+
+    if args.json:
+        out = []
+        for s in sessions:
+            out.append({
+                "sessionId": s["session_id"],
+                "project": display_path(s["cwd"]),
+                "firstPrompt": s["first_prompt"][:300],
+                "messageCount": s["message_count"],
+                "gitBranch": s["git_branch"],
+                "model": s["model"],
+                "totalTokens": s["total_tokens"],
+                "sourceKind": s["source_kind"],
+                "timestamp": s["timestamp"],
+                "modified": s["dt"].isoformat(),
+                "path": s["path"],
+            })
+        print(json.dumps(out, indent=2))
+        return
+
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    for s in sessions:
+        time_str = format_dt(s["dt"])
+        sid = s["session_id"][:8]
+        project = display_path(s["cwd"]) or "(unknown)"
+        branch = f" ({s['git_branch']})" if s["git_branch"] else ""
+        msgs = s["message_count"]
+        kind = "" if s["source_kind"] == "interactive" else f"  [{s['source_kind']}]"
+        first = " ".join(s["first_prompt"].split())[:120]
+        print(f"  {time_str:>12}  [{sid}]  {project}{branch}  ({msgs} msgs){kind}")
+        if first:
+            print(f"               {first}")
+        if args.long:
+            details = []
+            if s["model"]:
+                details.append(f"model: {s['model']}")
+            if s["total_tokens"]:
+                details.append(f"tokens: {s['total_tokens']:,}")
+            if s["cli_version"]:
+                details.append(f"cli: {s['cli_version']}")
+            details.append(f"prompts: {s['user_count']}")
+            print(f"               {'  '.join(details)}")
+        print()
+
+
+if __name__ == "__main__":
+    main()

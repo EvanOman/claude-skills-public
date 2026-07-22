@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Render a readable transcript from a Codex CLI session rollout file.
+
+Usage:
+  cx-transcript <session-id>              # Find and render session by unique ID prefix
+  cx-transcript <session-id> --tools      # Include tool calls and results
+  cx-transcript <session-id> --raw        # Output messages as JSON
+  cx-transcript <session-id> --user-only  # Only show user messages
+  cx-transcript <session-id> --summary    # Just first/last messages and stats
+  cx-transcript <session-id> --tail 10    # Last 10 messages
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from cx_common import (
+    display_path,
+    find_session_files,
+    load_messages,
+    parse_session,
+    session_id_from_path,
+)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Read Codex session transcripts")
+    parser.add_argument("session_id", help="Session ID (unique prefix match)")
+    parser.add_argument("--tools", "-t", action="store_true", help="Include tool calls")
+    parser.add_argument("--raw", action="store_true", help="Output messages as JSON")
+    parser.add_argument("--user-only", "-u", action="store_true", help="Only user messages")
+    parser.add_argument("--summary", "-s", action="store_true", help="Show summary only")
+    parser.add_argument("--tail", type=int, help="Show only last N messages")
+    args = parser.parse_args()
+
+    matches = find_session_files(args.session_id)
+    if not matches:
+        print(f"No session found matching '{args.session_id}'", file=sys.stderr)
+        print("Tip: use 'cx-sessions' to list recent sessions and get IDs", file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        print(f"Ambiguous prefix '{args.session_id}' matches {len(matches)} sessions:",
+              file=sys.stderr)
+        for p in matches:
+            print(f"  {session_id_from_path(p)}  {p}", file=sys.stderr)
+        print("Use a longer prefix.", file=sys.stderr)
+        sys.exit(1)
+
+    session_file = matches[0]
+    meta = parse_session(session_file, meta_only=True)
+    file_size_mb = session_file.stat().st_size / (1024 * 1024)
+    print(f"Session: {meta['session_id']}", file=sys.stderr)
+    if meta["cwd"]:
+        print(f"Workspace: {display_path(meta['cwd'])}", file=sys.stderr)
+    print(f"File: {session_file} ({file_size_mb:.1f} MB)", file=sys.stderr)
+    print(file=sys.stderr)
+
+    messages = load_messages(session_file, include_tools=args.tools)
+    if args.user_only:
+        messages = [m for m in messages if m["role"] == "user"]
+
+    if not messages:
+        print("No messages found in transcript.")
+        return
+
+    if args.summary:
+        first = messages[0]
+        last = messages[-1]
+        user_count = sum(1 for m in messages if m["role"] == "user")
+        asst_count = sum(1 for m in messages if m["role"] == "assistant")
+        print(f"Messages: {len(messages)} ({user_count} user, {asst_count} assistant)")
+        if first["timestamp"] and last["timestamp"]:
+            print(f"Duration: {first['timestamp']} → {last['timestamp']}")
+        print(f"\nFirst message:")
+        print(f"  {first['text'][:300]}")
+        print(f"\nLast message:")
+        print(f"  {last['text'][:300]}")
+        return
+
+    if args.tail:
+        messages = messages[-args.tail:]
+
+    if args.raw:
+        print(json.dumps(messages, indent=2))
+        return
+
+    for msg in messages:
+        role = msg["role"].upper()
+        text = msg["text"]
+        if role == "USER":
+            print("─" * 60)
+            print("USER:")
+            print(text)
+            print()
+        elif role in ("TOOL", "TOOL_RESULT"):
+            print(f"  {text}")
+            print()
+        else:
+            print("ASSISTANT:")
+            if len(text) > 2000:
+                print(text[:2000])
+                print(f"\n  ... [{len(text) - 2000} chars truncated] ...")
+            else:
+                print(text)
+            print()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Build a searchable SQLite index of Codex CLI sessions.
+
+Scans $CODEX_HOME/sessions and archived_sessions (default ~/.codex), extracts
+user prompts and session metadata, and writes an FTS5 (porter-stemmed) index
+that cx-search queries.
+
+The index lives at $CODEX_HOME/usage-data/sessions.db, overridable with the
+CX_SESSIONS_DB environment variable. Prompt text is redacted (API keys and
+tokens masked) before it is stored.
+
+Usage:
+  cx-index                # Index new/changed sessions (incremental)
+  cx-index --full         # Rebuild the whole index from scratch
+  cx-index --stats        # Show index summary
+"""
+
+import argparse
+import os
+import sqlite3
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from cx_common import db_path, iter_session_files, parse_session, session_id_from_path
+
+# Cap each prompt's contribution so pasted walls of text can't dominate.
+MAX_MSG_CHARS = 2000
+
+FTS_CREATE_SQL = """
+    CREATE VIRTUAL TABLE sessions_fts USING fts5(
+        session_id UNINDEXED,
+        first_prompt,
+        all_prompts,
+        tokenize='porter unicode61'
+    )
+"""
+
+
+def verify_fts5():
+    """Ensure this python3's sqlite3 has FTS5 with the porter tokenizer."""
+    try:
+        test = sqlite3.connect(":memory:")
+        test.execute(
+            "CREATE VIRTUAL TABLE _fts_probe USING fts5(x, tokenize='porter unicode61')"
+        )
+        test.close()
+    except sqlite3.OperationalError as e:
+        sys.exit(
+            "ERROR: This python3's sqlite3 module lacks FTS5 with the porter "
+            f"tokenizer, which cx-index requires ({e}). Install a python3 built "
+            "against a full SQLite (FTS5 enabled)."
+        )
+
+
+def init_db(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            cwd TEXT,
+            git_branch TEXT,
+            model TEXT,
+            originator TEXT,
+            cli_version TEXT,
+            source_kind TEXT,
+            first_prompt TEXT,
+            all_prompts TEXT,
+            message_count INTEGER,
+            user_count INTEGER,
+            total_tokens INTEGER,
+            timestamp TEXT,
+            mtime REAL,
+            jsonl_path TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_mtime ON sessions(mtime);
+        CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd);
+    """)
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions_fts'"
+    ).fetchone()
+    if row is None:
+        conn.execute(FTS_CREATE_SQL)
+    conn.commit()
+    return conn
+
+
+def rebuild_fts(conn):
+    conn.execute("DELETE FROM sessions_fts")
+    conn.execute("""
+        INSERT INTO sessions_fts(session_id, first_prompt, all_prompts)
+        SELECT session_id, first_prompt, all_prompts FROM sessions
+    """)
+    conn.commit()
+
+
+def upsert_session(conn, info, mtime):
+    all_prompts = " ".join(p[:MAX_MSG_CHARS] for p in info["prompts"])
+    conn.execute("""
+        INSERT OR REPLACE INTO sessions
+            (session_id, cwd, git_branch, model, originator, cli_version,
+             source_kind, first_prompt, all_prompts, message_count,
+             user_count, total_tokens, timestamp, mtime, jsonl_path)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        info["session_id"], info["cwd"], info["git_branch"], info["model"],
+        info["originator"], info["cli_version"], info["source_kind"],
+        info["first_prompt"][:300], all_prompts, info["message_count"],
+        info["user_count"], info["total_tokens"], info["timestamp"],
+        mtime, info["path"],
+    ))
+
+
+def show_stats(conn):
+    total = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    if total == 0:
+        print("No sessions indexed. Run 'cx-index' first.")
+        return
+    with_prompts = conn.execute(
+        "SELECT COUNT(*) FROM sessions WHERE first_prompt != ''"
+    ).fetchone()[0]
+    subagents = conn.execute(
+        "SELECT COUNT(*) FROM sessions WHERE source_kind = 'subagent'"
+    ).fetchone()[0]
+    print(f"\n{'Workspace':<50} {'Sessions':>8}")
+    print("─" * 60)
+    cursor = conn.execute("""
+        SELECT cwd, COUNT(*) as cnt FROM sessions
+        GROUP BY cwd ORDER BY cnt DESC LIMIT 20
+    """)
+    for cwd, count in cursor:
+        print(f"  {(cwd or '(unknown)'):<48} {count:>8}")
+    print(f"\nTotal indexed sessions: {total}")
+    print(f"  with prompts: {with_prompts}   subagent sessions: {subagents}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build Codex session search index (SQLite)")
+    parser.add_argument("--full", action="store_true", help="Re-index everything")
+    parser.add_argument("--stats", action="store_true", help="Show index summary")
+    args = parser.parse_args()
+
+    dbfile = db_path()
+
+    if args.stats:
+        if not dbfile.exists():
+            print("No database found. Run 'cx-index' first.")
+            return
+        conn = sqlite3.connect(str(dbfile))
+        show_stats(conn)
+        conn.close()
+        return
+
+    verify_fts5()
+
+    if args.full and dbfile.exists():
+        dbfile.unlink()
+
+    conn = init_db(dbfile)
+    existing_mtimes = {}
+    if not args.full:
+        existing_mtimes = dict(
+            conn.execute("SELECT session_id, mtime FROM sessions").fetchall()
+        )
+
+    new_count = 0
+    skip_count = 0
+    batch_count = 0
+    conn.execute("BEGIN")
+    for path in iter_session_files():
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        # Filename-derived id for the mtime check: unchanged files are never opened.
+        sid = session_id_from_path(path)
+        if sid in existing_mtimes and existing_mtimes[sid] >= mtime:
+            skip_count += 1
+            continue
+
+        print(f"  Indexing {sid[:8]}...", flush=True)
+        info = parse_session(path)
+        upsert_session(conn, info, mtime)
+        new_count += 1
+        batch_count += 1
+        if batch_count >= 50:
+            conn.execute("COMMIT")
+            conn.execute("BEGIN")
+            batch_count = 0
+    conn.execute("COMMIT")
+
+    if new_count > 0:
+        print("  Rebuilding FTS index...", flush=True)
+        rebuild_fts(conn)
+    conn.close()
+
+    print(f"\nDone. Indexed {new_count} new/updated sessions, skipped {skip_count} unchanged.")
+    print(f"Total sessions in index: {new_count + skip_count}")
+
+
+if __name__ == "__main__":
+    main()
