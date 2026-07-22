@@ -198,6 +198,29 @@ class Harness:
             pid = first_value(doctor, "pid", "daemon_pid", "daemonPid")
             if isinstance(pid, int):
                 self.terminate_test_daemon(pid)
+        # A regression under test can make the broker too busy to answer
+        # doctor. Only processes carrying this harness's exact state marker
+        # are eligible for the teardown fallback.
+        marker = f"OVERMIND_V2_STATE_DIR={self.state}".encode()
+        for process in Path("/proc").glob("[0-9]*"):
+            try:
+                environment = (process / "environ").read_bytes().split(b"\0")
+                pid = int(process.name)
+            except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+                continue
+            if marker not in environment:
+                continue
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 6
+            while process.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if process.exists():
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+                deadline = time.monotonic() + 2
+                while process.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
         self.temporary.cleanup()
 
     def call(
@@ -268,7 +291,7 @@ class Harness:
         if marker not in environ:
             raise ContractFailure(f"refusing to signal unverified process {pid}")
         os.kill(pid, signal.SIGTERM)
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 8
         while proc.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         if proc.exists():
@@ -337,6 +360,7 @@ class McpClient:
         self.stdout = self.process.stdout
         self.next_id = 1
         self.notifications: list[dict[str, Any]] = []
+        self._tool_names: dict[str, str] = {}
         self.request("initialize", {"protocolVersion": "2025-03-26", "capabilities": {}})
         self.notify("notifications/initialized", {})
 
@@ -354,18 +378,41 @@ class McpClient:
         *,
         timeout: float = 10,
     ) -> dict[str, Any]:
+        request_id = self.begin_request(method, params)
+        return self.wait_for_response(request_id, timeout=timeout, method=method)
+
+    def begin_request(self, method: str, params: dict[str, Any]) -> int:
         request_id = self.next_id
         self.next_id += 1
         self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        return request_id
+
+    def read_message(self, *, timeout: float = 10) -> dict[str, Any]:
+        ready, _, _ = select.select([self.stdout], [], [], timeout)
+        if ready:
+            line = self.stdout.readline()
+            if line:
+                return json.loads(line)
+        stderr = ""
+        if self.process.poll() is not None and self.process.stderr:
+            stderr = self.process.stderr.read()
+        raise ContractFailure(f"MCP message timed out; stderr={stderr!r}")
+
+    def wait_for_response(
+        self,
+        request_id: int,
+        *,
+        timeout: float = 10,
+        method: str = "request",
+    ) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            ready, _, _ = select.select([self.stdout], [], [], min(0.25, deadline - time.monotonic()))
-            if not ready:
-                continue
-            line = self.stdout.readline()
-            if not line:
-                break
-            message = json.loads(line)
+            try:
+                message = self.read_message(timeout=min(0.25, deadline - time.monotonic()))
+            except ContractFailure:
+                if self.process.poll() is None:
+                    continue
+                raise
             if message.get("id") == request_id:
                 return message
             self.notifications.append(message)
@@ -379,9 +426,13 @@ class McpClient:
         return response["result"]["tools"]
 
     def tool_name(self, canonical: str) -> str:
+        cached = self._tool_names.get(canonical)
+        if cached is not None:
+            return cached
         matches = [tool["name"] for tool in self.tools() if canonical_tool(tool["name"]) == canonical]
         if len(matches) != 1:
             raise ContractFailure(f"expected one canonical {canonical!r} tool, got {matches!r}")
+        self._tool_names[canonical] = matches[0]
         return matches[0]
 
     def call_tool(

@@ -236,22 +236,93 @@ class IdempotencyAndAliasTest(IntegrationCase):
 
 
 class WaitCollectAndSafetyTest(IntegrationCase):
+    def test_generic_mutations_reject_unique_prefixes_shorter_than_eight_characters(self) -> None:
+        operations = (
+            ("stop", {}),
+            (
+                "reply",
+                {"prompt": "must not launch", "idempotency_key": "short-reply-mutation"},
+            ),
+            ("forget", {}),
+        )
+        for operation, extra in operations:
+            with self.subTest(operation=operation):
+                created = self.harness.run_many(
+                    [self.harness.job_spec(f"short-{operation}", mode="hold")],
+                    key=f"short-{operation}",
+                )
+                group_id = ids_from(created, "group")[0]
+                job_id = ids_from(created, "job")[0]
+                candidates = [job_id[:size] for size in range(1, 8)]
+                short = next(value for value in reversed(candidates) if not group_id.startswith(value))
+                failed = self.harness.call(
+                    operation,
+                    {"target": short, **extra},
+                    check=False,
+                )
+                self.assertNotEqual(0, failed.returncode, failed.stdout)
+                detail = (failed.stdout + failed.stderr).lower()
+                self.assertTrue(
+                    "ambiguous" in detail or "8" in detail or "full" in detail,
+                    detail,
+                )
+                shown = self.harness.call("show", job_target(job_id)).json()
+                self.assertNotIn(state_from(shown), TERMINAL, shown)
+
+    def test_unchanged_usage_reconciliation_does_not_append_duplicate_evidence(self) -> None:
+        created = self.harness.run_many(
+            [self.harness.job_spec("usage-stable", mode="hold")],
+            key="usage-stable",
+        )
+        job_id = ids_from(created, "job")[0]
+        database = self.harness.state / "overmind.db"
+
+        def counts() -> tuple[int, int]:
+            with sqlite3.connect(database) as connection:
+                usage = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM usage WHERE job_id=?", (job_id,)
+                    ).fetchone()[0]
+                )
+                events = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM events WHERE job_id=? AND kind='usage.recorded'",
+                        (job_id,),
+                    ).fetchone()[0]
+                )
+            return usage, events
+
+        deadline = time.monotonic() + 2
+        before = counts()
+        while before[0] == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+            before = counts()
+        self.assertGreater(before[0], 0, before)
+        for _ in range(3):
+            self.harness.call("show", {**job_target(job_id), "fresh": True})
+        time.sleep(0.25)
+        self.assertEqual(before, counts())
+        self.harness.call("stop", job_target(job_id))
+
     def test_any_all_await_uses_monotonic_resumable_cursors(self) -> None:
         created = self.harness.run_many(
             [
-                self.harness.job_spec("quick", delay=0.05),
-                self.harness.job_spec("slow", delay=0.35),
+                self.harness.job_spec("first", mode="hold"),
+                self.harness.job_spec("second", mode="hold"),
             ],
             key="await-cursors",
         )
         group_id = ids_from(created, "group")[0]
+        job_ids = ids_from(created, "job")
         original = cursor_from(created)
+        self.harness.call("stop", job_target(job_ids[0]))
         any_done = self.harness.call(
             "await",
             {**group_target(group_id), "condition": "any_terminal", "since_cursor": original, "timeout": 2},
         ).json()
         any_cursor = cursor_from(any_done)
         self.assertGreater(any_cursor, original)
+        self.harness.call("stop", job_target(job_ids[1]))
         all_done = self.harness.call(
             "await",
             {**group_target(group_id), "condition": "all_terminal", "since_cursor": any_cursor, "timeout": 2},
@@ -287,6 +358,10 @@ class WaitCollectAndSafetyTest(IntegrationCase):
         time.sleep(0.1)
         process.terminate()
         process.wait(timeout=2)
+        if process.stdout:
+            process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
         self.harness.call("stop", job_target(job_id))
         resumed = self.harness.call(
             "await",

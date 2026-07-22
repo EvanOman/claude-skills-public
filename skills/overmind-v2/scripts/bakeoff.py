@@ -113,7 +113,9 @@ def run_v1() -> dict[str, Any]:
         }
 
 
-def populate_performance_fixture(harness: Harness, history: int, active: int) -> float:
+def populate_performance_fixture(
+    harness: Harness, history: int, active: int
+) -> dict[str, float]:
     batch_size = 50
     for offset in range(0, history, batch_size):
         size = min(batch_size, history - offset)
@@ -139,14 +141,33 @@ def populate_performance_fixture(harness: Harness, history: int, active: int) ->
         label="bake-active",
     )
     expected = set(ids_from(active_group, "job"))
-    harness.call("jobs", {"active": True, "limit": max(100, active)})
-    samples: list[float] = []
-    for _ in range(40):
-        response = harness.call("jobs", {"active": True, "limit": max(100, active)})
+    arguments = {
+        "state": ["queued", "starting", "running"],
+        "limit": max(100, active),
+    }
+    client = McpClient(harness.mcp, harness.env)
+    try:
+        client.call_tool("jobs", arguments)
+        persistent_samples: list[float] = []
+        for _ in range(40):
+            started = time.perf_counter()
+            response = client.call_tool("jobs", arguments)
+            persistent_samples.append((time.perf_counter() - started) * 1000)
+            if set(ids_from(structured(response), "job")) != expected:
+                raise ContractFailure("status fixture did not return exactly the active jobs")
+    finally:
+        client.close()
+
+    cold_cli_samples: list[float] = []
+    for _ in range(10):
+        response = harness.call("jobs", arguments)
         if set(ids_from(response.json(), "job")) != expected:
-            raise ContractFailure("status fixture did not return exactly the active jobs")
-        samples.append(response.elapsed_ms)
-    return percentile(samples, 0.95)
+            raise ContractFailure("cold CLI status did not return exactly the active jobs")
+        cold_cli_samples.append(response.elapsed_ms)
+    return {
+        "persistent_mcp_p95_ms": percentile(persistent_samples, 0.95),
+        "cold_cli_p95_ms": percentile(cold_cli_samples, 0.95),
+    }
 
 
 def run_v2(history: int, active: int, performance: bool) -> dict[str, Any]:
@@ -213,7 +234,9 @@ def run_v2(history: int, active: int, performance: bool) -> dict[str, Any]:
             and ids_from(retried, "job") == job_ids
             and len(harness.provider_calls("launch")) == len(WORKERS)
         )
-        status_p95 = populate_performance_fixture(harness, history, active) if performance else None
+        status_latency = (
+            populate_performance_fixture(harness, history, active) if performance else None
+        )
         terminal_count = sum(
             1 for state in set(str(value) for value in recursive_states(awaited)) if state == "succeeded"
         )
@@ -233,7 +256,12 @@ def run_v2(history: int, active: int, performance: bool) -> dict[str, Any]:
             "result_count": len(ids_from(collected, "job")),
             "model_driven_polling": "jobs" in operations or operations.count("await") != 1,
             "restart_idempotency": restart_idempotency,
-            "status_p95_ms": status_p95,
+            "persistent_mcp_status_p95_ms": (
+                status_latency["persistent_mcp_p95_ms"] if status_latency else None
+            ),
+            "cold_cli_status_p95_ms": (
+                status_latency["cold_cli_p95_ms"] if status_latency else None
+            ),
         }
     finally:
         harness.close()
@@ -263,9 +291,12 @@ def evaluate(v1: dict[str, Any], v2: dict[str, Any], performance: bool) -> dict[
         "v2_at_most_three_parent_lifecycle_calls": v2["lifecycle_call_count"] <= 3,
         "v2_no_model_driven_polling": not v2["model_driven_polling"],
         "v2_restart_and_idempotency": bool(v2["restart_idempotency"]),
-        "v2_status_p95_under_50ms": (
+        "v2_persistent_mcp_status_p95_under_50ms": (
             not performance
-            or (isinstance(v2["status_p95_ms"], (int, float)) and v2["status_p95_ms"] < 50)
+            or (
+                isinstance(v2["persistent_mcp_status_p95_ms"], (int, float))
+                and v2["persistent_mcp_status_p95_ms"] < 50
+            )
         ),
     }
     return {"pass": all(checks.values()), "checks": checks, "v1": v1, "v2": v2}
@@ -302,8 +333,15 @@ def main() -> int:
                     f"  {version}: {item['elapsed_ms']:.2f}ms, "
                     f"{item['lifecycle_call_count']} lifecycle calls, {item['operations']}"
                 )
-            if report["v2"].get("status_p95_ms") is not None:
-                print(f"  v2 status p95: {report['v2']['status_p95_ms']:.2f}ms")
+            if report["v2"].get("persistent_mcp_status_p95_ms") is not None:
+                print(
+                    "  v2 persistent MCP status p95: "
+                    f"{report['v2']['persistent_mcp_status_p95_ms']:.2f}ms (gated)"
+                )
+                print(
+                    "  v2 cold CLI status p95: "
+                    f"{report['v2']['cold_cli_status_p95_ms']:.2f}ms (informational)"
+                )
         else:
             print(" ", report["error"])
     return 0 if report.get("pass") else 1

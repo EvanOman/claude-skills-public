@@ -13,7 +13,14 @@ BAKEOFF = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BAKEOFF)
 
 
-def side(*, calls: int, polling: bool = False, restart: bool = True, p95: float = 10) -> dict[str, object]:
+def side(
+    *,
+    calls: int,
+    polling: bool = False,
+    restart: bool = True,
+    p95: float = 10,
+    cold_cli_p95: float = 500,
+) -> dict[str, object]:
     return {
         "worker_count": 4,
         "terminal_count": 4,
@@ -21,7 +28,8 @@ def side(*, calls: int, polling: bool = False, restart: bool = True, p95: float 
         "lifecycle_call_count": calls,
         "model_driven_polling": polling,
         "restart_idempotency": restart,
-        "status_p95_ms": p95,
+        "persistent_mcp_status_p95_ms": p95,
+        "cold_cli_status_p95_ms": cold_cli_p95,
     }
 
 
@@ -42,6 +50,14 @@ class BakeoffReportTest(unittest.TestCase):
             with self.subTest(candidate=candidate):
                 report = BAKEOFF.evaluate(side(calls=12), candidate, True)
                 self.assertFalse(report["pass"], report)
+
+    def test_cold_cli_latency_is_reported_but_not_gated(self) -> None:
+        report = BAKEOFF.evaluate(
+            side(calls=12),
+            side(calls=3, p95=10, cold_cli_p95=10_000),
+            True,
+        )
+        self.assertTrue(report["pass"], report)
 
 
 if __name__ == "__main__":

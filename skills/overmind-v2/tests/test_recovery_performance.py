@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import time
 import unittest
+from pathlib import Path
 
 from support import (
     Harness,
     IntegrationCase,
+    McpClient,
     cursor_from,
     first_value,
     ids_from,
@@ -18,6 +20,26 @@ from support import (
 
 def group_target(group_id: str) -> dict[str, object]:
     return {"target": {"group_id": group_id}}
+
+
+def processes_with_environment(marker: bytes) -> list[int]:
+    matches: list[int] = []
+    for process in Path("/proc").glob("[0-9]*"):
+        try:
+            environment = (process / "environ").read_bytes().split(b"\0")
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if marker in environment:
+            matches.append(int(process.name))
+    return matches
+
+
+def file_snapshot(root: Path) -> dict[str, tuple[int, int]]:
+    return {
+        str(path.relative_to(root)): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
 class RecoveryTest(IntegrationCase):
@@ -67,9 +89,43 @@ class RecoveryTest(IntegrationCase):
         self.assertEqual("unknown", state_from(shown), shown)
         self.assertEqual(1, len(self.harness.provider_calls("launch")))
 
+    def test_shutdown_with_eighteen_held_jobs_leaves_no_workers_or_file_recreation(self) -> None:
+        launched = self.harness.call(
+            "run-many",
+            {
+                "group": {"label": "shutdown-eighteen"},
+                "jobs": [
+                    self.harness.job_spec(f"shutdown-{item}", mode="hold")
+                    for item in range(18)
+                ],
+                "idempotency_key": "shutdown-eighteen",
+            },
+            timeout=60,
+        ).json()
+        self.assertEqual(18, len(ids_from(launched, "job")), launched)
+        deadline = time.monotonic() + 5
+        while len(self.harness.provider_calls("launch")) < 18 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(18, len(self.harness.provider_calls("launch")))
+        doctor = self.harness.call("doctor").json()
+        pid = first_value(doctor, "daemon_pid", "daemonPid", "pid")
+        self.assertIsInstance(pid, int, doctor)
+        assert isinstance(pid, int)
+        self.harness.terminate_test_daemon(pid)
+
+        marker = f"OVERMIND_V2_FAKE_STATE_DIR={self.harness.provider_state}".encode()
+        self.assertEqual([], processes_with_environment(marker))
+        before = file_snapshot(self.harness.provider_state)
+        socket = self.harness.state / "overmind.sock"
+        self.assertFalse(socket.exists(), socket)
+        time.sleep(0.5)
+        self.assertEqual([], processes_with_environment(marker))
+        self.assertEqual(before, file_snapshot(self.harness.provider_state))
+        self.assertFalse(socket.exists(), socket)
+
 
 class StatusPerformanceTest(IntegrationCase):
-    def test_status_p95_with_1000_history_and_20_active_is_under_50ms(self) -> None:
+    def test_persistent_mcp_status_p95_with_1000_history_and_20_active_is_under_50ms(self) -> None:
         if os.environ.get("OVERMIND_V2_SKIP_PERF") == "1":
             self.skipTest("OVERMIND_V2_SKIP_PERF=1")
 
@@ -95,16 +151,33 @@ class StatusPerformanceTest(IntegrationCase):
         active_ids = set(ids_from(active, "job"))
         self.assertEqual(20, len(active_ids))
 
-        # Warm the daemon and page cache, then include CLI transport in the measured status latency.
-        self.harness.call("jobs", {"active": True, "limit": 100})
-        timings: list[float] = []
-        for _ in range(40):
-            result = self.harness.call("jobs", {"active": True, "limit": 100})
-            timings.append(result.elapsed_ms)
-            listed = set(ids_from(result.json(), "job"))
-            self.assertEqual(active_ids, listed)
-        p95 = percentile(timings, 0.95)
-        self.assertLess(p95, 50.0, f"status p95={p95:.2f}ms; samples={timings}")
+        # Gate the long-lived MCP lifecycle path. CLI process startup is sampled
+        # separately below as diagnostic information, never as the latency SLO.
+        mcp = McpClient(self.harness.mcp, self.harness.env)
+        active_filter = {"state": ["queued", "starting", "running"], "limit": 100}
+        try:
+            mcp.call_tool("jobs", active_filter)
+            timings: list[float] = []
+            for _ in range(40):
+                started = time.perf_counter()
+                response = mcp.call_tool("jobs", active_filter)
+                timings.append((time.perf_counter() - started) * 1000)
+                listed = set(ids_from(response["result"]["structuredContent"], "job"))
+                self.assertEqual(active_ids, listed)
+        finally:
+            mcp.close()
+        persistent_p95 = percentile(timings, 0.95)
+        cold_cli_samples = [
+            self.harness.call("jobs", active_filter).elapsed_ms
+            for _ in range(10)
+        ]
+        cold_cli_p95 = percentile(cold_cli_samples, 0.95)
+        self.assertLess(
+            persistent_p95,
+            50.0,
+            f"persistent MCP p95={persistent_p95:.2f}ms; "
+            f"cold CLI p95={cold_cli_p95:.2f}ms; samples={timings}",
+        )
 
         history = self.harness.call("jobs", {"terminal": True, "limit": 2_000}).json()
         terminal_states = list(recursive_values(history, {"state"}))

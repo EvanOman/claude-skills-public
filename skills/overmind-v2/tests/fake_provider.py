@@ -90,8 +90,10 @@ def snapshot(record: dict[str, Any]) -> dict[str, Any]:
 
 def launch(request: dict[str, Any]) -> dict[str, Any]:
     options = fake_options(request)
-    provider_job_id = str(uuid.uuid4())
     mode = str(options.get("mode", "success"))
+    if mode == "launch-error":
+        raise SystemExit("fake-provider: requested launch failure")
+    provider_job_id = str(uuid.uuid4())
     delay = float(options.get("delay", 0))
     result = str(options.get("result", f"fake-result:{provider_job_id}"))
     artifact_dir = ROOT / "artifacts" / provider_job_id
