@@ -13,8 +13,9 @@ subscription-backed workers; never select a metered backend unless the user expl
 
 Run `scripts/om doctor --json` before the first cross-harness fan-out in a session. Use the returned
 provider and billing facts instead of assuming that a harness, model, or live-steering feature is
-available. Read [references/protocol.md](references/protocol.md) when installing the MCP server,
-debugging lifecycle behavior, or using advanced filters.
+available. Read [references/setup.md](references/setup.md) when installing the broker in Claude and
+Codex. Read [references/protocol.md](references/protocol.md) when debugging lifecycle behavior or
+using advanced filters.
 
 ## Orchestrate a mission
 
