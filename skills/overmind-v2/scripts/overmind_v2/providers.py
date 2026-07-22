@@ -666,7 +666,7 @@ class ClaudeProvider(Provider):
                 "source": "claude-state",
             }
         detail = value.get("detail", value.get("error"))
-        if detail:
+        if detail and state in {"failed", "unknown", "interrupted"}:
             update["error"] = str(detail)
         return update
 
