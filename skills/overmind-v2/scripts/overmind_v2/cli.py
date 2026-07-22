@@ -117,7 +117,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collect.set_defaults(operation="collect")
     collect.add_argument("targets", nargs="*")
-    collect.add_argument("--max-chars", type=int, default=4000)
+    collect.add_argument(
+        "--preview-bytes",
+        "--max-chars",
+        dest="preview_bytes",
+        type=int,
+        default=4000,
+        help="maximum result preview bytes per job (default: 4000)",
+    )
     collect.add_argument("--include-nonterminal", action="store_true")
 
     reply = commands.add_parser(
@@ -256,7 +263,7 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
     elif operation == "collect":
         if not args.targets:
             raise OvermindError("collect requires a target unless --input is used", code="invalid_input")
-        params = {"max_chars": args.max_chars}
+        params = {"preview_bytes": args.preview_bytes}
         if len(args.targets) == 1:
             params["target"] = args.targets[0]
         else:

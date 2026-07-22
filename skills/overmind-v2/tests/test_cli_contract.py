@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import threading
 import time
 import unittest
@@ -121,6 +122,42 @@ class SchemaAndCrudTest(IntegrationCase):
 
 
 class IdempotencyAndAliasTest(IntegrationCase):
+    def test_collect_preview_bytes_flag_matches_structured_contract(self) -> None:
+        created = self.harness.run_many(
+            [self.harness.job_spec("preview-flag", result="abcdef")],
+            key="preview-flag",
+        )
+        group_id = ids_from(created, "group")[0]
+        self.harness.call(
+            "await",
+            {
+                **group_target(group_id),
+                "condition": "all_terminal",
+                "since_cursor": cursor_from(created),
+                "timeout": 2,
+            },
+        )
+
+        completed = subprocess.run(
+            [
+                str(self.harness.cli),
+                "collect",
+                group_id,
+                "--preview-bytes",
+                "2",
+                "--json",
+            ],
+            text=True,
+            capture_output=True,
+            env=self.harness.env,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(2, result["bounded"]["preview_bytes"])
+        self.assertEqual("ab", result["results"][0]["preview"])
+
     def test_idempotent_retry_and_conflict(self) -> None:
         payload = {
             "group": {"label": "retry"},
