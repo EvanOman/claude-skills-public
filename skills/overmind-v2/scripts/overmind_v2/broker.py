@@ -8,6 +8,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -310,12 +311,18 @@ class Broker:
                         pass
         if entity["created"]:
             errors: list[Exception] = []
-            for spec in prepared:
-                try:
-                    self._launch_job(spec)
-                except Exception as error:
-                    errors.append(error)
+            with ThreadPoolExecutor(
+                max_workers=min(32, len(prepared)),
+                thread_name_prefix="overmind-launch",
+            ) as executor:
+                futures = [executor.submit(self._launch_job, spec) for spec in prepared]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as error:
+                        errors.append(error)
             if errors:
+                errors.sort(key=lambda error: str(error))
                 raise OvermindError(str(errors[0])) from errors[0]
         return self._launch_response(
             entity["group_id"],
