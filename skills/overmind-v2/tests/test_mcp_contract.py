@@ -89,9 +89,21 @@ class McpContractTest(IntegrationCase):
             and message.get("params", {}).get("progressToken") == "progress-mcp-group"
         ]
         self.assertTrue(progress, self.mcp.notifications)
-        cursors = [first_value(item, "cursor", "event_cursor", "eventCursor") for item in progress]
-        cursors = [item for item in cursors if isinstance(item, int)]
-        self.assertEqual(sorted(set(cursors)), cursors, progress)
+        cursors: list[int] = []
+        resumable: int | None = None
+        for notification in progress:
+            params = notification.get("params", {})
+            cursor = params.get("cursor")
+            if isinstance(cursor, int):
+                if resumable is not None:
+                    self.assertGreater(cursor, resumable, progress)
+                resumable = cursor
+                cursors.append(cursor)
+            last_cursor = params.get("lastCursor")
+            if isinstance(last_cursor, int):
+                self.assertIsNotNone(resumable, progress)
+                self.assertEqual(resumable, last_cursor, progress)
+        self.assertTrue(cursors, progress)
 
         collected = self.mcp.call_tool(
             "collect", {"target": {"group_id": group_id}, "preview_bytes": 64}
