@@ -106,7 +106,13 @@ class SchemaAndCrudTest(IntegrationCase):
             "await",
             {**group_target(group_ids[0]), "condition": "all_terminal", "since_cursor": 0, "timeout": 5},
         ).json()
-        states = set(recursive_values(terminal, {"state"}))
+        # Historical events intentionally retain queued/starting states. Assert
+        # terminality from the current job snapshots, not from the event log.
+        states = {
+            item.get("state")
+            for item in terminal.get("jobs", [])
+            if isinstance(item, dict)
+        }
         self.assertTrue(states)
         self.assertTrue(states.issubset(TERMINAL), states)
         self.harness.call("forget", group_target(group_ids[0]))
