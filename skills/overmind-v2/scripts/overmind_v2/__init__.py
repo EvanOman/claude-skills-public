@@ -35,10 +35,19 @@ class OvermindError(RuntimeError):
 class ConflictError(OvermindError):
     """An idempotency key or state precondition conflicts with durable state."""
 
+    def __init__(self, message: str, *, data: object | None = None) -> None:
+        super().__init__(message, code="conflict", data=data)
+
 
 class NotFoundError(OvermindError):
     """An entity or provider cannot be resolved."""
 
+    def __init__(self, message: str, *, data: object | None = None) -> None:
+        super().__init__(message, code="not_found", data=data)
+
 
 class AmbiguousIdError(OvermindError):
     """A short identifier matches more than one entity."""
+
+    def __init__(self, message: str, *, data: object | None = None) -> None:
+        super().__init__(message, code="ambiguous_id", data=data)
