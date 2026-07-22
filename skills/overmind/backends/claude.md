@@ -17,14 +17,16 @@ permission envelope, and notify the parent when background work finishes.
 
 ### Model tiers — always pass `model` explicitly
 
-**A subagent that omits `model` inherits the session model. From a Fable main loop that silently
-bills premium rates—never allowed.** Pick per the delegation rules:
+**A subagent that omits `model` inherits the session model. Always choose the delegated model
+explicitly.** Use Fable only when Evan explicitly requests Fable for that delegated work; otherwise
+pick from the standard tiers:
 
 | `model` | Use for |
 |---|---|
 | `haiku` | Mechanical/boilerplate: renames, config changes, test runs, scripted transforms, repo sweeps |
 | `sonnet` | Routine, well-specified implementation |
 | `opus` | Hard reasoning inside the worker (rare—usually that work belongs in your loop) |
+| `fable` | Only when Evan explicitly requests Fable for the delegated work |
 
 ### Mechanics
 
@@ -46,8 +48,8 @@ bills premium rates—never allowed.** Pick per the delegation rules:
 For N-items × same-transform pipelines, find→verify loops, or judge panels, the Workflow tool
 scripts the fan-out deterministically (`pipeline()`, `parallel()`, schema-validated agent outputs).
 **This requires explicit user opt-in** ("use a workflow", "ultracode"); otherwise use Agent calls.
-Inside a Workflow authored from a Fable session, every `agent()` call must set an explicit non-Fable
-`model`.
+Inside a Workflow authored from a Fable session, every `agent()` call must set an explicit `model`.
+Use Fable only under the same explicit-user-request rule.
 
 ## Codex to Claude: daemon-backed background agents
 
