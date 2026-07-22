@@ -228,6 +228,8 @@ class Daemon:
             except OSError:
                 pass
             connection.close()
+        if self.broker is not None:
+            self.broker.close(timeout=5)
         deadline = time.monotonic() + 2
         for thread in threads:
             if thread is threading.current_thread():

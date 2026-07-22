@@ -78,6 +78,14 @@ class Store:
         finally:
             connection.close()
 
+    @contextlib.contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            yield connection
+        finally:
+            connection.close()
+
     def _initialize(self) -> None:
         with self.transaction(immediate=True) as connection:
             connection.executescript(
@@ -195,7 +203,7 @@ class Store:
                 sidecar.chmod(0o600)
 
     def schema_version(self) -> int:
-        with self._connect() as connection:
+        with self.connection() as connection:
             return int(
                 connection.execute("SELECT version FROM schema_meta").fetchone()[0]
             )
@@ -203,7 +211,7 @@ class Store:
     def allocate_id(self, table: str) -> tuple[str, str]:
         if table not in {"groups", "jobs"}:
             raise ValueError("invalid ID table")
-        with self._connect() as connection:
+        with self.connection() as connection:
             for _ in range(100):
                 identifier = new_uuid()
                 short_id = identifier[:8]
@@ -335,7 +343,7 @@ class Store:
     ) -> dict[str, Any] | None:
         if not key:
             return None
-        with self._connect() as connection:
+        with self.connection() as connection:
             row = connection.execute(
                 "SELECT * FROM idempotency WHERE key=?", (key,)
             ).fetchone()
@@ -390,7 +398,7 @@ class Store:
         return value
 
     def get_job(self, job_id: str) -> dict[str, Any]:
-        with self._connect() as connection:
+        with self.connection() as connection:
             row = connection.execute(
                 "SELECT * FROM jobs WHERE id=?", (job_id,)
             ).fetchone()
@@ -399,7 +407,7 @@ class Store:
         return self._decode_job(row)
 
     def get_group(self, group_id: str) -> dict[str, Any]:
-        with self._connect() as connection:
+        with self.connection() as connection:
             row = connection.execute(
                 "SELECT * FROM groups WHERE id=?", (group_id,)
             ).fetchone()
@@ -413,7 +421,7 @@ class Store:
         identifier = identifier.strip()
         tables = [kind] if kind else ["job", "group"]
         matches: list[tuple[str, str]] = []
-        with self._connect() as connection:
+        with self.connection() as connection:
             for entity_kind in tables:
                 table = "jobs" if entity_kind == "job" else "groups"
                 row = connection.execute(
@@ -538,7 +546,7 @@ class Store:
             )
 
     def artifacts(self, job_id: str) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 "SELECT kind,path,size_bytes,created_at FROM artifacts WHERE job_id=? ORDER BY id",
                 (job_id,),
@@ -568,7 +576,7 @@ class Store:
             )
 
     def usage(self, job_id: str) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 "SELECT provider,evidence_json,created_at FROM usage WHERE job_id=? ORDER BY id",
                 (job_id,),
@@ -622,7 +630,7 @@ class Store:
             values.append(int(after_cursor))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         limit = max(1, min(int(filters.get("limit", 200)), 5000))
-        with self._connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 f"SELECT j.* FROM jobs j{where} ORDER BY j.created_at LIMIT ?",
                 (*values, limit),
@@ -634,7 +642,7 @@ class Store:
 
     def nonterminal_jobs(self) -> list[dict[str, Any]]:
         placeholders = ",".join("?" for _ in TERMINAL_STATES)
-        with self._connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 f"SELECT * FROM jobs WHERE state NOT IN ({placeholders}) ORDER BY created_at",
                 tuple(sorted(TERMINAL_STATES)),
@@ -657,7 +665,7 @@ class Store:
         if job_ids:
             clauses.append("job_id IN (" + ",".join("?" for _ in job_ids) + ")")
             values.extend(job_ids)
-        with self._connect() as connection:
+        with self.connection() as connection:
             rows = connection.execute(
                 f"SELECT * FROM events WHERE {' AND '.join(clauses)} ORDER BY cursor LIMIT ?",
                 (*values, max(1, min(limit, 1000))),
@@ -670,7 +678,7 @@ class Store:
         return result
 
     def latest_cursor(self) -> int:
-        with self._connect() as connection:
+        with self.connection() as connection:
             return int(
                 connection.execute(
                     "SELECT COALESCE(MAX(cursor),0) FROM events"

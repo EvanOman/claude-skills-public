@@ -37,12 +37,29 @@ class Broker:
         self.store = Store(state_dir)
         self.providers = dict(providers or provider_registry())
         self._condition = threading.Condition()
+        self._closing = threading.Event()
         self._generation = 0
         self._watchers: dict[str, threading.Thread] = {}
         self._watchers_lock = threading.Lock()
         self._destructive_lock = threading.RLock()
         if recover:
             self.reconcile_nonterminal()
+
+    def close(self, timeout: float = 5.0) -> None:
+        self._closing.set()
+        self._notify()
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._watchers_lock:
+                watchers = [thread for thread in self._watchers.values() if thread.is_alive()]
+            if not watchers:
+                return
+            for thread in watchers:
+                if thread is threading.current_thread():
+                    continue
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if time.monotonic() >= deadline:
+                return
 
     def _notify(self) -> None:
         with self._condition:
@@ -434,6 +451,8 @@ class Broker:
         return self._apply_observation(job_id, observation, kind="job.reconciled")
 
     def _watch(self, job_id: str) -> None:
+        if self._closing.is_set():
+            return
         with self._watchers_lock:
             active = self._watchers.get(job_id)
             if active and active.is_alive():
@@ -441,11 +460,13 @@ class Broker:
 
             def watch() -> None:
                 try:
-                    while True:
+                    while not self._closing.is_set():
                         job = self._reconcile_job(job_id)
                         if job["state"] in TERMINAL_STATES:
                             return
-                        time.sleep(0.1 if job["provider"] == "fake" else 1.0)
+                        self._closing.wait(
+                            timeout=0.1 if job["provider"] == "fake" else 1.0
+                        )
                 except Exception as error:
                     try:
                         self.store.update_job(
@@ -601,6 +622,8 @@ class Broker:
         )
         deadline = time.monotonic() + timeout
         while True:
+            if self._closing.is_set():
+                raise OvermindError("broker is shutting down")
             with self._condition:
                 generation = self._generation
             jobs = (
