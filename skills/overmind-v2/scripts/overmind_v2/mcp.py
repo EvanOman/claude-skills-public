@@ -28,6 +28,22 @@ JOB_PROPERTIES: dict[str, Any] = {
     },
 }
 
+TARGET_SCHEMA: dict[str, Any] = {
+    "oneOf": [
+        {"type": "string"},
+        {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string"},
+                "group_id": {"type": "string"},
+            },
+            "additionalProperties": False,
+            "minProperties": 1,
+            "maxProperties": 1,
+        },
+    ]
+}
+
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "run",
@@ -61,6 +77,7 @@ TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "label": {"type": "string"},
+                "group": {"type": "object"},
                 "idempotency_key": {"type": "string"},
             },
             "additionalProperties": False,
@@ -89,7 +106,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["target"],
             "properties": {
-                "target": {"type": "string"},
+                "target": TARGET_SCHEMA,
                 "fresh": {"type": "boolean"},
             },
             "additionalProperties": False,
@@ -102,13 +119,13 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["target"],
             "properties": {
-                "target": {"type": "string"},
+                "target": TARGET_SCHEMA,
                 "condition": {
                     "enum": ["any_change", "any_terminal", "all_terminal"],
                     "default": "all_terminal",
                 },
                 "since_cursor": {"type": "integer", "minimum": 0, "default": 0},
-                "timeout_seconds": {
+                "timeout": {
                     "type": "number",
                     "minimum": 0,
                     "maximum": 86400,
@@ -123,14 +140,16 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Return bounded terminal previews and artifact paths.",
         "inputSchema": {
             "type": "object",
-            "required": ["targets"],
+            "anyOf": [{"required": ["target"]}, {"required": ["job_ids"]}],
             "properties": {
-                "targets": {
+                "target": TARGET_SCHEMA,
+                "job_ids": {
                     "type": "array",
                     "minItems": 1,
                     "items": {"type": "string"},
                 },
                 "max_chars": {"type": "integer", "minimum": 0, "default": 4000},
+                "preview_bytes": {"type": "integer", "minimum": 0},
                 "include_nonterminal": {"type": "boolean", "default": False},
             },
             "additionalProperties": False,
@@ -143,7 +162,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["target", "prompt"],
             "properties": {
-                "target": {"type": "string"},
+                "target": TARGET_SCHEMA,
                 "prompt": {"type": "string", "minLength": 1},
                 "label": {"type": "string"},
                 "idempotency_key": {"type": "string"},
@@ -158,7 +177,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["target"],
             "properties": {
-                "target": {"type": "string"},
+                "target": TARGET_SCHEMA,
                 "idempotency_key": {"type": "string"},
             },
             "additionalProperties": False,
@@ -171,7 +190,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["target"],
             "properties": {
-                "target": {"type": "string"},
+                "target": TARGET_SCHEMA,
                 "idempotency_key": {"type": "string"},
             },
             "additionalProperties": False,
@@ -345,8 +364,9 @@ class McpServer:
             self.send({"jsonrpc": "2.0", "method": "notifications/progress", "params": params})
 
         try:
+            broker_method = "run-many" if name == "run_many" else name
             result = self.client.request(
-                name,
+                broker_method,
                 arguments,
                 cancel_event=cancel_event,
                 on_progress=progress if name == "await" else None,

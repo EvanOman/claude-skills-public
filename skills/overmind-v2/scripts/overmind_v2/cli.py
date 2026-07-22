@@ -22,6 +22,12 @@ ID_PATTERN = re.compile(
 def _common_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--input",
+        default=argparse.SUPPRESS,
+        metavar="FILE",
+        help="use a complete JSON request object from FILE, or - for stdin",
+    )
     parser.add_argument("--state-dir", default=argparse.SUPPRESS)
     parser.add_argument("--no-autostart", action="store_true", default=argparse.SUPPRESS)
     return parser
@@ -40,8 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
         "run", aliases=["spawn", "start"], parents=[common], help="launch one worker"
     )
     run.set_defaults(operation="run")
-    run.add_argument("brief", help="worker brief, or - to read stdin")
-    run.add_argument("--provider", required=True)
+    run.add_argument("brief", nargs="?", help="worker brief, or - to read stdin")
+    run.add_argument("--provider")
     run.add_argument("-C", "--cwd", default=os.getcwd())
     run.add_argument("--label", default="worker")
     run.add_argument("--model")
@@ -58,38 +64,40 @@ def build_parser() -> argparse.ArgumentParser:
         "run-many", aliases=["run_many"], parents=[common], help="launch a JSON job list"
     )
     run_many.set_defaults(operation="run_many")
-    run_many.add_argument("spec", help="JSON array/object file, or - to read stdin")
+    run_many.add_argument("spec", nargs="?", help="JSON array/object file, or - to read stdin")
     run_many.add_argument("--label")
     run_many.add_argument("--idempotency-key")
 
     jobs = commands.add_parser(
-        "jobs", aliases=["ps", "ls"], parents=[common], help="list job snapshots"
+        "jobs", aliases=["ps", "ls", "list"], parents=[common], help="list job snapshots"
     )
     jobs.set_defaults(operation="jobs")
     jobs.add_argument("--group-id")
-    jobs.add_argument("--state", action="append")
-    jobs.add_argument("--provider", action="append")
+    jobs.add_argument("--state")
+    jobs.add_argument("--provider")
     jobs.add_argument("--label")
     jobs.add_argument("--since-cursor", type=int)
     jobs.add_argument("--limit", type=int)
 
-    show = commands.add_parser("show", parents=[common], help="show one job or group")
+    show = commands.add_parser(
+        "show", aliases=["status"], parents=[common], help="show one job or group"
+    )
     show.set_defaults(operation="show")
-    show.add_argument("target")
+    show.add_argument("target", nargs="?")
     show.add_argument("--fresh", action="store_true")
 
     wait = commands.add_parser(
         "await", aliases=["wait", "join"], parents=[common], help="wait on a job or group"
     )
     wait.set_defaults(operation="await")
-    wait.add_argument("target")
+    wait.add_argument("target", nargs="?")
     wait.add_argument(
         "--condition",
         choices=["any_change", "any_terminal", "all_terminal"],
         default="all_terminal",
     )
     wait.add_argument("--since-cursor", type=int, default=0)
-    wait.add_argument("--timeout-seconds", type=float, default=3600)
+    wait.add_argument("--timeout", "--timeout-seconds", dest="timeout", type=float, default=3600)
 
     collect = commands.add_parser(
         "collect",
@@ -98,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="collect bounded result previews",
     )
     collect.set_defaults(operation="collect")
-    collect.add_argument("targets", nargs="+")
+    collect.add_argument("targets", nargs="*")
     collect.add_argument("--max-chars", type=int, default=4000)
     collect.add_argument("--include-nonterminal", action="store_true")
 
@@ -109,8 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="steer or continue a worker",
     )
     reply.set_defaults(operation="reply")
-    reply.add_argument("target")
-    reply.add_argument("prompt", help="follow-up prompt, or - to read stdin")
+    reply.add_argument("target", nargs="?")
+    reply.add_argument("prompt", nargs="?", help="follow-up prompt, or - to read stdin")
     reply.add_argument("--label")
     reply.add_argument("--idempotency-key")
 
@@ -121,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="interrupt a job or group",
     )
     stop.set_defaults(operation="stop")
-    stop.add_argument("target")
+    stop.add_argument("target", nargs="?")
     stop.add_argument("--idempotency-key")
 
     forget = commands.add_parser(
@@ -131,7 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="delete terminal lifecycle metadata",
     )
     forget.set_defaults(operation="forget")
-    forget.add_argument("target")
+    forget.add_argument("target", nargs="?")
     forget.add_argument("--idempotency-key")
 
     doctor = commands.add_parser("doctor", parents=[common], help="report broker capabilities")
@@ -172,8 +180,20 @@ def _require_unambiguous_id(target: str, operation: str) -> None:
 
 def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
     operation = args.operation
+    input_path = getattr(args, "input", None)
+    if input_path is not None:
+        value = _read_json(input_path)
+        if not isinstance(value, dict):
+            raise OvermindError("--input must contain a JSON object", code="invalid_input")
+        return "run-many" if operation == "run_many" else operation, value
+
     params: dict[str, Any]
     if operation == "run":
+        if not args.provider or args.brief is None:
+            raise OvermindError(
+                "run requires --provider and a brief unless --input is used",
+                code="invalid_input",
+            )
         params = {
             "provider": args.provider,
             "brief": _read_text(args.brief),
@@ -184,6 +204,11 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         for key in ("model", "group_id", "parent_job_id", "idempotency_key"):
             _set(params, key, getattr(args, key))
     elif operation == "run_many":
+        if args.spec is None:
+            raise OvermindError(
+                "run-many requires a JSON spec unless --input is used",
+                code="invalid_input",
+            )
         value = _read_json(args.spec)
         if isinstance(value, list):
             params = {"jobs": value}
@@ -193,33 +218,53 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             raise OvermindError("run-many spec must be a JSON array or object", code="invalid_input")
         _set(params, "label", args.label)
         _set(params, "idempotency_key", args.idempotency_key)
+        operation = "run-many"
     elif operation == "jobs":
         params = {}
-        for key in ("group_id", "state", "provider", "label", "since_cursor", "limit"):
+        for key in ("group_id", "state", "provider", "label", "limit"):
             _set(params, key, getattr(args, key))
+        _set(params, "after_cursor", args.since_cursor)
     elif operation == "show":
+        if args.target is None:
+            raise OvermindError("show requires a target unless --input is used", code="invalid_input")
         params = {"target": args.target}
         if args.fresh:
             params["fresh"] = True
     elif operation == "await":
+        if args.target is None:
+            raise OvermindError("await requires a target unless --input is used", code="invalid_input")
         params = {
             "target": args.target,
             "condition": args.condition,
             "since_cursor": args.since_cursor,
-            "timeout_seconds": args.timeout_seconds,
+            "timeout": args.timeout,
         }
     elif operation == "collect":
-        params = {
-            "targets": args.targets,
-            "max_chars": args.max_chars,
-            "include_nonterminal": args.include_nonterminal,
-        }
+        if not args.targets:
+            raise OvermindError("collect requires a target unless --input is used", code="invalid_input")
+        params = {"max_chars": args.max_chars}
+        if len(args.targets) == 1:
+            params["target"] = args.targets[0]
+        else:
+            params["job_ids"] = args.targets
+        if args.include_nonterminal:
+            params["include_nonterminal"] = True
     elif operation == "reply":
+        if args.target is None or args.prompt is None:
+            raise OvermindError(
+                "reply requires a target and prompt unless --input is used",
+                code="invalid_input",
+            )
         _require_unambiguous_id(args.target, operation)
-        params = {"target": args.target, "prompt": _read_text(args.prompt)}
+        params = {"job_id": args.target, "prompt": _read_text(args.prompt)}
         _set(params, "label", args.label)
         _set(params, "idempotency_key", args.idempotency_key)
     elif operation in {"stop", "forget"}:
+        if args.target is None:
+            raise OvermindError(
+                f"{operation} requires a target unless --input is used",
+                code="invalid_input",
+            )
         _require_unambiguous_id(args.target, operation)
         params = {"target": args.target}
         _set(params, "idempotency_key", args.idempotency_key)
