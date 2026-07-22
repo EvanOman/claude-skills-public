@@ -11,11 +11,14 @@ subscription-backed workers; never select a metered backend unless the user expl
 
 ## Start with capabilities
 
-Run `scripts/om doctor --json` before the first cross-harness fan-out in a session. Use the returned
-provider and billing facts instead of assuming that a harness, model, or live-steering feature is
-available. Read [references/setup.md](references/setup.md) when installing the broker in Claude and
-Codex. Read [references/protocol.md](references/protocol.md) when debugging lifecycle behavior or
-using advanced filters.
+Resolve the directory containing this `SKILL.md` to an absolute `SKILL_ROOT`; commands below are
+relative to that directory, not the user's current working directory. Run
+`$SKILL_ROOT/scripts/om doctor --json` before the first cross-harness fan-out in a session. Use the
+returned provider and billing facts instead of assuming that a harness, model, or live-steering
+feature is available. Read [references/setup.md](references/setup.md) when installing the broker in
+Claude and Codex. Read [references/protocol.md](references/protocol.md) when debugging lifecycle
+behavior or using advanced filters. Read [references/testing.md](references/testing.md) for a
+deterministic bake-off or broker regression work.
 
 ## Orchestrate a mission
 
@@ -61,9 +64,10 @@ provider cannot be observed, preserve the job as `unknown` rather than inventing
 
 ## Use the command surface
 
-Use `scripts/om --help` for the human CLI and `scripts/overmind-v2-mcp` for the MCP stdio server.
-Canonical operations are `run`, `run-many`, `jobs`, `show`, `await`, `collect`, `reply`, `stop`,
-`forget`, and `doctor`. Human aliases are accepted, but do not teach duplicate MCP tool names.
+Use `$SKILL_ROOT/scripts/om --help` for the human CLI and `$SKILL_ROOT/scripts/overmind-v2-mcp` for
+the MCP stdio server. Canonical operations are `run`, `run-many`, `jobs`, `show`, `await`, `collect`,
+`reply`, `stop`, `forget`, and `doctor`. Human aliases are accepted, but do not teach duplicate MCP
+tool names.
 
 Use v1 only as the control during migration or when v2's doctor reports an unavailable required
 capability. Do not modify or migrate v1 state implicitly.

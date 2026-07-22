@@ -66,7 +66,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--idempotency-key")
 
     run_many = commands.add_parser(
-        "run-many", aliases=["run_many"], parents=[common], help="launch a JSON job list"
+        "run-many",
+        aliases=["run_many"],
+        parents=[common],
+        help="launch a JSON job list",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Each job requires provider, brief, cwd, and label; billing_class defaults "
+            "to subscription-native. The input may be a JSON job array or an object "
+            "with group, jobs, and idempotency_key."
+        ),
     )
     run_many.set_defaults(operation="run_many")
     run_many.add_argument("spec", nargs="?", help="JSON array/object file, or - to read stdin")
@@ -116,7 +125,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="collect bounded result previews",
     )
     collect.set_defaults(operation="collect")
-    collect.add_argument("targets", nargs="*")
+    collect.add_argument(
+        "targets",
+        nargs="*",
+        help="one group/job ID, or multiple job IDs",
+    )
     collect.add_argument(
         "--preview-bytes",
         "--max-chars",
