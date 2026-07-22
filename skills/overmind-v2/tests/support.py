@@ -25,7 +25,7 @@ import unittest
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterator
 
 
 REPO = Path(__file__).resolve().parents[3]

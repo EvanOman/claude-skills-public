@@ -6,7 +6,6 @@ import unittest
 from pathlib import Path
 
 from support import (
-    Harness,
     IntegrationCase,
     McpClient,
     cursor_from,

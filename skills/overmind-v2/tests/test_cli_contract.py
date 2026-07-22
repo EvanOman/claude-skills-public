@@ -3,16 +3,12 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
-import threading
 import time
 import unittest
 from pathlib import Path
 
 from support import (
-    ALIASES,
     TERMINAL,
-    ContractFailure,
-    Harness,
     IntegrationCase,
     assert_uuid_text,
     concurrent_calls,
