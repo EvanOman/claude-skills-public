@@ -358,18 +358,28 @@ class McpServer:
     ) -> None:
         sequence = 0
         last_amount: int | float = 0
+        last_payload: str | None = None
         resumable_cursor: int | float | None = None
 
         def progress(value: dict[str, Any]) -> None:
-            nonlocal last_amount, resumable_cursor, sequence
-            sequence += 1
+            nonlocal last_amount, last_payload, resumable_cursor, sequence
             if progress_token is None:
                 return
+            payload = json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            if payload == last_payload:
+                return
+            last_payload = payload
+            sequence += 1
             candidate = value.get("cursor", value.get("last_cursor"))
             numeric_cursor = (
                 candidate
                 if isinstance(candidate, (int, float)) and not isinstance(candidate, bool)
                 else None
+            )
+            cursor_advanced = numeric_cursor is not None and (
+                resumable_cursor is None or numeric_cursor > resumable_cursor
             )
             if numeric_cursor is not None:
                 resumable_cursor = (
@@ -386,14 +396,12 @@ class McpServer:
                 "progress": amount,
             }
             if resumable_cursor is not None:
-                if "cursor" in value:
+                if "cursor" in value and cursor_advanced:
                     params["cursor"] = resumable_cursor
                 else:
                     params["lastCursor"] = resumable_cursor
             params["data"] = value
-            params["message"] = json.dumps(
-                value, ensure_ascii=False, separators=(",", ":")
-            )
+            params["message"] = payload
             total = value.get("total")
             if isinstance(total, (int, float)):
                 params["total"] = total
