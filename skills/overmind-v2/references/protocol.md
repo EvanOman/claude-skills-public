@@ -54,6 +54,12 @@ fallback must preserve billing class unless the caller explicitly opts into a ch
 - `stop`: interrupt a job or group without deleting its record.
 - `forget`: delete terminal lifecycle metadata; provider-native deletion is separate and explicit.
 - `doctor`: report schema, daemon, provider, adapter, authentication, billing, and quota capabilities.
+  Each provider entry also carries `last_failure`: the most recent terminal job for that provider
+  with a recorded error, as `{job_id, short_id, state, message, occurred_at}` (or `null` when the
+  broker has observed no such failure). CLI-based probing (`available`/`authenticated`) cannot see
+  capacity errors such as exhausted subscription quota; `last_failure` is factual evidence drawn
+  from the broker's own job history, not a fabricated quota snapshot, so a parent can see e.g. "usage
+  limit until Jul 29th" before fanning out more work to a provider that will immediately fail.
 
 Mutating calls accept an idempotency key. Retrying the same logical launch returns the original
 entity. Conflicting payloads with the same key are errors.
@@ -77,6 +83,13 @@ A provider adapter exposes capability discovery, launch, reconcile, continue or 
 and usage collection. Claude should track the exact daemon job state path returned at launch rather
 than scan the global registry. Codex should prefer app-server event streams when the installed CLI
 supports them and fall back to `codex exec --json` without changing billing class.
+
+Codex reports a failed turn through its JSON event stream (a `turn.failed` event, with a preceding
+bare `error` event as fallback), not through stderr. The adapter treats `turn.failed` as
+authoritative: its message becomes the job's `error` field and, when no `agent_message` item was
+produced, the result artifact content too, so `collect` previews carry the reason. A terminal
+failure's `error` is always a non-empty string; stderr is used only when no event carries a message,
+and a generic exit-code message is the last resort. It is never the empty string.
 
 Tests use a deterministic fake provider through the same adapter contract. The fake provider is not
 advertised as a production backend.

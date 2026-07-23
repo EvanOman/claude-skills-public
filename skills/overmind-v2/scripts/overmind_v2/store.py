@@ -665,6 +665,26 @@ class Store:
             ).fetchall()
         return [self._decode_job(row) for row in rows]
 
+    def last_provider_failure(self, provider: str) -> dict[str, Any] | None:
+        """Most recent terminal job for a provider that recorded a non-empty error.
+
+        Used by ``doctor`` to surface evidence (e.g. a recent quota exhaustion)
+        that CLI-based capability probing cannot see on its own.
+        """
+        placeholders = ",".join("?" for _ in TERMINAL_STATES)
+        with self.connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE provider=? AND state IN ({placeholders})
+                  AND error IS NOT NULL AND trim(error) != ''
+                ORDER BY COALESCE(terminal_at, updated_at) DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (provider, *sorted(TERMINAL_STATES)),
+            ).fetchone()
+        return self._decode_job(row) if row is not None else None
+
     def events_since(
         self,
         cursor: int,

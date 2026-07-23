@@ -951,6 +951,26 @@ def ensure_billing(
     return actual
 
 
+def _codex_event_failure_message(event: dict[str, Any]) -> str | None:
+    """Extract a human-readable failure message from a codex exec JSON event.
+
+    Covers the two shapes Codex CLI emits for a failed turn: a bare
+    ``{"type": "error", "message": "..."}`` event and the authoritative
+    ``{"type": "turn.failed", "error": {"message": "..."}}`` event.
+    """
+    event_type = event.get("type")
+    if event_type == "turn.failed":
+        detail = event.get("error")
+        if isinstance(detail, dict):
+            message = detail.get("message")
+            return str(message) if message else (str(detail) if detail else None)
+        return str(detail) if detail else None
+    if event_type == "error":
+        message = event.get("message")
+        return str(message) if message else None
+    return None
+
+
 def _codex_runner(arguments: argparse.Namespace) -> int:
     state_path = Path(arguments.state_path)
     event_path = Path(arguments.event_path)
@@ -1056,29 +1076,46 @@ def _codex_runner(arguments: argparse.Namespace) -> int:
     messages: list[str] = []
     usage: dict[str, Any] = {}
     thread_id = arguments.resume
+    turn_error: str | None = None
     for line in event_path.read_text(encoding="utf-8").splitlines():
         try:
             event = json.loads(line)
         except ValueError:
             continue
-        if event.get("type") == "thread.started":
+        event_type = event.get("type")
+        if event_type == "thread.started":
             thread_id = event.get("thread_id") or thread_id
         item = event.get("item") or {}
-        if (
-            event.get("type") == "item.completed"
-            and item.get("type") == "agent_message"
-        ):
+        if event_type == "item.completed" and item.get("type") == "agent_message":
             messages.append(str(item.get("text", "")))
-        if event.get("type") == "turn.completed" and isinstance(
-            event.get("usage"), dict
-        ):
+        if event_type == "turn.completed" and isinstance(event.get("usage"), dict):
             usage = event["usage"]
-    write_private(result_path, messages[-1] if messages else "")
+        message = _codex_event_failure_message(event)
+        if message:
+            # `turn.failed` is authoritative; a preceding bare `error` event is
+            # kept only as a fallback in case a run never emits `turn.failed`.
+            if event_type == "turn.failed" or turn_error is None:
+                turn_error = message
+    write_private(
+        result_path, messages[-1] if messages else (turn_error or "")
+    )
     current = parse_json(state_path.read_text(encoding="utf-8"))
     if interrupted:
         terminal = "interrupted"
     else:
         terminal = "succeeded" if return_code == 0 else "failed"
+    if return_code == 0:
+        error: str | None = None
+    else:
+        stderr_text = error_path.read_text(encoding="utf-8").strip()
+        # Codex CLI reports turn failures (e.g. quota exhaustion) through the
+        # JSON event stream, not stderr, so prefer that message; stderr is a
+        # fallback for launch/transport failures that never reach a turn.
+        error = (
+            turn_error
+            or stderr_text
+            or f"codex exec exited {return_code} with no captured detail"
+        )[-4000:]
     current.update(
         state=terminal,
         provider_job_id=thread_id,
@@ -1087,9 +1124,7 @@ def _codex_runner(arguments: argparse.Namespace) -> int:
         log_path=str(event_path),
         error_path=str(error_path),
         usage=usage,
-        error=None
-        if return_code == 0
-        else error_path.read_text(encoding="utf-8")[-4000:],
+        error=error,
     )
     atomic_json(state_path, current)
     return int(return_code or 0)
