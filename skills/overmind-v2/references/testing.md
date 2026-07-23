@@ -17,6 +17,9 @@ Run all broker regressions from the owning repository root:
 python3 -m unittest discover -s skills/overmind-v2/tests -v
 ```
 
+The suite uses `unittest discover` with a `support` module imported from the tests directory, so
+running plain `pytest` from elsewhere fails collection — use the documented command above.
+
 ## Activate the fake provider manually
 
 The fake provider is test-only and is never discovered unless explicitly injected. From the owning

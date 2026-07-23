@@ -75,6 +75,14 @@ The judge found v2 definitively better. Verbose snapshots, deterministic-fixture
 native harness-registry membership remained paper cuts but did not weaken the demonstrated recovery,
 completion, or billing guarantees.
 
+## Scope and limitations
+
+This bake-off ran entirely against the fake provider, so it validates the broker protocol —
+idempotency, event cursors, lifecycle call counts, and status latency — but it does not exercise
+real provider execution. Live testing on 2026-07-23 with real Claude workers surfaced
+launch-permission and stall-detection defects that the fake provider could not catch; fixes are in
+progress on branches `ov2-fix-claude` and `ov2-fix-codex`.
+
 ## Honest boundaries
 
 MCP Tasks remain an experimental, changing transport affordance, so the SQLite broker and event
