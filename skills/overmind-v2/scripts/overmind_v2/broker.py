@@ -927,6 +927,21 @@ class Broker:
         self.store.remember_idempotency("forget", request_payload, key, result)
         return result
 
+    def _last_failure_evidence(self, provider: str) -> dict[str, Any] | None:
+        job = self.store.last_provider_failure(provider)
+        if job is None:
+            return None
+        excerpt = str(job.get("error") or "")
+        if len(excerpt) > 500:
+            excerpt = excerpt[:500] + "…"
+        return {
+            "job_id": job.get("id"),
+            "short_id": job.get("short_id"),
+            "state": job.get("state"),
+            "message": excerpt,
+            "occurred_at": job.get("terminal_at") or job.get("updated_at"),
+        }
+
     def doctor(self, _params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         production: dict[str, Any] = {}
         tests: dict[str, Any] = {}
@@ -935,6 +950,14 @@ class Broker:
                 capabilities = provider.probe()
             except Exception as error:
                 capabilities = {"available": False, "reason": str(error)}
+            # doctor evidence: CLI-reported availability/auth can't see quota
+            # exhaustion or other capacity errors. Surface the most recent
+            # terminal failure this broker actually observed for the provider
+            # so a parent sees "usage limit until <date>" before fanning out.
+            capabilities = {
+                **capabilities,
+                "last_failure": self._last_failure_evidence(name),
+            }
             if provider.production:
                 production[name] = capabilities
             else:
