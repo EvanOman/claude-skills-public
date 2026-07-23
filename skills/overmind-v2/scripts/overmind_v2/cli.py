@@ -63,6 +63,24 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="explicitly allow a provider fallback to a different billing class",
     )
+    run.add_argument(
+        "--permission-mode",
+        choices=["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"],
+        help=(
+            "Claude worker permission mode (default: bypassPermissions; "
+            "ignored by non-Claude providers)"
+        ),
+    )
+    run.add_argument(
+        "--no-isolate-worker-config",
+        dest="isolate_worker_config",
+        action="store_false",
+        default=None,
+        help=(
+            "let a Claude worker inherit the operator's full user-level "
+            "settings/hooks/plugins instead of isolating it (default: isolated)"
+        ),
+    )
     run.add_argument("--idempotency-key")
 
     run_many = commands.add_parser(
@@ -74,7 +92,10 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Each job requires provider, brief, cwd, and label; billing_class defaults "
             "to subscription-native. The input may be a JSON job array or an object "
-            "with group, jobs, and idempotency_key."
+            "with group, jobs, and idempotency_key. A Claude job may also set "
+            "permission_mode (default bypassPermissions) and isolate_worker_config "
+            "(default true) per-job, or at the request's top level as a default "
+            "for jobs that omit them."
         ),
     )
     run_many.set_defaults(operation="run_many")
@@ -151,6 +172,18 @@ def build_parser() -> argparse.ArgumentParser:
     reply.add_argument("prompt", nargs="?", help="follow-up prompt, or - to read stdin")
     reply.add_argument("--label")
     reply.add_argument("--idempotency-key")
+    reply.add_argument(
+        "--permission-mode",
+        choices=["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"],
+        help="override the parent's Claude worker permission mode for this continuation",
+    )
+    reply.add_argument(
+        "--no-isolate-worker-config",
+        dest="isolate_worker_config",
+        action="store_false",
+        default=None,
+        help="override the parent's config isolation for this continuation",
+    )
 
     stop = commands.add_parser(
         "stop",
@@ -231,10 +264,18 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             "label": args.label,
             "billing_class": args.billing_class,
         }
-        for key in ("model", "group_id", "parent_job_id", "idempotency_key"):
+        for key in (
+            "model",
+            "group_id",
+            "parent_job_id",
+            "idempotency_key",
+            "permission_mode",
+        ):
             _set(params, key, getattr(args, key))
         if args.allow_billing_class_change:
             params["allow_billing_class_change"] = True
+        if getattr(args, "isolate_worker_config", None) is False:
+            params["isolate_worker_config"] = False
     elif operation == "run_many":
         if args.spec is None:
             raise OvermindError(
@@ -293,6 +334,9 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         params = {"job_id": args.target, "prompt": _read_text(args.prompt)}
         _set(params, "label", args.label)
         _set(params, "idempotency_key", args.idempotency_key)
+        _set(params, "permission_mode", args.permission_mode)
+        if getattr(args, "isolate_worker_config", None) is False:
+            params["isolate_worker_config"] = False
     elif operation in {"stop", "forget"}:
         if args.target is None:
             raise OvermindError(

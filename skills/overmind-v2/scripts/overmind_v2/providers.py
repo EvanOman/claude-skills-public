@@ -401,6 +401,18 @@ class FakeProvider(Provider):
         return {"state": "interrupted"}
 
 
+DEFAULT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
+
+# Prepended to the brief when a worker's user-level config cannot be excluded via
+# --setting-sources (see ClaudeProvider._supports_setting_sources). Keeps a worker
+# from burning its turn on session-start skill/hook ceremony before touching the brief.
+CEREMONY_PREAMBLE = (
+    "Skip session-start onboarding ceremony: do not invoke standing workflow skills "
+    "(TDD rituals, worktree setup, brainstorming prompts, or similar) before starting. "
+    "Execute the brief below directly with only the tools it requires, then stop.\n\n"
+)
+
+
 class ClaudeProvider(Provider):
     name = "claude"
 
@@ -411,11 +423,37 @@ class ClaudeProvider(Provider):
                 "OVERMIND_CLAUDE_BIN", os.environ.get("CLAUDE_BIN", "claude")
             ),
         )
+        self._setting_sources_supported: bool | None = None
 
     def _env(self) -> dict[str, str]:
         env = subscription_env("claude")
         env["CLAUDE_BIN"] = self.binary
         return env
+
+    @staticmethod
+    def _job_option(job: dict[str, Any], key: str) -> Any:
+        payload = job.get("provider_payload")
+        if isinstance(payload, dict) and payload.get(key) is not None:
+            return payload[key]
+        return None
+
+    def _supports_setting_sources(self) -> bool:
+        if self._setting_sources_supported is None:
+            try:
+                completed = subprocess.run(
+                    [self.binary, "--help"],
+                    text=True,
+                    capture_output=True,
+                    env=self._env(),
+                    check=False,
+                    timeout=10,
+                )
+                self._setting_sources_supported = (
+                    "--setting-sources" in completed.stdout
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                self._setting_sources_supported = False
+        return self._setting_sources_supported
 
     def probe(self) -> dict[str, Any]:
         if shutil.which(self.binary) is None:
@@ -541,19 +579,30 @@ class ClaudeProvider(Provider):
             raise OvermindError(
                 "Claude subscription-native capability preflight failed"
             )
+        permission_mode = str(
+            self._job_option(job, "permission_mode") or DEFAULT_CLAUDE_PERMISSION_MODE
+        )
+        isolate_config = self._job_option(job, "isolate_worker_config")
+        isolate_config = True if isolate_config is None else bool(isolate_config)
+        effective_brief = brief
         command = [self.binary]
         if resume_thread:
             command += ["--resume", resume_thread]
+        if isolate_config:
+            if self._supports_setting_sources():
+                command += ["--setting-sources", "project,local"]
+            else:
+                effective_brief = CEREMONY_PREAMBLE + brief
         command += [
             "--bg",
             "--model",
             job.get("model") or "sonnet",
             "--permission-mode",
-            "dontAsk",
+            permission_mode,
             "--name",
             f"overmind-{job['short_id']}",
             "--",
-            brief,
+            effective_brief,
         ]
         completed = subprocess.run(
             command,
@@ -619,6 +668,12 @@ class ClaudeProvider(Provider):
             "done": "succeeded",
             "complete": "succeeded",
             "completed": "succeeded",
+            # "blocked" means the CLI's turn has genuinely ended and it is waiting
+            # synchronously for operator input (e.g. a permission denial or a
+            # clarifying question); it never resolves on its own. Treat it as a
+            # completed turn so the broker surfaces the final assistant message
+            # instead of polling forever. See references/setup.md.
+            "blocked": "succeeded",
             "failed": "failed",
             "error": "failed",
             "stopped": "interrupted",
@@ -635,7 +690,6 @@ class ClaudeProvider(Provider):
             "queued",
             "waiting",
             "idle",
-            "blocked",
         }:
             state = "running"
         else:
@@ -649,9 +703,16 @@ class ClaudeProvider(Provider):
             "artifacts": [{"kind": "provider-state", "path": str(state_path)}],
         }
         output = value.get("output")
-        if state in TERMINAL_STATES and isinstance(output, dict) and "result" in output:
-            result_path = Path(job["brief_path"]).parent / "result.md"
+        result: Any = None
+        if isinstance(output, dict) and "result" in output:
             result = output["result"]
+        elif raw_state == "blocked":
+            # No structured output when blocked; fall back to the CLI's own
+            # summary of what it is waiting on so the parent has something to
+            # judge instead of an empty artifact.
+            result = value.get("needs") or value.get("detail")
+        if state in TERMINAL_STATES and result is not None:
+            result_path = Path(job["brief_path"]).parent / "result.md"
             write_private(
                 result_path, result if isinstance(result, str) else json.dumps(result)
             )

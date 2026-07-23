@@ -31,6 +31,25 @@ JOB_PROPERTIES: dict[str, Any] = {
         "default": False,
         "description": "Explicitly allow fallback to a different billing class.",
     },
+    "permission_mode": {
+        "enum": ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"],
+        "description": (
+            "Claude worker permission mode. Defaults to bypassPermissions so a "
+            "background worker can act without a TTY to answer prompts; dontAsk "
+            "auto-denies instead of auto-approving and can stall a worker "
+            "indefinitely. Ignored by non-Claude providers."
+        ),
+    },
+    "isolate_worker_config": {
+        "type": "boolean",
+        "default": True,
+        "description": (
+            "Launch a Claude worker without the operator's user-level "
+            "settings/hooks/plugins so it skips session-start ceremony and "
+            "acts on the brief directly. Set false to inherit full user "
+            "config. Ignored by non-Claude providers."
+        ),
+    },
 }
 
 TARGET_SCHEMA: dict[str, Any] = {
@@ -178,6 +197,8 @@ TOOLS: list[dict[str, Any]] = [
                 "prompt": {"type": "string", "minLength": 1},
                 "label": {"type": "string"},
                 "idempotency_key": {"type": "string"},
+                "permission_mode": JOB_PROPERTIES["permission_mode"],
+                "isolate_worker_config": JOB_PROPERTIES["isolate_worker_config"],
             },
             "additionalProperties": False,
         },
