@@ -29,6 +29,12 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 class Broker:
+    # Per-job provider options that flow through unvalidated into
+    # job["provider_payload"] so providers can read them (e.g. ClaudeProvider's
+    # permission_mode and isolate_worker_config). Not stored as dedicated
+    # columns; a run/run-many default is merged in when a job omits them.
+    _PASSTHROUGH_PROVIDER_OPTIONS = ("permission_mode", "isolate_worker_config")
+
     def __init__(
         self,
         state_dir: Path,
@@ -186,6 +192,10 @@ class Broker:
                     raise ConflictError("parent job belongs to a different group")
             else:
                 parent_id = None
+            provider_payload = dict(raw)
+            for option in self._PASSTHROUGH_PROVIDER_OPTIONS:
+                if option not in provider_payload and defaults.get(option) is not None:
+                    provider_payload[option] = defaults[option]
             prepared.append(
                 {
                     "id": job_id,
@@ -203,7 +213,7 @@ class Broker:
                     "brief_path": str(brief_path),
                     "brief": brief,
                     "capabilities": capabilities,
-                    "provider_payload": dict(raw),
+                    "provider_payload": provider_payload,
                     "allow_billing_class_change": bool(
                         raw.get(
                             "allow_billing_class_change",
@@ -839,6 +849,12 @@ class Broker:
             "parent_job_id": parent["id"],
             "label": str(params.get("label") or f"{parent['label']}-reply"),
         }
+        parent_payload = parent.get("provider_payload") or {}
+        for option in self._PASSTHROUGH_PROVIDER_OPTIONS:
+            if params.get(option) is not None:
+                child_params[option] = params[option]
+            elif parent_payload.get(option) is not None:
+                child_params[option] = parent_payload[option]
         response = self._run_many(
             [child_params],
             defaults={**child_params, "resume_thread": parent["provider_thread_id"]},

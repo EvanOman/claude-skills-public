@@ -60,7 +60,18 @@ VERIFY:      Exact commands or checks.
 Trust normalized terminal states from the broker: `succeeded`, `failed`, `interrupted`, and
 `unknown`. A worker summary alone is not proof. If the parent or broker restarts, query the existing
 group and resume from its event cursor; do not relaunch without the same idempotency key. When a
-provider cannot be observed, preserve the job as `unknown` rather than inventing failure.
+provider cannot be observed, preserve the job as `unknown` rather than inventing failure. A Claude
+worker that ends its turn waiting on operator input (a "blocked" CLI state) is reported `succeeded`
+with that message as the result artifact; judge its content like any other result rather than
+treating it as still running.
+
+## Claude worker defaults
+
+Claude workers launch with `permission_mode: bypassPermissions` and `isolate_worker_config: true` by
+default, so a background worker can act on its brief unattended and skips the operator's user-level
+skill/hook ceremony. Both are per-job options on `run`/`run-many`/`reply` (inherited by continuations
+unless overridden); see [references/setup.md](references/setup.md#claude-worker-launch-options) to
+opt into a narrower permission mode or the operator's full config.
 
 ## Use the command surface
 

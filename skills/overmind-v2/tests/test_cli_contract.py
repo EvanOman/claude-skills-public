@@ -472,5 +472,138 @@ class WaitCollectAndSafetyTest(IntegrationCase):
         self.assertFalse(unsafe, stop_calls)
 
 
+class ProviderOptionPlumbingTest(IntegrationCase):
+    """permission_mode and isolate_worker_config are provider-agnostic pass-through
+    options; the fake provider's captured request lets us assert they reach the
+    provider layer without invoking the real Claude CLI."""
+
+    def test_per_job_options_flow_to_the_provider_request(self) -> None:
+        spec = self.harness.job_spec("options")
+        spec["permission_mode"] = "acceptEdits"
+        spec["isolate_worker_config"] = False
+        created = self.harness.run_many([spec], key="option-per-job")
+        group_id = ids_from(created, "group")[0]
+        self.harness.call(
+            "await",
+            {
+                **group_target(group_id),
+                "condition": "all_terminal",
+                "since_cursor": cursor_from(created),
+                "timeout": 3,
+            },
+        )
+        launches = self.harness.provider_calls("launch")
+        self.assertEqual(1, len(launches), launches)
+        request = launches[0]["request"]
+        self.assertEqual("acceptEdits", request.get("permission_mode"))
+        self.assertIs(False, request.get("isolate_worker_config"))
+
+    def test_request_level_default_applies_to_jobs_that_omit_the_option(self) -> None:
+        spec = self.harness.job_spec("options-default")
+        created = self.harness.run_many(
+            [spec], key="option-default", permission_mode="dontAsk"
+        )
+        group_id = ids_from(created, "group")[0]
+        self.harness.call(
+            "await",
+            {
+                **group_target(group_id),
+                "condition": "all_terminal",
+                "since_cursor": cursor_from(created),
+                "timeout": 3,
+            },
+        )
+        launches = self.harness.provider_calls("launch")
+        self.assertEqual(1, len(launches), launches)
+        self.assertEqual("dontAsk", launches[0]["request"].get("permission_mode"))
+
+    def test_run_cli_flags_set_permission_mode_and_isolation(self) -> None:
+        completed = subprocess.run(
+            [
+                str(self.harness.cli),
+                "run",
+                "--provider",
+                "fake",
+                "--label",
+                "cli-flags",
+                "-C",
+                str(self.harness.root),
+                "--permission-mode",
+                "dontAsk",
+                "--no-isolate-worker-config",
+                "--idempotency-key",
+                "cli-flags",
+                "--json",
+                "deterministic fake task cli-flags",
+            ],
+            text=True,
+            capture_output=True,
+            env=self.harness.env,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        result = json.loads(completed.stdout)
+        group_id = ids_from(result, "group")[0]
+        self.harness.call(
+            "await",
+            {
+                **group_target(group_id),
+                "condition": "all_terminal",
+                "since_cursor": cursor_from(result),
+                "timeout": 3,
+            },
+        )
+        launches = self.harness.provider_calls("launch")
+        matching = [
+            call
+            for call in launches
+            if call["request"].get("permission_mode") == "dontAsk"
+        ]
+        self.assertTrue(matching, launches)
+        self.assertIs(False, matching[-1]["request"].get("isolate_worker_config"))
+
+    def test_reply_inherits_parent_option_unless_overridden(self) -> None:
+        spec = self.harness.job_spec("options-parent")
+        spec["permission_mode"] = "acceptEdits"
+        created = self.harness.run_many([spec], key="option-reply-parent")
+        group_id = ids_from(created, "group")[0]
+        job_id = ids_from(created, "job")[0]
+        self.harness.call(
+            "await",
+            {
+                **group_target(group_id),
+                "condition": "all_terminal",
+                "since_cursor": cursor_from(created),
+                "timeout": 3,
+            },
+        )
+        self.harness.call(
+            "reply",
+            {
+                **job_target(job_id),
+                "prompt": "inherit please",
+                "idempotency_key": "option-reply-inherit",
+            },
+        )
+        continuations = self.harness.provider_calls("continue")
+        self.assertEqual(1, len(continuations), continuations)
+        self.assertEqual("acceptEdits", continuations[0]["request"].get("permission_mode"))
+
+        overridden = self.harness.call(
+            "reply",
+            {
+                **job_target(job_id),
+                "prompt": "override please",
+                "idempotency_key": "option-reply-override",
+                "permission_mode": "dontAsk",
+            },
+        )
+        self.assertEqual(0, overridden.returncode, overridden.stdout)
+        continuations = self.harness.provider_calls("continue")
+        self.assertEqual(2, len(continuations), continuations)
+        self.assertEqual("dontAsk", continuations[1]["request"].get("permission_mode"))
+
+
 if __name__ == "__main__":
     unittest.main()
