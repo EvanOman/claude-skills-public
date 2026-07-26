@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -88,6 +89,100 @@ class ClaudeProviderReconcileTest(unittest.TestCase):
             "waiting on operator input",
             Path(update["result_path"]).read_text(encoding="utf-8"),
         )
+
+
+class ClaudeIdleReaperTest(unittest.TestCase):
+    """A worker that finishes without a final message must not hang the group.
+
+    The CLI parks such a session at state "working" with tempo "idle" and an empty
+    inFlight, and stops touching its state file. Left alone the broker polls it
+    forever, so `await` never satisfies and `reply` refuses to continue it.
+    """
+
+    def reconcile(self, *, age_seconds: float, grace: object = None, **fields: object):
+        with tempfile.TemporaryDirectory(prefix="overmind-v2-idle.") as root:
+            job_dir = Path(root) / "job"
+            job_dir.mkdir()
+            state_path = job_dir / "state.json"
+            observed = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+            payload = {
+                "state": "working",
+                "tempo": "idle",
+                "inFlight": {"tasks": 0, "queued": 0},
+                "detail": "committed OPTOUT.txt; running git status",
+                "updatedAt": observed.isoformat().replace("+00:00", "Z"),
+                **fields,
+            }
+            state_path.write_text(json.dumps(payload), encoding="utf-8")
+            job: dict[str, object] = {
+                "provider_job_id": "deadbeef",
+                "provider_state_path": str(state_path),
+                "brief_path": str(job_dir / "brief.md"),
+                "provider_payload": {} if grace is None else {"idle_grace_seconds": grace},
+            }
+            stopped: list[list[str]] = []
+            provider = ClaudeProvider()
+            provider._stop_quietly = lambda pid: stopped.append([pid])  # type: ignore[assignment]
+            update = provider.reconcile(job)
+            written = (
+                Path(str(update["result_path"])).read_text(encoding="utf-8")
+                if update.get("result_path")
+                else None
+            )
+            return update, stopped, written
+
+    def test_a_long_quiescent_worker_is_reaped_and_its_session_ended(self) -> None:
+        update, stopped, _ = self.reconcile(age_seconds=900)
+
+        self.assertEqual("unknown", update["state"])
+        self.assertIn("without reporting a final message", update["error"])
+        self.assertEqual([["deadbeef"]], stopped)
+
+    def test_the_reaped_worker_keeps_its_progress_note_as_the_result(self) -> None:
+        update, _, written = self.reconcile(age_seconds=900)
+
+        self.assertIn("result_path", update)
+        self.assertIsNotNone(written)
+        self.assertIn("committed OPTOUT.txt", str(written))
+
+    def test_a_recently_active_worker_is_left_running(self) -> None:
+        update, stopped, _ = self.reconcile(age_seconds=5)
+
+        self.assertEqual("running", update["state"])
+        self.assertEqual([], stopped)
+
+    def test_a_worker_with_a_turn_in_progress_is_never_reaped(self) -> None:
+        update, stopped, _ = self.reconcile(
+            age_seconds=9000, inFlight={"tasks": 1, "queued": 0}
+        )
+
+        self.assertEqual("running", update["state"])
+        self.assertEqual([], stopped)
+
+    def test_a_worker_that_is_not_idle_is_never_reaped(self) -> None:
+        update, _, _ = self.reconcile(age_seconds=9000, tempo="thinking")
+
+        self.assertEqual("running", update["state"])
+
+    def test_reaping_can_be_disabled_per_job(self) -> None:
+        update, stopped, _ = self.reconcile(age_seconds=9000, grace=0)
+
+        self.assertEqual("running", update["state"])
+        self.assertEqual([], stopped)
+
+    def test_a_shorter_grace_reaps_sooner(self) -> None:
+        update, _, _ = self.reconcile(age_seconds=120, grace=60)
+
+        self.assertEqual("unknown", update["state"])
+
+    def test_a_genuinely_finished_worker_still_succeeds(self) -> None:
+        update, stopped, _ = self.reconcile(
+            age_seconds=9000, state="done", output={"result": "all done"}
+        )
+
+        self.assertEqual("succeeded", update["state"])
+        self.assertNotIn("error", update)
+        self.assertEqual([], stopped)
 
 
 class ClaudeProviderLaunchOptionsTest(unittest.TestCase):

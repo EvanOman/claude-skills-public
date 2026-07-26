@@ -50,6 +50,17 @@ JOB_PROPERTIES: dict[str, Any] = {
             "worktree. Ignored by non-Claude providers."
         ),
     },
+    "idle_grace_seconds": {
+        "type": "number",
+        "minimum": 0,
+        "description": (
+            "Seconds a Claude worker may sit with no turn in progress before the "
+            "broker ends the session and reports it terminal. Defaults to 300. A "
+            "worker that finishes without emitting a final message otherwise never "
+            "reaches a terminal state, so await hangs and reply refuses to continue "
+            "it. Set 0 to disable reaping for a long-idling job."
+        ),
+    },
     "isolate_worker_config": {
         "type": "boolean",
         "default": True,
@@ -209,6 +220,7 @@ TOOLS: list[dict[str, Any]] = [
                 "idempotency_key": {"type": "string"},
                 "permission_mode": JOB_PROPERTIES["permission_mode"],
                 "workspace_note": JOB_PROPERTIES["workspace_note"],
+                "idle_grace_seconds": JOB_PROPERTIES["idle_grace_seconds"],
                 "isolate_worker_config": JOB_PROPERTIES["isolate_worker_config"],
             },
             "additionalProperties": False,

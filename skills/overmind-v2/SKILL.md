@@ -81,6 +81,13 @@ worktree per writer yourself; pass `workspace_note: false` when a worker must ma
 Omit `model` unless a job genuinely needs a specific one, so workers inherit the configured default
 rather than a hardcoded tier.
 
+A worker that finishes its work but never emits a final message parks at "working" forever. The
+broker reaps such a worker after `idle_grace_seconds` (default 300) of no turn in progress, ends its
+session, and reports it terminal as `unknown` with its last progress note as the result. `unknown`
+here means exactly what it says: the work may well be complete, but nothing reported it, so inspect
+the artifacts the brief asked for before trusting or redoing it. Raise `idle_grace_seconds` for a
+job that legitimately sits idle, or set 0 to disable reaping for it.
+
 ## Use the command surface
 
 Use `$SKILL_ROOT/scripts/om --help` for the human CLI and `$SKILL_ROOT/scripts/overmind-v2-mcp` for

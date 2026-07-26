@@ -37,6 +37,7 @@ class Broker:
         "permission_mode",
         "isolate_worker_config",
         "workspace_note",
+        "idle_grace_seconds",
     )
 
     def __init__(

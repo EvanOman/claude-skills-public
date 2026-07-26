@@ -24,7 +24,7 @@ under `~/.local/state/overmind-v2/` until explicitly forgotten or archived.
 
 ## Claude worker launch options
 
-`run`, `run_many`, and `reply` accept three Claude-specific, per-job options. All are ignored by
+`run`, `run_many`, and `reply` accept four Claude-specific, per-job options. All are ignored by
 non-Claude providers. Set them on an individual job, or at the request's top level as a default for
 jobs that omit them; `reply` inherits the parent job's values unless the continuation overrides them.
 
@@ -48,6 +48,17 @@ jobs that omit them; `reply` inherits the parent job's values unless the continu
   creates a nested `.claude/worktrees/<name>` checkout on its own branch; the work succeeds but is
   stranded where the orchestrator is not looking, and the assigned branch appears untouched. Set
   `workspace_note: false` when a worker is supposed to manage its own worktree.
+
+- `idle_grace_seconds` (default `300`): how long a worker may sit with no turn in progress before the
+  broker ends its session and reports it terminal. The Claude CLI parks a worker that completed its
+  work without emitting a final message at `state: "working"` with `tempo: "idle"`, an empty
+  `inFlight`, and a frozen `updatedAt`. That is not the `blocked` case above -- nothing is waiting on
+  the operator, the turn simply ended silently -- and the broker would otherwise poll it forever, so
+  `await` never satisfies and `reply` refuses to continue it. Observed on roughly a third of workers
+  in a seven-worker run whose git state proved the work had finished. The reaped job is reported
+  `unknown`, not `succeeded`: the broker has no report to judge, so it declines to claim success and
+  the orchestrator should verify the brief's artifacts. The worker's last progress note is kept as
+  the result artifact. Set a larger value for a job that legitimately idles, or `0` to disable.
 
 A related launch detail: `--model` is passed only when a job specifies one, so workers inherit the
 operator's configured default instead of a tier hardcoded in the adapter.

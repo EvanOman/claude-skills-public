@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -403,6 +404,26 @@ class FakeProvider(Provider):
 
 DEFAULT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
 
+# A Claude worker that finishes its work but never emits a final message parks at
+# state "working" forever: tempo goes "idle", inFlight empties, and the CLI stops
+# updating its state file. That is distinct from "blocked" (which waits on operator
+# input). The broker reaps such a worker after this much quiescence so `await` and
+# `reply` are not blocked by a session that has stopped working. 0 disables.
+CLAUDE_IDLE_GRACE_SECONDS = 300.0
+
+
+def _parse_cli_timestamp(value: Any) -> float | None:
+    """Read the Claude CLI's ISO-8601 `updatedAt` as an epoch float."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        text = value[:-1] + "+00:00" if value.endswith("Z") else value
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
 # Appended to the brief when a worker's cwd is a git checkout. A write-capable agent
 # otherwise creates its own nested worktree and commits there, so the orchestrator finds
 # nothing on the branch it assigned.
@@ -440,6 +461,51 @@ class ClaudeProvider(Provider):
         env = subscription_env("claude")
         env["CLAUDE_BIN"] = self.binary
         return env
+
+    @staticmethod
+    def _is_quiescent(value: dict[str, Any]) -> bool:
+        """True when the CLI reports no turn in progress and nothing queued."""
+
+        if str(value.get("tempo") or "").lower() != "idle":
+            return False
+        in_flight = value.get("inFlight")
+        if isinstance(in_flight, dict):
+            for key in ("tasks", "queued"):
+                try:
+                    if int(in_flight.get(key) or 0) > 0:
+                        return False
+                except (TypeError, ValueError):
+                    return False
+        return True
+
+    def _idle_grace_seconds(self, job: dict[str, Any]) -> float:
+        for candidate in (
+            self._job_option(job, "idle_grace_seconds"),
+            os.environ.get("OVERMIND_V2_CLAUDE_IDLE_GRACE_SECONDS"),
+            CLAUDE_IDLE_GRACE_SECONDS,
+        ):
+            if candidate is None or candidate == "":
+                continue
+            try:
+                return max(0.0, float(candidate))
+            except (TypeError, ValueError):
+                continue
+        return CLAUDE_IDLE_GRACE_SECONDS
+
+    def _stop_quietly(self, provider_id: str) -> None:
+        """Best-effort release of a session the broker has decided is finished."""
+
+        try:
+            subprocess.run(
+                [self.binary, "stop", str(provider_id)],
+                text=True,
+                capture_output=True,
+                env=self._env(),
+                check=False,
+                timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     @staticmethod
     def _brief_with_workspace_note(job: dict[str, Any], brief: str) -> str:
@@ -720,6 +786,25 @@ class ClaudeProvider(Provider):
             state = "running"
         else:
             state = "unknown"
+        reaped_after: float | None = None
+        if state == "running":
+            grace = self._idle_grace_seconds(job)
+            if grace > 0 and self._is_quiescent(value):
+                observed = _parse_cli_timestamp(value.get("updatedAt"))
+                if observed is None:
+                    observed = state_path.stat().st_mtime
+                idle_for = time.time() - observed
+                if idle_for >= grace:
+                    # The turn has ended without a final message. Left alone this
+                    # job never reaches a terminal state, so `await` hangs and
+                    # `reply` refuses to continue it.
+                    reaped_after = idle_for
+                    state = "unknown"
+                    provider_id = value.get(
+                        "daemonShort", value.get("id", job.get("provider_job_id"))
+                    )
+                    if provider_id:
+                        self._stop_quietly(str(provider_id))
         update: dict[str, Any] = {
             "state": state,
             "provider_job_id": value.get(
@@ -732,6 +817,10 @@ class ClaudeProvider(Provider):
         result: Any = None
         if isinstance(output, dict) and "result" in output:
             result = output["result"]
+        elif reaped_after is not None:
+            # Nothing structured was ever emitted; the CLI's own progress note is
+            # the only account of what the worker did.
+            result = value.get("detail")
         elif raw_state == "blocked":
             # No structured output when blocked; fall back to the CLI's own
             # summary of what it is waiting on so the parent has something to
@@ -752,6 +841,13 @@ class ClaudeProvider(Provider):
                 "tokens": value["tokens"],
                 "source": "claude-state",
             }
+        if reaped_after is not None:
+            update["error"] = (
+                f"worker stopped working {reaped_after:.0f}s ago without reporting a "
+                "final message; the broker ended the session. Its outcome is "
+                "unverified: check the artifacts it was asked to produce."
+            )
+            return update
         detail = value.get("detail", value.get("error"))
         if detail and state in {"failed", "unknown", "interrupted"}:
             update["error"] = str(detail)
