@@ -1,0 +1,7 @@
+interface:
+  display_name: "Domain-Driven Design"
+  short_description: "Size, design, or audit a system against DDD"
+  default_prompt: "Use $domain-driven-design to assess how much structure this system actually earns."
+
+policy:
+  allow_implicit_invocation: false
