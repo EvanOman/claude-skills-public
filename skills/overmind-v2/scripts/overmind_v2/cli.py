@@ -217,6 +217,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = commands.add_parser("doctor", parents=[common], help="report broker capabilities")
     doctor.set_defaults(operation="doctor")
+
+    orphans = commands.add_parser(
+        "orphans",
+        parents=[common],
+        help="list workers whose owning session is gone",
+    )
+    orphans.set_defaults(operation="orphans")
+    orphans.add_argument(
+        "--stop",
+        action="store_true",
+        help="stop the orphaned workers instead of only listing them",
+    )
     return parser
 
 
@@ -284,6 +296,7 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             _set(params, key, getattr(args, key))
         if args.allow_billing_class_change:
             params["allow_billing_class_change"] = True
+        _attach_owner(params, getattr(args, "state_dir", None))
         if getattr(args, "isolate_worker_config", None) is False:
             params["isolate_worker_config"] = False
         if getattr(args, "workspace_note", None) is False:
@@ -363,6 +376,22 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
     else:  # pragma: no cover - argparse owns this invariant
         raise OvermindError(f"unsupported operation: {operation}", code="invalid_request")
     return operation, params
+
+
+def _attach_owner(params: dict[str, Any], state_dir: Any) -> None:
+    """Record which session launched this worker, so it can be found or reaped later."""
+
+    if params.get("owner_session"):
+        return
+    try:
+        from .client import default_state_dir
+        from .sessions import owning_session
+
+        owner = owning_session(Path(state_dir) if state_dir else default_state_dir())
+    except Exception:
+        return
+    if owner:
+        params["owner_session"] = owner
 
 
 def _display_id(value: Any) -> str:
@@ -529,9 +558,115 @@ def render_human(operation: str, value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _orphans(args: Any) -> int:
+    """Report (and optionally stop) workers whose owning session has exited.
+
+    Deliberately not automatic. Surviving the parent session is a documented
+    capability of this broker, so a worker outliving its launcher is a legitimate
+    state, not a leak. This makes the cleanup available and explicit instead of
+    quietly killing work someone meant to keep.
+    """
+
+    from .sessions import is_live, read_all
+
+    client = DaemonClient(
+        getattr(args, "state_dir", None),
+        autostart=not getattr(args, "no_autostart", False),
+    )
+    live = {
+        str(record["session_id"]) for record in read_all(client.state_dir) if is_live(record)
+    }
+    # The jobs snapshot deliberately omits provider_payload, and owner_session lives
+    # there, so read the store directly rather than widening the wire format.
+    import sqlite3
+
+    orphaned = []
+    try:
+        connection = sqlite3.connect(
+            f"file:{client.state_dir / 'overmind.db'}?mode=ro", uri=True, timeout=1.0
+        )
+    except sqlite3.Error as error:
+        raise OvermindError(f"cannot read the job store: {error}") from error
+    try:
+        rows = connection.execute(
+            "SELECT id, short_id, label, provider, provider_payload_json FROM jobs "
+            "WHERE state IN ('running','starting','queued')"
+        ).fetchall()
+    finally:
+        connection.close()
+    for job_id, short_id, label, provider, payload_json in rows:
+        try:
+            payload = json.loads(payload_json or "{}")
+        except ValueError:
+            continue
+        owner = payload.get("owner_session") if isinstance(payload, dict) else None
+        if owner and str(owner) not in live:
+            orphaned.append(
+                (
+                    {
+                        "id": job_id,
+                        "short_id": short_id,
+                        "label": label,
+                        "provider": provider,
+                    },
+                    str(owner),
+                )
+            )
+
+    if getattr(args, "stop", False):
+        for job, _owner in orphaned:
+            try:
+                client.request("stop", {"target": {"job_id": job["id"]}})
+            except OvermindError:
+                pass
+
+    if getattr(args, "json", False):
+        json.dump(
+            {
+                "orphans": [
+                    {
+                        "job_id": job.get("id"),
+                        "short_id": job.get("short_id"),
+                        "label": job.get("label"),
+                        "provider": job.get("provider"),
+                        "owner_session": owner,
+                        "stopped": bool(getattr(args, "stop", False)),
+                    }
+                    for job, owner in orphaned
+                ],
+                "live_sessions": sorted(live),
+            },
+            sys.stdout,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        sys.stdout.write("\n")
+        return 0
+
+    if not orphaned:
+        print(f"no orphaned workers ({len(live)} live session(s))")
+        return 0
+    verb = "stopped" if getattr(args, "stop", False) else "orphaned"
+    for job, owner in orphaned:
+        print(
+            f"{_display_id(job.get('short_id') or job.get('id'))} "
+            f"{verb:9} {str(job.get('provider')):7} {job.get('label')} "
+            f"(owner {_display_id(owner)} gone)"
+        )
+    if not getattr(args, "stop", False):
+        print("re-run with --stop to end them")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "operation", None) == "orphans":
+        try:
+            return _orphans(args)
+        except OvermindError as error:
+            print(f"om: {error}", file=sys.stderr)
+            return 1
     try:
         operation, params = request_for(args)
         client = DaemonClient(

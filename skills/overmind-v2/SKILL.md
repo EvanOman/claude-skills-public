@@ -46,6 +46,11 @@ DONE WHEN:   Acceptance criteria visible outside the worker's narrative.
 VERIFY:      Exact commands or checks.
 ```
 
+Each job records the session that launched it, derived automatically from process
+ancestry. `om orphans` shows workers whose owning session has exited and `--stop` ends
+them; it is a command, not a sweep, because workers are meant to be able to outlive the
+session that started them.
+
 ## Keep context and spend bounded
 
 - Prefer `run-many -> await -> collect` over one launch, wait, and result cycle per worker.

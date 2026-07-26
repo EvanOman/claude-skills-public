@@ -61,6 +61,14 @@ JOB_PROPERTIES: dict[str, Any] = {
             "it. Set 0 to disable reaping for a long-idling job."
         ),
     },
+    "owner_session": {
+        "type": "string",
+        "description": (
+            "Orchestrator session that owns this worker. Filled in automatically "
+            "from the calling session when available; set it explicitly to attribute "
+            "a job to a different owner."
+        ),
+    },
     "idle_hard_timeout_seconds": {
         "type": "number",
         "minimum": 0,
@@ -467,6 +475,19 @@ class McpServer:
 
         try:
             broker_method = "run-many" if name == "run_many" else name
+            if broker_method in {"run", "run-many"}:
+                # The CLI never tells an MCP server which session invoked it, but this
+                # server is a child of that session, so ancestry plus the live-session
+                # registry names the owner without the caller supplying anything.
+                owner = self._owner_session()
+                if owner:
+                    jobs = arguments.get("jobs")
+                    if isinstance(jobs, list):
+                        for job in jobs:
+                            if isinstance(job, dict):
+                                job.setdefault("owner_session", owner)
+                    else:
+                        arguments.setdefault("owner_session", owner)
             result = self.client.request(
                 broker_method,
                 arguments,
@@ -514,6 +535,15 @@ class McpServer:
         if isinstance(metadata, dict) and "progressToken" in metadata:
             return metadata["progressToken"]
         return params.get("progressToken")
+
+    def _owner_session(self) -> str | None:
+        try:
+            from .sessions import owning_session
+
+            return owning_session(self.client.state_dir)
+        except Exception:
+            # Attribution is a convenience; never fail a launch over it.
+            return None
 
     @staticmethod
     def _structured(value: Any) -> dict[str, Any]:

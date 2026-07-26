@@ -39,6 +39,10 @@ class Broker:
         "workspace_note",
         "idle_grace_seconds",
         "idle_hard_timeout_seconds",
+        # Which orchestrator session launched this worker. Recorded so a session
+        # can find its own workers, and so workers orphaned by a dead session can
+        # be identified rather than lingering unattributed.
+        "owner_session",
     )
 
     def __init__(

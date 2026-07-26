@@ -76,6 +76,27 @@ moment the subagent started, with `updatedAt` frozen for over three minutes, whi
 `local_agent` and `local_bash`. Without the in-flight check that parent would have been killed
 mid-flight, taking its subagent's work with it.
 
+## Session ownership and orphaned workers
+
+Each job records the orchestrator session that launched it, in `owner_session`. Nothing
+needs to pass it: the MCP server is a child of the session process, so it walks its own
+process ancestry and matches a live entry in the session registry under
+`<state-dir>/sessions/`. Set `owner_session` on a job to attribute it deliberately, or
+`OVERMIND_V2_OWNER_SESSION` to force one.
+
+A session registers itself while it is alive. The Claude CLI hands the session id to the
+status line and nowhere else -- it is absent from the MCP server's environment and from a
+worker's own state file -- so the status line is what binds session id to a live process.
+Liveness is pid *plus* process start identity, never pid alone, because pids are recycled
+and claiming a stranger's process is the one mistake this must not make.
+
+`om orphans` lists running workers whose owning session is gone; `om orphans --stop` ends
+them. This is deliberately a command rather than an automatic sweep. Surviving the parent
+session is a documented capability of this broker, so a worker outliving its launcher is a
+legitimate state and not by itself a leak; a sweep that killed those would quietly destroy
+work someone meant to keep. Run it when you want the cleanup, or wire it to a session-end
+hook if you want it every time.
+
 ### Unrecognized states are transitions, not outcomes
 
 A CLI state the adapter does not map is treated as still-running for
