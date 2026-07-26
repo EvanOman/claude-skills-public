@@ -411,6 +411,12 @@ DEFAULT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
 # `reply` are not blocked by a session that has stopped working. 0 disables.
 CLAUDE_IDLE_GRACE_SECONDS = 300.0
 
+# How long an unmapped CLI state is treated as a transition rather than an outcome.
+# Observed: a worker reported "SIGTERM (143); respawning", was recorded terminal, then
+# respawned and committed its work -- but the broker never looked again, so a
+# successful worker was reported as unknown.
+UNRECOGNIZED_STATE_GRACE_SECONDS = 60.0
+
 
 def _parse_cli_timestamp(value: Any) -> float | None:
     """Read the Claude CLI's ISO-8601 `updatedAt` as an epoch float."""
@@ -795,6 +801,10 @@ class ClaudeProvider(Provider):
             "canceled": "interrupted",
             "killed": "interrupted",
         }
+        observed = _parse_cli_timestamp(value.get("updatedAt"))
+        if observed is None:
+            observed = state_path.stat().st_mtime
+        idle_for = time.time() - observed
         if raw_state in mapping:
             state = mapping[raw_state]
         elif raw_state in {
@@ -804,17 +814,22 @@ class ClaudeProvider(Provider):
             "queued",
             "waiting",
             "idle",
+            "respawning",
+            "restarting",
         }:
+            state = "running"
+        elif idle_for < UNRECOGNIZED_STATE_GRACE_SECONDS:
+            # An unrecognized state is usually a transition, not an outcome. A worker
+            # that takes a SIGTERM reports something unmapped and then respawns and
+            # finishes normally; calling that terminal locks in a wrong verdict,
+            # because a terminal job is never reconciled again and its real result is
+            # discarded. Wait for the CLI to stop moving before judging it.
             state = "running"
         else:
             state = "unknown"
         reaped_after: float | None = None
         reaped_reason = ""
         if state == "running":
-            observed = _parse_cli_timestamp(value.get("updatedAt"))
-            if observed is None:
-                observed = state_path.stat().st_mtime
-            idle_for = time.time() - observed
             grace = self._idle_grace_seconds(job)
             hard_timeout = self._hard_timeout_seconds(job)
             if grace > 0 and idle_for >= grace and self._is_quiescent(value):

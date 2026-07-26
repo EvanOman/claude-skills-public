@@ -46,14 +46,28 @@ class ClaudeProviderReconcileTest(unittest.TestCase):
         self.assertNotIn("error", update)
 
     def test_unsuccessful_states_preserve_provider_detail_or_error(self) -> None:
-        cases = (
-            ("failed", "detail", "worker failed", "failed"),
-            ("cancelled", "detail", "stopped by caller", "interrupted"),
-            ("mystery", "error", "unrecognized provider state", "unknown"),
+        # An unrecognized state only settles to unknown once the CLI has stopped
+        # moving (see ClaudeTransientStateTest), so "mystery" carries a stale
+        # timestamp here; the point of this case is that the detail survives.
+        stale = (
+            (datetime.now(timezone.utc) - timedelta(seconds=600))
+            .isoformat()
+            .replace("+00:00", "Z")
         )
-        for raw_state, field, message, expected_state in cases:
+        cases = (
+            ("failed", "detail", "worker failed", "failed", {}),
+            ("cancelled", "detail", "stopped by caller", "interrupted", {}),
+            (
+                "mystery",
+                "error",
+                "unrecognized provider state",
+                "unknown",
+                {"updatedAt": stale},
+            ),
+        )
+        for raw_state, field, message, expected_state, extra in cases:
             with self.subTest(state=raw_state, field=field):
-                update = self.reconcile(raw_state, **{field: message})
+                update = self.reconcile(raw_state, **{field: message}, **extra)
                 self.assertEqual(expected_state, update["state"])
                 self.assertEqual(message, update["error"])
 
@@ -89,6 +103,55 @@ class ClaudeProviderReconcileTest(unittest.TestCase):
             "waiting on operator input",
             Path(update["result_path"]).read_text(encoding="utf-8"),
         )
+
+
+class ClaudeTransientStateTest(unittest.TestCase):
+    """An unmapped CLI state is a transition, not an outcome.
+
+    Observed live: a worker reported "SIGTERM (143); respawning", the broker recorded
+    it terminal as unknown, and the worker then respawned and committed its work. A
+    terminal job is never reconciled again, so a successful worker was permanently
+    misreported as unknown and its result artifact discarded.
+    """
+
+    def reconcile(self, raw_state: str, *, age_seconds: float):
+        with tempfile.TemporaryDirectory(prefix="overmind-v2-transient.") as root:
+            job_dir = Path(root) / "job"
+            job_dir.mkdir()
+            state_path = job_dir / "state.json"
+            observed = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "state": raw_state,
+                        "detail": "SIGTERM (143); respawning",
+                        "updatedAt": observed.isoformat().replace("+00:00", "Z"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return ClaudeProvider().reconcile(
+                {
+                    "provider_job_id": "deadbeef",
+                    "provider_state_path": str(state_path),
+                    "brief_path": str(job_dir / "brief.md"),
+                    "provider_payload": {},
+                }
+            )
+
+    def test_a_respawning_worker_is_still_running(self) -> None:
+        self.assertEqual("running", self.reconcile("respawning", age_seconds=1)["state"])
+
+    def test_a_fresh_unmapped_state_is_not_yet_an_outcome(self) -> None:
+        self.assertEqual("running", self.reconcile("kerfuffle", age_seconds=5)["state"])
+
+    def test_an_unmapped_state_that_stops_moving_becomes_unknown(self) -> None:
+        update = self.reconcile("kerfuffle", age_seconds=600)
+
+        self.assertEqual("unknown", update["state"])
+
+    def test_a_real_failure_is_still_reported_immediately(self) -> None:
+        self.assertEqual("failed", self.reconcile("failed", age_seconds=1)["state"])
 
 
 class ClaudeIdleReaperTest(unittest.TestCase):

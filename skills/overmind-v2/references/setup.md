@@ -76,6 +76,18 @@ moment the subagent started, with `updatedAt` frozen for over three minutes, whi
 `local_agent` and `local_bash`. Without the in-flight check that parent would have been killed
 mid-flight, taking its subagent's work with it.
 
+### Unrecognized states are transitions, not outcomes
+
+A CLI state the adapter does not map is treated as still-running for
+`UNRECOGNIZED_STATE_GRACE_SECONDS` (60) and only settles to `unknown` once the state file
+stops changing. This exists because of an observed misreport: a worker took a SIGTERM,
+reported `SIGTERM (143); respawning`, was recorded terminal as `unknown` -- and then
+respawned and committed its work correctly. A terminal job is never reconciled again, so
+the broker permanently reported a successful worker as failed and discarded its result.
+`respawning` and `restarting` are now mapped to running outright; the grace covers whatever
+else the CLI may emit mid-transition. Genuine `failed`/`stopped` states are still reported
+immediately, since they are mapped explicitly.
+
 A related launch detail: `--model` is passed only when a job specifies one, so workers inherit the
 operator's configured default instead of a tier hardcoded in the adapter.
 
