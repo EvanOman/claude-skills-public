@@ -33,7 +33,11 @@ class Broker:
     # job["provider_payload"] so providers can read them (e.g. ClaudeProvider's
     # permission_mode and isolate_worker_config). Not stored as dedicated
     # columns; a run/run-many default is merged in when a job omits them.
-    _PASSTHROUGH_PROVIDER_OPTIONS = ("permission_mode", "isolate_worker_config")
+    _PASSTHROUGH_PROVIDER_OPTIONS = (
+        "permission_mode",
+        "isolate_worker_config",
+        "workspace_note",
+    )
 
     def __init__(
         self,

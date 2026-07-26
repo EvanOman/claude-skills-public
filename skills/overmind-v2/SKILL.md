@@ -71,7 +71,15 @@ Claude workers launch with `permission_mode: bypassPermissions` and `isolate_wor
 default, so a background worker can act on its brief unattended and skips the operator's user-level
 skill/hook ceremony. Both are per-job options on `run`/`run-many`/`reply` (inherited by continuations
 unless overridden); see [references/setup.md](references/setup.md#claude-worker-launch-options) to
-opt into a narrower permission mode or the operator's full config.
+opt into a narrower permission mode or the operator's full config. Prefer `dontAsk` for read-only
+auditors and reviewers, and say in the brief that the work is read-only.
+
+A worker whose `cwd` is a git checkout is also told not to create its own nested worktree, so its
+commits land on the branch you assigned rather than one you are not watching. Keep assigning one
+worktree per writer yourself; pass `workspace_note: false` when a worker must manage its own.
+
+Omit `model` unless a job genuinely needs a specific one, so workers inherit the configured default
+rather than a hardcoded tier.
 
 ## Use the command surface
 

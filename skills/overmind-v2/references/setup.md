@@ -24,7 +24,7 @@ under `~/.local/state/overmind-v2/` until explicitly forgotten or archived.
 
 ## Claude worker launch options
 
-`run`, `run_many`, and `reply` accept two Claude-specific, per-job options. Both are ignored by
+`run`, `run_many`, and `reply` accept three Claude-specific, per-job options. All are ignored by
 non-Claude providers. Set them on an individual job, or at the request's top level as a default for
 jobs that omit them; `reply` inherits the parent job's values unless the continuation overrides them.
 
@@ -42,9 +42,18 @@ jobs that omit them; `reply` inherits the parent job's values unless the continu
   it, the broker instead prepends a short standard preamble to the brief telling the worker to skip
   onboarding ceremony and execute the brief directly (see `CEREMONY_PREAMBLE` in `providers.py`). Set
   `isolate_worker_config: false` to let a job inherit the operator's full config instead.
+- `workspace_note` (default `true`): when the worker's `cwd` is a git checkout, appends a short note
+  telling it that it is already in the dedicated directory the orchestrator assigned and must not
+  create another worktree. Without it, a write-capable worker tends to call `EnterWorktree`, which
+  creates a nested `.claude/worktrees/<name>` checkout on its own branch; the work succeeds but is
+  stranded where the orchestrator is not looking, and the assigned branch appears untouched. Set
+  `workspace_note: false` when a worker is supposed to manage its own worktree.
 
-CLI equivalents: `om run --permission-mode <mode>` and `om run --no-isolate-worker-config` (also
-available on `om reply`). `run-many` and MCP callers set the same field names directly in the job
+A related launch detail: `--model` is passed only when a job specifies one, so workers inherit the
+operator's configured default instead of a tier hardcoded in the adapter.
+
+CLI equivalents: `om run --permission-mode <mode>`, `om run --no-isolate-worker-config`, and
+`om run --no-workspace-note` (the first two are also available on `om reply`). `run-many` and MCP callers set the same field names directly in the job
 object or request.
 
 ## Claude stall/blocked-turn reconciliation

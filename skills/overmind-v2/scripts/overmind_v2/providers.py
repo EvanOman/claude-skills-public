@@ -403,6 +403,17 @@ class FakeProvider(Provider):
 
 DEFAULT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
 
+# Appended to the brief when a worker's cwd is a git checkout. A write-capable agent
+# otherwise creates its own nested worktree and commits there, so the orchestrator finds
+# nothing on the branch it assigned.
+WORKSPACE_NOTE = (
+    "Workspace: you are already running in the dedicated working directory the "
+    "orchestrator assigned to you, and you are its only writer. Do not call "
+    "EnterWorktree and do not create another git worktree. Work, commit, and verify "
+    "directly in your current working directory, so the orchestrator finds your work "
+    "on the branch it assigned. Do not switch, rebase, or reset that branch."
+)
+
 # Prepended to the brief when a worker's user-level config cannot be excluded via
 # --setting-sources (see ClaudeProvider._supports_setting_sources). Keeps a worker
 # from burning its turn on session-start skill/hook ceremony before touching the brief.
@@ -429,6 +440,22 @@ class ClaudeProvider(Provider):
         env = subscription_env("claude")
         env["CLAUDE_BIN"] = self.binary
         return env
+
+    @staticmethod
+    def _brief_with_workspace_note(job: dict[str, Any], brief: str) -> str:
+        """Pin a worker to the directory the orchestrator gave it.
+
+        A write-capable background agent otherwise isolates itself into a nested
+        `.claude/worktrees/<name>` checkout on its own branch. The orchestrator already
+        assigns one worktree per writer, so that nesting is redundant and silently
+        strands the result on a branch nobody is watching.
+        """
+
+        if ClaudeProvider._job_option(job, "workspace_note") is False:
+            return brief
+        if not (Path(str(job.get("cwd") or ".")) / ".git").exists():
+            return brief
+        return f"{brief}\n\n---\n\n{WORKSPACE_NOTE}\n"
 
     @staticmethod
     def _job_option(job: dict[str, Any], key: str) -> Any:
@@ -595,14 +622,13 @@ class ClaudeProvider(Provider):
                 effective_brief = CEREMONY_PREAMBLE + brief
         command += [
             "--bg",
-            "--model",
-            job.get("model") or "sonnet",
+            *(["--model", str(job["model"])] if job.get("model") else []),
             "--permission-mode",
             permission_mode,
             "--name",
             f"overmind-{job['short_id']}",
             "--",
-            effective_brief,
+            self._brief_with_workspace_note(job, effective_brief),
         ]
         completed = subprocess.run(
             command,

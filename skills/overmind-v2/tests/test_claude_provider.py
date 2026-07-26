@@ -93,7 +93,13 @@ class ClaudeProviderReconcileTest(unittest.TestCase):
 class ClaudeProviderLaunchOptionsTest(unittest.TestCase):
     """Verifies the exact command line built for a launch, using a fake claude binary."""
 
-    def build_command(self, provider_payload: dict[str, object] | None = None, **job_fields: object):
+    def build_command(
+        self,
+        provider_payload: dict[str, object] | None = None,
+        *,
+        make_repo: bool = False,
+        **job_fields: object,
+    ):
         with tempfile.TemporaryDirectory(prefix="overmind-v2-claude-launch.") as root:
             root_path = Path(root)
             fake_bin = root_path / "claude"
@@ -109,6 +115,8 @@ class ClaudeProviderLaunchOptionsTest(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_bin.chmod(fake_bin.stat().st_mode | stat.S_IEXEC)
+            if make_repo:
+                (root_path / ".git").mkdir()
             job_dir = root_path / "job"
             job_dir.mkdir()
             brief_path = job_dir / "brief.txt"
@@ -161,6 +169,36 @@ class ClaudeProviderLaunchOptionsTest(unittest.TestCase):
         )
 
         self.assertNotIn("--setting-sources", argv)
+
+    def test_an_unset_model_defers_to_the_operator_configuration(self) -> None:
+        """A hardcoded tier silently overrode whatever the operator had configured."""
+
+        self.assertNotIn("--model", self.build_command())
+
+    def test_an_explicit_model_is_passed_through(self) -> None:
+        argv = self.build_command(model="opus")
+
+        self.assertEqual("opus", argv[argv.index("--model") + 1])
+
+    def test_a_git_worktree_is_pinned_so_commits_land_where_assigned(self) -> None:
+        """Otherwise a write-capable worker commits into its own nested worktree."""
+
+        argv = self.build_command(make_repo=True)
+
+        self.assertIn("Do not call EnterWorktree", argv[-1])
+        self.assertTrue(argv[-1].startswith("do the thing"))
+
+    def test_a_non_repository_cwd_is_left_alone(self) -> None:
+        argv = self.build_command()
+
+        self.assertEqual("do the thing", argv[-1])
+
+    def test_the_workspace_pin_can_be_declined(self) -> None:
+        argv = self.build_command(
+            provider_payload={"workspace_note": False}, make_repo=True
+        )
+
+        self.assertNotIn("EnterWorktree", argv[-1])
 
 
 if __name__ == "__main__":

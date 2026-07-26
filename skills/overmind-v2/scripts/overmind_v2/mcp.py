@@ -40,6 +40,16 @@ JOB_PROPERTIES: dict[str, Any] = {
             "indefinitely. Ignored by non-Claude providers."
         ),
     },
+    "workspace_note": {
+        "type": "boolean",
+        "default": True,
+        "description": (
+            "Tell a Claude worker whose cwd is a git checkout not to create its own "
+            "nested worktree, so its commits land on the branch you assigned instead "
+            "of one you are not watching. Set false when a worker manages its own "
+            "worktree. Ignored by non-Claude providers."
+        ),
+    },
     "isolate_worker_config": {
         "type": "boolean",
         "default": True,
@@ -198,6 +208,7 @@ TOOLS: list[dict[str, Any]] = [
                 "label": {"type": "string"},
                 "idempotency_key": {"type": "string"},
                 "permission_mode": JOB_PROPERTIES["permission_mode"],
+                "workspace_note": JOB_PROPERTIES["workspace_note"],
                 "isolate_worker_config": JOB_PROPERTIES["isolate_worker_config"],
             },
             "additionalProperties": False,

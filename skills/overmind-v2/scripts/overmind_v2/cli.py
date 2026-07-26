@@ -72,6 +72,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--no-workspace-note",
+        dest="workspace_note",
+        action="store_false",
+        default=None,
+        help=(
+            "let a Claude worker create its own nested git worktree instead of "
+            "committing on the branch you assigned"
+        ),
+    )
+    run.add_argument(
         "--no-isolate-worker-config",
         dest="isolate_worker_config",
         action="store_false",
@@ -276,6 +286,8 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             params["allow_billing_class_change"] = True
         if getattr(args, "isolate_worker_config", None) is False:
             params["isolate_worker_config"] = False
+        if getattr(args, "workspace_note", None) is False:
+            params["workspace_note"] = False
     elif operation == "run_many":
         if args.spec is None:
             raise OvermindError(
