@@ -24,7 +24,7 @@ under `~/.local/state/overmind-v2/` until explicitly forgotten or archived.
 
 ## Claude worker launch options
 
-`run`, `run_many`, and `reply` accept four Claude-specific, per-job options. All are ignored by
+`run`, `run_many`, and `reply` accept five Claude-specific, per-job options. All are ignored by
 non-Claude providers. Set them on an individual job, or at the request's top level as a default for
 jobs that omit them; `reply` inherits the parent job's values unless the continuation overrides them.
 
@@ -59,6 +59,22 @@ jobs that omit them; `reply` inherits the parent job's values unless the continu
   `unknown`, not `succeeded`: the broker has no report to judge, so it declines to claim success and
   the orchestrator should verify the brief's artifacts. The worker's last progress note is kept as
   the result artifact. Set a larger value for a job that legitimately idles, or `0` to disable.
+
+- `idle_hard_timeout_seconds` (default `0`, disabled): ends a worker that has made no progress for
+  this long *even while the CLI reports a task in flight*. Two measured facts make this necessary and
+  make it opt-in. First, a worker can sit at `inFlight: {tasks: 1}` permanently: the counter is not
+  always cleared when the underlying process exits, so a finished worker looks busy forever and the
+  quiescence reaper above will never touch it. Second, `updatedAt` does not advance during a tool
+  call, so a worker running a thirty-minute test suite is indistinguishable from one that has hung.
+  Reaping on staleness alone would kill legitimate long work, so the ceiling is off unless the caller
+  sets a bound it knows is safe for its own job. `OVERMIND_V2_CLAUDE_HARD_TIMEOUT_SECONDS` sets it
+  globally.
+
+Do not be tempted to reap on `tempo: "idle"` plus staleness without the in-flight guard. Measured
+against a real parent worker waiting on a subagent: the parent reported `tempo: "idle"` from the
+moment the subagent started, with `updatedAt` frozen for over three minutes, while `inFlight` held
+`local_agent` and `local_bash`. Without the in-flight check that parent would have been killed
+mid-flight, taking its subagent's work with it.
 
 A related launch detail: `--model` is passed only when a job specifies one, so workers inherit the
 operator's configured default instead of a tier hardcoded in the adapter.

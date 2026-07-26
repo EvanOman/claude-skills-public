@@ -99,7 +99,14 @@ class ClaudeIdleReaperTest(unittest.TestCase):
     forever, so `await` never satisfies and `reply` refuses to continue it.
     """
 
-    def reconcile(self, *, age_seconds: float, grace: object = None, **fields: object):
+    def reconcile(
+        self,
+        *,
+        age_seconds: float,
+        grace: object = None,
+        hard_timeout: object = None,
+        **fields: object,
+    ):
         with tempfile.TemporaryDirectory(prefix="overmind-v2-idle.") as root:
             job_dir = Path(root) / "job"
             job_dir.mkdir()
@@ -118,7 +125,14 @@ class ClaudeIdleReaperTest(unittest.TestCase):
                 "provider_job_id": "deadbeef",
                 "provider_state_path": str(state_path),
                 "brief_path": str(job_dir / "brief.md"),
-                "provider_payload": {} if grace is None else {"idle_grace_seconds": grace},
+                "provider_payload": {
+                    **({} if grace is None else {"idle_grace_seconds": grace}),
+                    **(
+                        {}
+                        if hard_timeout is None
+                        else {"idle_hard_timeout_seconds": hard_timeout}
+                    ),
+                },
             }
             stopped: list[list[str]] = []
             provider = ClaudeProvider()
@@ -174,6 +188,48 @@ class ClaudeIdleReaperTest(unittest.TestCase):
         update, _, _ = self.reconcile(age_seconds=120, grace=60)
 
         self.assertEqual("unknown", update["state"])
+
+    def test_a_busy_worker_is_never_reaped_by_the_default_grace(self) -> None:
+        """Measured: a parent waiting on a subagent reports tempo idle for minutes.
+
+        Its inFlight carries the subagent and its shell, and updatedAt does not move
+        while a tool call runs, so idleness plus staleness alone would kill a parent
+        mid-flight. Only the in-flight guard prevents that.
+        """
+
+        update, stopped, _ = self.reconcile(
+            age_seconds=9000,
+            tempo="idle",
+            inFlight={"tasks": 2, "queued": 0, "kinds": ["local_agent", "local_bash"]},
+        )
+
+        self.assertEqual("running", update["state"])
+        self.assertEqual([], stopped)
+
+    def test_the_hard_timeout_is_off_unless_the_caller_sets_it(self) -> None:
+        update, _, _ = self.reconcile(
+            age_seconds=9000, inFlight={"tasks": 1, "queued": 0}
+        )
+
+        self.assertEqual("running", update["state"])
+
+    def test_the_hard_timeout_reaps_a_permanently_busy_worker(self) -> None:
+        update, stopped, _ = self.reconcile(
+            age_seconds=9000,
+            inFlight={"tasks": 1, "queued": 0, "kinds": ["local_bash"]},
+            hard_timeout=600,
+        )
+
+        self.assertEqual("unknown", update["state"])
+        self.assertIn("made no progress", update["error"])
+        self.assertEqual([["deadbeef"]], stopped)
+
+    def test_a_busy_worker_within_its_hard_timeout_keeps_running(self) -> None:
+        update, _, _ = self.reconcile(
+            age_seconds=120, inFlight={"tasks": 1, "queued": 0}, hard_timeout=600
+        )
+
+        self.assertEqual("running", update["state"])
 
     def test_a_genuinely_finished_worker_still_succeeds(self) -> None:
         update, stopped, _ = self.reconcile(

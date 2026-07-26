@@ -61,6 +61,17 @@ JOB_PROPERTIES: dict[str, Any] = {
             "it. Set 0 to disable reaping for a long-idling job."
         ),
     },
+    "idle_hard_timeout_seconds": {
+        "type": "number",
+        "minimum": 0,
+        "description": (
+            "Opt-in ceiling, disabled by default. Ends a worker that has made no "
+            "progress for this long even when the CLI still reports a task in "
+            "flight, which happens when an in-flight counter is never cleared. Off "
+            "by default because a genuinely long tool call looks identical, so only "
+            "the caller knows a safe upper bound for its own job."
+        ),
+    },
     "isolate_worker_config": {
         "type": "boolean",
         "default": True,
@@ -221,6 +232,9 @@ TOOLS: list[dict[str, Any]] = [
                 "permission_mode": JOB_PROPERTIES["permission_mode"],
                 "workspace_note": JOB_PROPERTIES["workspace_note"],
                 "idle_grace_seconds": JOB_PROPERTIES["idle_grace_seconds"],
+                "idle_hard_timeout_seconds": JOB_PROPERTIES[
+                    "idle_hard_timeout_seconds"
+                ],
                 "isolate_worker_config": JOB_PROPERTIES["isolate_worker_config"],
             },
             "additionalProperties": False,

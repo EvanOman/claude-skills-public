@@ -38,6 +38,7 @@ class Broker:
         "isolate_worker_config",
         "workspace_note",
         "idle_grace_seconds",
+        "idle_hard_timeout_seconds",
     )
 
     def __init__(

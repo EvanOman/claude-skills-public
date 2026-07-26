@@ -88,6 +88,12 @@ here means exactly what it says: the work may well be complete, but nothing repo
 the artifacts the brief asked for before trusting or redoing it. Raise `idle_grace_seconds` for a
 job that legitimately sits idle, or set 0 to disable reaping for it.
 
+Reaping requires the CLI to report no work in flight, which matters more than it sounds: a parent
+waiting on a subagent reports `tempo: "idle"` for the whole wait, so idleness alone would kill
+orchestrating workers mid-flight. A worker the CLI still reports as busy is therefore never reaped by
+default, even if it is genuinely hung. Set `idle_hard_timeout_seconds` on a job when you know its real
+upper bound and want that case ended too.
+
 ## Use the command surface
 
 Use `$SKILL_ROOT/scripts/om --help` for the human CLI and `$SKILL_ROOT/scripts/overmind-v2-mcp` for

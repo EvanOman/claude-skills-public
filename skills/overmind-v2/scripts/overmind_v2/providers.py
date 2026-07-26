@@ -492,6 +492,28 @@ class ClaudeProvider(Provider):
                 continue
         return CLAUDE_IDLE_GRACE_SECONDS
 
+    def _hard_timeout_seconds(self, job: dict[str, Any]) -> float:
+        """Opt-in ceiling on a worker the CLI still reports as busy.
+
+        A worker can sit at inFlight tasks > 0 indefinitely: the CLI's counter is not
+        always decremented when the underlying process exits, so a finished worker can
+        look permanently busy. Reaping that case cannot be a default, because a genuinely
+        long tool call -- a full test suite, say -- also freezes updatedAt and is
+        indistinguishable from a hang. Only the caller knows what its job should take.
+        """
+
+        for candidate in (
+            self._job_option(job, "idle_hard_timeout_seconds"),
+            os.environ.get("OVERMIND_V2_CLAUDE_HARD_TIMEOUT_SECONDS"),
+        ):
+            if candidate is None or candidate == "":
+                continue
+            try:
+                return max(0.0, float(candidate))
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
     def _stop_quietly(self, provider_id: str) -> None:
         """Best-effort release of a session the broker has decided is finished."""
 
@@ -787,24 +809,34 @@ class ClaudeProvider(Provider):
         else:
             state = "unknown"
         reaped_after: float | None = None
+        reaped_reason = ""
         if state == "running":
+            observed = _parse_cli_timestamp(value.get("updatedAt"))
+            if observed is None:
+                observed = state_path.stat().st_mtime
+            idle_for = time.time() - observed
             grace = self._idle_grace_seconds(job)
-            if grace > 0 and self._is_quiescent(value):
-                observed = _parse_cli_timestamp(value.get("updatedAt"))
-                if observed is None:
-                    observed = state_path.stat().st_mtime
-                idle_for = time.time() - observed
-                if idle_for >= grace:
-                    # The turn has ended without a final message. Left alone this
-                    # job never reaches a terminal state, so `await` hangs and
-                    # `reply` refuses to continue it.
-                    reaped_after = idle_for
-                    state = "unknown"
-                    provider_id = value.get(
-                        "daemonShort", value.get("id", job.get("provider_job_id"))
-                    )
-                    if provider_id:
-                        self._stop_quietly(str(provider_id))
+            hard_timeout = self._hard_timeout_seconds(job)
+            if grace > 0 and idle_for >= grace and self._is_quiescent(value):
+                # The turn ended without a final message. Left alone this job never
+                # reaches a terminal state, so `await` hangs and `reply` refuses to
+                # continue it.
+                reaped_after = idle_for
+                reaped_reason = "stopped working"
+            elif hard_timeout > 0 and idle_for >= hard_timeout:
+                # Opt-in ceiling for a worker the CLI still reports as busy. A tool
+                # call that has genuinely hung looks identical to one that is simply
+                # slow, and inFlight can stay non-zero after the underlying process
+                # has already exited, so only the caller knows a real upper bound.
+                reaped_after = idle_for
+                reaped_reason = "made no progress"
+            if reaped_after is not None:
+                state = "unknown"
+                provider_id = value.get(
+                    "daemonShort", value.get("id", job.get("provider_job_id"))
+                )
+                if provider_id:
+                    self._stop_quietly(str(provider_id))
         update: dict[str, Any] = {
             "state": state,
             "provider_job_id": value.get(
@@ -843,7 +875,7 @@ class ClaudeProvider(Provider):
             }
         if reaped_after is not None:
             update["error"] = (
-                f"worker stopped working {reaped_after:.0f}s ago without reporting a "
+                f"worker {reaped_reason} for {reaped_after:.0f}s without reporting a "
                 "final message; the broker ended the session. Its outcome is "
                 "unverified: check the artifacts it was asked to produce."
             )
