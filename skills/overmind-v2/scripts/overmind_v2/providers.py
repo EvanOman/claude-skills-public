@@ -404,6 +404,52 @@ class FakeProvider(Provider):
 
 DEFAULT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
 
+# CLI states that mean the turn is still in motion. Kept as a named set because
+# both the state mapping and the "unrecognized state" grace test against it.
+CLAUDE_RUNNING_STATES = frozenset(
+    {
+        "working",
+        "running",
+        "starting",
+        "queued",
+        "waiting",
+        "idle",
+        "respawning",
+        "restarting",
+    }
+)
+
+# Default ceiling on a worker whose state file has stopped changing while the CLI
+# still claims work in flight. This bounds silence, not runtime: the CLI rewrites
+# state.json on every message and tool result, so any worker that is actually
+# making progress resets the clock. An hour of a completely frozen state file is
+# longer than the longest legitimately silent single tool call measured here (a
+# full Lean `lake build`, a full pytest run), and it replaces the previous
+# behavior where a wedged worker could sit unbounded -- one measured job held a
+# non-terminal record for 39 hours. Raise it per job when a single step really can
+# be silent for longer; 0 disables the ceiling.
+CLAUDE_HARD_TIMEOUT_SECONDS = 3600.0
+
+# The transcript is flushed after the CLI marks its state file terminal, so a job
+# finalized the instant it goes terminal reads a transcript that is missing the
+# worker's last message. Measured: a report written at :41.5 and a terminal marker
+# at :43.4 were still not both on disk when the broker read at :44. Recording the
+# wrong last message is permanent, because a terminal job is never reconciled
+# again, so wait for the file to go quiet -- and stop waiting at the ceiling, since
+# a transcript that never settles must not hold a finished job open forever.
+CLAUDE_TRANSCRIPT_QUIET_SECONDS = 2.0
+CLAUDE_FINALIZE_CEILING_SECONDS = 30.0
+
+# A terminal Claude job whose result artifact is smaller than this did not report
+# a work product. Measured over 188 broker-launched Claude jobs: the median
+# `succeeded` artifact was 138 bytes of CLI progress note ("approve 1 new project
+# MCP server (grafana)", "awaiting write permission"), and only 4.8% carried a
+# real report. Calling those `succeeded` is worse than calling them unknown,
+# because the orchestrator trusts the state, skips verification, and re-dispatches
+# the same brief later. Set `min_result_bytes: 0` on a job whose deliverable is
+# genuinely a one-word verdict.
+CLAUDE_MIN_RESULT_BYTES = 300
+
 # A Claude worker that finishes its work but never emits a final message parks at
 # state "working" forever: tempo goes "idle", inFlight empties, and the CLI stops
 # updating its state file. That is distinct from "blocked" (which waits on operator
@@ -499,18 +545,21 @@ class ClaudeProvider(Provider):
         return CLAUDE_IDLE_GRACE_SECONDS
 
     def _hard_timeout_seconds(self, job: dict[str, Any]) -> float:
-        """Opt-in ceiling on a worker the CLI still reports as busy.
+        """Ceiling on a worker the CLI still reports as busy.
 
         A worker can sit at inFlight tasks > 0 indefinitely: the CLI's counter is not
         always decremented when the underlying process exits, so a finished worker can
-        look permanently busy. Reaping that case cannot be a default, because a genuinely
-        long tool call -- a full test suite, say -- also freezes updatedAt and is
-        indistinguishable from a hang. Only the caller knows what its job should take.
+        look permanently busy and the quiescence reaper never touches it. This used to
+        be opt-in on the theory that a long tool call is indistinguishable from a hang,
+        and the result was that no job ever set it and wedged workers were never ended.
+        A default that bounds silence at an hour is strictly better than no bound: it
+        cannot fire while a worker is emitting anything at all.
         """
 
         for candidate in (
             self._job_option(job, "idle_hard_timeout_seconds"),
             os.environ.get("OVERMIND_V2_CLAUDE_HARD_TIMEOUT_SECONDS"),
+            CLAUDE_HARD_TIMEOUT_SECONDS,
         ):
             if candidate is None or candidate == "":
                 continue
@@ -518,7 +567,48 @@ class ClaudeProvider(Provider):
                 return max(0.0, float(candidate))
             except (TypeError, ValueError):
                 continue
-        return 0.0
+        return CLAUDE_HARD_TIMEOUT_SECONDS
+
+    def _min_result_bytes(self, job: dict[str, Any]) -> int:
+        for candidate in (
+            self._job_option(job, "min_result_bytes"),
+            os.environ.get("OVERMIND_V2_CLAUDE_MIN_RESULT_BYTES"),
+            CLAUDE_MIN_RESULT_BYTES,
+        ):
+            if candidate is None or candidate == "":
+                continue
+            try:
+                return max(0, int(float(candidate)))
+            except (TypeError, ValueError):
+                continue
+        return CLAUDE_MIN_RESULT_BYTES
+
+    @staticmethod
+    def _mcp_arguments(job: dict[str, Any]) -> list[str]:
+        """Isolate a worker from the operator's MCP configuration.
+
+        A background worker has no TTY, so a server it has not already approved
+        stops the turn dead: three measured jobs "succeeded" in under five seconds
+        with a 64-byte artifact reading "approve 1 new project MCP server (grafana)
+        -- attach to respond". `--strict-mcp-config` makes the worker use only the
+        servers named on its own command line, so a project `.mcp.json` the operator
+        happens to have cannot introduce a prompt nothing can answer. A job that
+        genuinely needs a server passes `mcp_config` and gets exactly that server.
+        """
+
+        if ClaudeProvider._job_option(job, "strict_mcp_config") is False:
+            return []
+        configs = ClaudeProvider._job_option(job, "mcp_config")
+        if configs is None:
+            selected: list[str] = []
+        elif isinstance(configs, (list, tuple)):
+            selected = [str(item) for item in configs if str(item)]
+        else:
+            selected = [str(configs)]
+        arguments = ["--strict-mcp-config"]
+        for config in selected:
+            arguments += ["--mcp-config", config]
+        return arguments
 
     def _stop_quietly(self, provider_id: str) -> None:
         """Best-effort release of a session the broker has decided is finished."""
@@ -552,11 +642,134 @@ class ClaudeProvider(Provider):
         return f"{brief}\n\n---\n\n{WORKSPACE_NOTE}\n"
 
     @staticmethod
+    def _settings_arguments(job: dict[str, Any]) -> list[str]:
+        """Turn off the CLI's background worktree-isolation guard.
+
+        The guard refuses a background session's first Write with "This background
+        session hasn't isolated its changes yet. Call EnterWorktree first", which is
+        precisely what a broker-launched worker must not do: the orchestrator has
+        already assigned it a directory and is watching that branch. bypassPermissions
+        does not cover it, because it is a workspace policy rather than a permission
+        prompt. Measured cost of leaving it on: a worker finished an 85,000-token
+        audit and then sat blocked for 39 hours on "Approve Write for
+        experiments/... , or use EnterWorktree, or take summary as-is".
+
+        Left on for a job that passed `workspace_note: false`, which is how a caller
+        says the worker is responsible for isolating itself.
+        """
+
+        if ClaudeProvider._job_option(job, "workspace_note") is False:
+            return []
+        return ["--settings", json.dumps({"worktree": {"bgIsolation": "none"}})]
+
+    @staticmethod
     def _job_option(job: dict[str, Any], key: str) -> Any:
         payload = job.get("provider_payload")
         if isinstance(payload, dict) and payload.get(key) is not None:
             return payload[key]
         return None
+
+    @staticmethod
+    def _transcript_path(value: dict[str, Any]) -> Path | None:
+        """Locate the worker's own session transcript.
+
+        The CLI records it as `linkScanPath`; the session id plus the projects
+        directory is the fallback for a state file written before that field
+        existed.
+        """
+
+        link = value.get("linkScanPath")
+        if isinstance(link, str) and link and Path(link).is_file():
+            return Path(link)
+        session = value.get("sessionId") or value.get("resumeSessionId")
+        if not session:
+            return None
+        root = (
+            Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+            / "projects"
+        )
+        matches = sorted(root.glob(f"*/{session}.jsonl"))
+        return matches[-1] if matches else None
+
+    @staticmethod
+    def _settled_for(value: dict[str, Any]) -> float:
+        """Seconds since the CLI first reported this session terminal."""
+
+        for key in ("firstTerminalAt", "updatedAt"):
+            observed = _parse_cli_timestamp(value.get(key))
+            if observed is not None:
+                return max(0.0, time.time() - observed)
+        return float("inf")
+
+    @staticmethod
+    def _transcript_settled(value: dict[str, Any]) -> bool:
+        """True when the transcript can be trusted to hold the worker's last word."""
+
+        path = ClaudeProvider._transcript_path(value)
+        if path is None:
+            return True
+        settled_for = ClaudeProvider._settled_for(value)
+        if settled_for >= CLAUDE_FINALIZE_CEILING_SECONDS:
+            return True
+        try:
+            quiet_for = time.time() - path.stat().st_mtime
+        except OSError:
+            return True
+        return (
+            quiet_for >= CLAUDE_TRANSCRIPT_QUIET_SECONDS
+            and settled_for >= CLAUDE_TRANSCRIPT_QUIET_SECONDS
+        )
+
+    @staticmethod
+    def _final_assistant_message(value: dict[str, Any]) -> str | None:
+        """The worker's actual last word, not the CLI's headline for it.
+
+        `output.result` is a one-line summary the CLI asks the worker to write for
+        its job list -- "hello.txt contains OK" -- and recording that as the result
+        artifact is why broker-launched Claude jobs returned a 138-byte median while
+        Codex returned 1,929. The final assistant message in the session transcript
+        is the report the brief actually asked for, and it is what the Codex adapter
+        already captures (`messages[-1]`). Sidechain records are subagent turns, not
+        the worker's own conclusion, so they are skipped.
+        """
+
+        path = ClaudeProvider._transcript_path(value)
+        if path is None:
+            return None
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        latest: str | None = None
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(record, dict) or record.get("isSidechain"):
+                continue
+            message = record.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                text = content.strip()
+            elif isinstance(content, list):
+                text = "\n\n".join(
+                    str(block.get("text", "")).strip()
+                    for block in content
+                    if isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and str(block.get("text", "")).strip()
+                ).strip()
+            else:
+                text = ""
+            if text:
+                latest = text
+        return latest
 
     def _supports_setting_sources(self) -> bool:
         if self._setting_sources_supported is None:
@@ -719,6 +932,17 @@ class ClaudeProvider(Provider):
             *(["--model", str(job["model"])] if job.get("model") else []),
             "--permission-mode",
             permission_mode,
+            # bypassPermissions is only selectable when the CLI has been told the
+            # operator accepts it; without this flag the requested mode can be
+            # refused and the worker falls back to prompting, which a background
+            # session has no way to answer.
+            *(
+                ["--allow-dangerously-skip-permissions"]
+                if permission_mode == "bypassPermissions"
+                else []
+            ),
+            *self._mcp_arguments(job),
+            *self._settings_arguments(job),
             "--name",
             f"overmind-{job['short_id']}",
             "--",
@@ -805,25 +1029,31 @@ class ClaudeProvider(Provider):
         if observed is None:
             observed = state_path.stat().st_mtime
         idle_for = time.time() - observed
+        created_at = float(job.get("created_at") or 0)
+        job_age = time.time() - created_at if created_at else float("inf")
         if raw_state in mapping:
             state = mapping[raw_state]
-        elif raw_state in {
-            "working",
-            "running",
-            "starting",
-            "queued",
-            "waiting",
-            "idle",
-            "respawning",
-            "restarting",
-        }:
+        elif raw_state in CLAUDE_RUNNING_STATES:
             state = "running"
-        elif idle_for < UNRECOGNIZED_STATE_GRACE_SECONDS:
+        elif (
+            idle_for < UNRECOGNIZED_STATE_GRACE_SECONDS
+            or job_age < UNRECOGNIZED_STATE_GRACE_SECONDS
+        ):
             # An unrecognized state is usually a transition, not an outcome. A worker
             # that takes a SIGTERM reports something unmapped and then respawns and
             # finishes normally; calling that terminal locks in a wrong verdict,
             # because a terminal job is never reconciled again and its real result is
             # discarded. Wait for the CLI to stop moving before judging it.
+            #
+            # The job's own age is part of that test because staleness alone misread
+            # eleven measured launches: each was declared terminal `unknown` with
+            # detail "SIGTERM (143); respawning" between five and twelve seconds after
+            # launch, while the state file carried an `updatedAt` older than the grace
+            # (the CLI hands a background session a pre-spawned host process, whose
+            # recorded timestamp predates this job). One of those workers was still
+            # running an hour later, doing exactly what it was asked. A job younger
+            # than the grace has not had time to produce an outcome, whatever its
+            # state file claims.
             state = "running"
         else:
             state = "unknown"
@@ -839,10 +1069,9 @@ class ClaudeProvider(Provider):
                 reaped_after = idle_for
                 reaped_reason = "stopped working"
             elif hard_timeout > 0 and idle_for >= hard_timeout:
-                # Opt-in ceiling for a worker the CLI still reports as busy. A tool
-                # call that has genuinely hung looks identical to one that is simply
-                # slow, and inFlight can stay non-zero after the underlying process
-                # has already exited, so only the caller knows a real upper bound.
+                # Ceiling for a worker the CLI still reports as busy. inFlight can
+                # stay non-zero after the underlying process has exited, so the
+                # quiescence test above never fires for a wedged worker.
                 reaped_after = idle_for
                 reaped_reason = "made no progress"
             if reaped_after is not None:
@@ -854,30 +1083,42 @@ class ClaudeProvider(Provider):
                     self._stop_quietly(str(provider_id))
         update: dict[str, Any] = {
             "state": state,
+            "raw_state": raw_state,
             "provider_job_id": value.get(
                 "daemonShort", value.get("id", job.get("provider_job_id"))
             ),
             "provider_thread_id": value.get("sessionId", value.get("resumeSessionId")),
             "artifacts": [{"kind": "provider-state", "path": str(state_path)}],
         }
-        output = value.get("output")
         result: Any = None
-        if isinstance(output, dict) and "result" in output:
-            result = output["result"]
-        elif reaped_after is not None:
-            # Nothing structured was ever emitted; the CLI's own progress note is
-            # the only account of what the worker did.
-            result = value.get("detail")
-        elif raw_state == "blocked":
-            # No structured output when blocked; fall back to the CLI's own
-            # summary of what it is waiting on so the parent has something to
-            # judge instead of an empty artifact.
-            result = value.get("needs") or value.get("detail")
+        reported_work = False
+        if state in TERMINAL_STATES:
+            # Preference order is deliberate: the worker's own final message, then
+            # the CLI's one-line headline for it, then whatever note the CLI has.
+            # Only the first is a work product; the rest are descriptions of one.
+            if reaped_after is None and not self._transcript_settled(value):
+                # The state file goes terminal before the last assistant record is
+                # flushed. Finalizing inside that window records an earlier message,
+                # or the CLI's headline, as the worker's report. Look again next poll.
+                update["state"] = "running"
+                return update
+            final_message = self._final_assistant_message(value)
+            output = value.get("output")
+            if final_message:
+                result = final_message
+                reported_work = True
+            elif isinstance(output, dict) and output.get("result") is not None:
+                result = output["result"]
+            elif raw_state == "blocked":
+                # The turn ended waiting on the operator and produced no report.
+                # Keep what it is waiting on so the parent has something to judge.
+                result = value.get("needs") or value.get("detail")
+            elif reaped_after is not None:
+                result = value.get("detail")
         if state in TERMINAL_STATES and result is not None:
             result_path = Path(job["brief_path"]).parent / "result.md"
-            write_private(
-                result_path, result if isinstance(result, str) else json.dumps(result)
-            )
+            body = result if isinstance(result, str) else json.dumps(result)
+            write_private(result_path, body)
             update["result_path"] = str(result_path)
             update["artifacts"].append({"kind": "result", "path": str(result_path)})
         usage = value.get("usage")
@@ -895,10 +1136,55 @@ class ClaudeProvider(Provider):
                 "unverified: check the artifacts it was asked to produce."
             )
             return update
+        thin = self._thin_result_error(job, state, result, reported_work)
+        if thin:
+            update["state"] = "unknown"
+            update["error"] = thin
+            return update
         detail = value.get("detail", value.get("error"))
         if detail and state in {"failed", "unknown", "interrupted"}:
             update["error"] = str(detail)
         return update
+
+    def _thin_result_error(
+        self,
+        job: dict[str, Any],
+        state: str,
+        result: Any,
+        reported_work: bool,
+    ) -> str | None:
+        """Refuse to call a job that reported nothing a success.
+
+        A `succeeded` job is never reconciled again and the orchestrator is told to
+        trust it, so a success with no work product is the most expensive possible
+        misreport: the brief looks done, nothing verifies it, and the same work is
+        dispatched again later. `unknown` says what is actually true -- the work may
+        be finished, but nothing reported it, so check the artifacts.
+        """
+
+        if state != "succeeded":
+            return None
+        minimum = self._min_result_bytes(job)
+        if minimum <= 0:
+            return None
+        body = "" if result is None else (
+            result if isinstance(result, str) else json.dumps(result)
+        )
+        size = len(body.strip().encode("utf-8"))
+        if size >= minimum:
+            return None
+        source = (
+            "its own final message"
+            if reported_work
+            else "a CLI progress note, not a report from the worker"
+        )
+        return (
+            f"worker ended with a {size}-byte result ({source}), below the "
+            f"{minimum}-byte minimum for a reported work product; the outcome is "
+            "unverified. Check the artifacts the brief asked for, then treat this "
+            "job as done or continue it with reply. Set min_result_bytes: 0 for a "
+            "job whose deliverable really is this short."
+        )
 
     def interrupt(self, job: dict[str, Any]) -> dict[str, Any]:
         provider_id = job.get("provider_job_id")

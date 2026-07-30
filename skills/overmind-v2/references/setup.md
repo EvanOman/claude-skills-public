@@ -24,7 +24,7 @@ under `~/.local/state/overmind-v2/` until explicitly forgotten or archived.
 
 ## Claude worker launch options
 
-`run`, `run_many`, and `reply` accept five Claude-specific, per-job options. All are ignored by
+`run`, `run_many`, and `reply` accept the Claude-specific, per-job options below. All are ignored by
 non-Claude providers. Set them on an individual job, or at the request's top level as a default for
 jobs that omit them; `reply` inherits the parent job's values unless the continuation overrides them.
 
@@ -33,7 +33,29 @@ jobs that omit them; `reply` inherits the parent job's values unless the continu
   calls with no TTY to answer a prompt; a denied worker parks itself in the CLI's `blocked` state and
   never progresses on its own, which every recovery required an explicit `stop`. `bypassPermissions`
   lets a worker act on its brief and reach a terminal state unattended. Pass `acceptEdits`, `auto`,
-  `dontAsk`, `manual`, or `plan` to opt back into a narrower mode for a specific job.
+  `dontAsk`, `manual`, or `plan` to opt back into a narrower mode for a specific job. When the mode
+  is `bypassPermissions` the launch also passes `--allow-dangerously-skip-permissions`, because
+  selecting the mode is not by itself enough for the CLI to allow it; without that flag the request
+  can be refused and the worker silently falls back to prompting.
+
+- `strict_mcp_config` (default `true`) and `mcp_config` (default none): a worker is launched with
+  `--strict-mcp-config`, so it sees only the MCP servers named in its own `mcp_config` and none of
+  the operator's user- or project-scope configuration. A background worker cannot answer a server
+  approval prompt: three measured jobs reached a terminal state in under five seconds with a 64-byte
+  artifact reading "approve 1 new project MCP server (grafana) — attach to respond", because the
+  assigned worktree happened to contain a `.mcp.json`. Pass `mcp_config` (a path, inline JSON, or a
+  list) to hand a worker exactly the servers its brief needs. Set `strict_mcp_config: false` only
+  when a worker is meant to inherit everything the operator has configured, and accept that an
+  unapproved server will stall it.
+
+- `min_result_bytes` (default `300`): the smallest result artifact reported as `succeeded` rather
+  than `unknown`. Measured over 188 broker-launched Claude jobs, the median `succeeded` artifact was
+  138 bytes of CLI progress note and only 4.8% carried a real report; Codex's median over the same
+  window was 1,929 bytes. A `succeeded` job is never reconciled again and the orchestrator is told to
+  trust it, so a success with no readable work product is the most expensive misreport available: the
+  brief looks done, nothing verifies it, and the same work is dispatched again later. Reporting it
+  `unknown` says what is actually true. Set `0` for a job whose deliverable really is a one-word
+  verdict.
 - `isolate_worker_config` (default `true`): launches the worker without the operator's user-level
   Claude settings, hooks, and plugins, so a SessionStart hook or a standing workflow skill (TDD
   ritual, worktree setup, brainstorming prompt, etc.) doesn't consume the worker's turn before it
@@ -49,6 +71,15 @@ jobs that omit them; `reply` inherits the parent job's values unless the continu
   stranded where the orchestrator is not looking, and the assigned branch appears untouched. Set
   `workspace_note: false` when a worker is supposed to manage its own worktree.
 
+  Telling the worker is not enough on its own, because the CLI enforces the opposite. A background
+  session's first `Write` is refused by a workspace guard — "This background session hasn't isolated
+  its changes yet. Call EnterWorktree first" — and `bypassPermissions` does not cover it, because it
+  is workspace policy rather than a permission prompt. The measured cost: a worker finished an
+  85,000-token audit, was refused the write, and sat blocked for 39 hours on "Approve Write for
+  experiments/… , or use EnterWorktree, or take summary as-is". The launch therefore also passes
+  `--settings '{"worktree": {"bgIsolation": "none"}}'`. `workspace_note: false` leaves the guard on,
+  since that is how a caller says the worker is responsible for isolating itself.
+
 - `idle_grace_seconds` (default `300`): how long a worker may sit with no turn in progress before the
   broker ends its session and reports it terminal. The Claude CLI parks a worker that completed its
   work without emitting a final message at `state: "working"` with `tempo: "idle"`, an empty
@@ -60,15 +91,17 @@ jobs that omit them; `reply` inherits the parent job's values unless the continu
   the orchestrator should verify the brief's artifacts. The worker's last progress note is kept as
   the result artifact. Set a larger value for a job that legitimately idles, or `0` to disable.
 
-- `idle_hard_timeout_seconds` (default `0`, disabled): ends a worker that has made no progress for
-  this long *even while the CLI reports a task in flight*. Two measured facts make this necessary and
-  make it opt-in. First, a worker can sit at `inFlight: {tasks: 1}` permanently: the counter is not
-  always cleared when the underlying process exits, so a finished worker looks busy forever and the
-  quiescence reaper above will never touch it. Second, `updatedAt` does not advance during a tool
-  call, so a worker running a thirty-minute test suite is indistinguishable from one that has hung.
-  Reaping on staleness alone would kill legitimate long work, so the ceiling is off unless the caller
-  sets a bound it knows is safe for its own job. `OVERMIND_V2_CLAUDE_HARD_TIMEOUT_SECONDS` sets it
-  globally.
+- `idle_hard_timeout_seconds` (default `3600`): ends a worker whose state file has stopped changing
+  for this long *even while the CLI reports a task in flight*. A worker can sit at
+  `inFlight: {tasks: 1}` permanently, because the counter is not always cleared when the underlying
+  process exits, so a finished or wedged worker looks busy forever and the quiescence reaper above
+  never touches it. This ceiling was originally opt-in, on the argument that `updatedAt` does not
+  advance during a tool call and a thirty-minute test suite is indistinguishable from a hang. The
+  measured consequence of that argument was that not one of 188 jobs ever set it, and a wedged worker
+  held a non-terminal record for 39 hours. An hour is a bound on *silence*, not on runtime: the CLI
+  rewrites the state file on every message and tool result, so this cannot fire while a worker is
+  producing anything at all. Raise it for a job with a single legitimately silent step longer than an
+  hour; `0` disables it. `OVERMIND_V2_CLAUDE_HARD_TIMEOUT_SECONDS` sets it globally.
 
 Do not be tempted to reap on `tempo: "idle"` plus staleness without the in-flight guard. Measured
 against a real parent worker waiting on a subagent: the parent reported `tempo: "idle"` from the
@@ -101,20 +134,71 @@ hook if you want it every time.
 
 A CLI state the adapter does not map is treated as still-running for
 `UNRECOGNIZED_STATE_GRACE_SECONDS` (60) and only settles to `unknown` once the state file
-stops changing. This exists because of an observed misreport: a worker took a SIGTERM,
-reported `SIGTERM (143); respawning`, was recorded terminal as `unknown` -- and then
-respawned and committed its work correctly. A terminal job is never reconciled again, so
-the broker permanently reported a successful worker as failed and discarded its result.
-`respawning` and `restarting` are now mapped to running outright; the grace covers whatever
-else the CLI may emit mid-transition. Genuine `failed`/`stopped` states are still reported
-immediately, since they are mapped explicitly.
+stops changing **and** the job itself is older than the grace. This exists because of an
+observed misreport: a worker took a SIGTERM, reported `SIGTERM (143); respawning`, was
+recorded terminal as `unknown` -- and then respawned and committed its work correctly. A
+terminal job is never reconciled again, so the broker permanently reported a successful
+worker as failed and discarded its result. `respawning` and `restarting` are now mapped to
+running outright; the grace covers whatever else the CLI may emit mid-transition. Genuine
+`failed`/`stopped` states are still reported immediately, since they are mapped explicitly.
+
+Staleness alone was not enough. Eleven measured launches were declared terminal `unknown`
+with that same `SIGTERM (143); respawning` detail between five and twelve seconds after
+launch, on the *first* reconcile — the state file already carried an `updatedAt` older than
+the grace, so the staleness test passed instantly. The CLI hands a background session a
+pre-spawned host process (`claude bg-spare`, visible in `ps`), and the timestamp the adapter
+reads at that moment predates the job. One of those eleven workers was verified still
+running, correctly, an hour after the broker had written it off. A job younger than the
+grace therefore cannot settle to `unknown`, whatever its state file claims.
+
+The provider's unnormalized state string is now recorded on every state-change event as
+`provider_raw_state`, because that is the one fact needed to diagnose a bad `unknown` and it
+was not recoverable from the surrounding detail text.
+
+### `database is locked` is contention, not a dead worker
+
+Six measured jobs were reported permanently unobservable with
+`provider observation failed: database is locked`. Each per-job watcher writes on every
+observation, so a fan-out means many short write transactions competing for SQLite's single
+writer lock; `busy_timeout` covers most of that, but SQLite returns `SQLITE_BUSY` without
+consulting the busy handler when a transaction cannot start against a snapshot that has
+moved. Two changes: the store raises `busy_timeout` to 30s and retries a busy
+`BEGIN`/`COMMIT` for up to 30s, and a watcher no longer declares a job unobservable on the
+first failure — it backs off and retries, and gives up only after
+`OBSERVATION_FAILURE_LIMIT` (5) consecutive failures. Declaring a job terminal is
+irreversible, so it should never be the response to one transient error.
 
 A related launch detail: `--model` is passed only when a job specifies one, so workers inherit the
 operator's configured default instead of a tier hardcoded in the adapter.
 
-CLI equivalents: `om run --permission-mode <mode>`, `om run --no-isolate-worker-config`, and
-`om run --no-workspace-note` (the first two are also available on `om reply`). `run-many` and MCP callers set the same field names directly in the job
-object or request.
+CLI equivalents: `om run --permission-mode <mode>`, `om run --no-isolate-worker-config`,
+`om run --no-workspace-note`, `om run --mcp-config <path>`, `om run --no-strict-mcp-config`, and
+`om run --min-result-bytes <n>` (the permission and isolation flags are also available on
+`om reply`). `run-many` and MCP callers set the same field names directly in the job object or
+request.
+
+## What a Claude result artifact contains
+
+The artifact is the worker's **final assistant message**, read from its own session transcript
+(`linkScanPath` in the CLI's job state, or `~/.claude/projects/*/<sessionId>.jsonl`). Sidechain
+records are subagent turns, not the worker's conclusion, and are skipped.
+
+This is not the same thing as `output.result` in the CLI's job state, which is a one-line headline
+the CLI keeps for its job list — "hello.txt contains OK" for a job whose real report ran to several
+paragraphs. Recording that headline as the result is what produced a 138-byte median result for
+Claude workers against 1,929 for Codex, which has always captured its last agent message. The
+headline is still the fallback when no transcript is readable, followed by the CLI's `needs`/`detail`
+note for a blocked or reaped worker; both fallbacks are usually short enough to trip
+`min_result_bytes` and be reported `unknown`, which is the honest answer when the worker itself never
+said anything.
+
+Finalizing waits for the transcript to go quiet, because the CLI flushes it *after* marking its
+state file terminal. Measured: a report recorded at :41.5 with a terminal marker at :43.4 was still
+absent from the file when the broker read at :44, so the artifact captured was the worker's opening
+line. A terminal job is never reconciled again, so that loss is permanent — hence
+`CLAUDE_TRANSCRIPT_QUIET_SECONDS` (2) of no writes before finalizing, and
+`CLAUDE_FINALIZE_CEILING_SECONDS` (30) after which the job settles regardless, so a transcript that
+never quiets cannot hold a finished job open.
 
 ## Claude stall/blocked-turn reconciliation
 

@@ -5,6 +5,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,9 @@ class ClaudeProviderReconcileTest(unittest.TestCase):
             "provider_job_id": "deadbeef",
             "provider_state_path": str(state_path),
             "brief_path": str(job_dir / "brief.md"),
+            # The thin-result guard is exercised on its own in
+            # ClaudeThinResultTest; these cases are about state mapping.
+            "provider_payload": {"min_result_bytes": 0},
         }
         return ClaudeProvider().reconcile(job)
 
@@ -70,6 +74,7 @@ class ClaudeProviderReconcileTest(unittest.TestCase):
                 update = self.reconcile(raw_state, **{field: message}, **extra)
                 self.assertEqual(expected_state, update["state"])
                 self.assertEqual(message, update["error"])
+                self.assertEqual(raw_state, update["raw_state"])
 
     def test_blocked_turn_is_reported_terminal_with_final_message_as_result(self) -> None:
         # A worker denied a tool call (or genuinely needing guidance) ends its
@@ -230,19 +235,19 @@ class ClaudeIdleReaperTest(unittest.TestCase):
 
     def test_a_worker_with_a_turn_in_progress_is_never_reaped(self) -> None:
         update, stopped, _ = self.reconcile(
-            age_seconds=9000, inFlight={"tasks": 1, "queued": 0}
+            age_seconds=600, inFlight={"tasks": 1, "queued": 0}
         )
 
         self.assertEqual("running", update["state"])
         self.assertEqual([], stopped)
 
     def test_a_worker_that_is_not_idle_is_never_reaped(self) -> None:
-        update, _, _ = self.reconcile(age_seconds=9000, tempo="thinking")
+        update, _, _ = self.reconcile(age_seconds=600, tempo="thinking")
 
         self.assertEqual("running", update["state"])
 
     def test_reaping_can_be_disabled_per_job(self) -> None:
-        update, stopped, _ = self.reconcile(age_seconds=9000, grace=0)
+        update, stopped, _ = self.reconcile(age_seconds=600, grace=0)
 
         self.assertEqual("running", update["state"])
         self.assertEqual([], stopped)
@@ -261,7 +266,7 @@ class ClaudeIdleReaperTest(unittest.TestCase):
         """
 
         update, stopped, _ = self.reconcile(
-            age_seconds=9000,
+            age_seconds=600,
             tempo="idle",
             inFlight={"tasks": 2, "queued": 0, "kinds": ["local_agent", "local_bash"]},
         )
@@ -269,9 +274,26 @@ class ClaudeIdleReaperTest(unittest.TestCase):
         self.assertEqual("running", update["state"])
         self.assertEqual([], stopped)
 
-    def test_the_hard_timeout_is_off_unless_the_caller_sets_it(self) -> None:
+    def test_a_permanently_busy_worker_is_reaped_by_the_default_ceiling(self) -> None:
+        """The hard timeout used to be opt-in, so nothing ever set it.
+
+        Measured over 188 jobs: not one passed idle_hard_timeout_seconds, and a
+        wedged worker held a non-terminal record for 39 hours. The default bounds
+        silence, not runtime -- the CLI touches the state file on every message and
+        tool result -- so it cannot fire while a worker is doing anything.
+        """
+
+        update, stopped, _ = self.reconcile(
+            age_seconds=9000, inFlight={"tasks": 1, "queued": 0, "kinds": ["local_bash"]}
+        )
+
+        self.assertEqual("unknown", update["state"])
+        self.assertIn("made no progress", update["error"])
+        self.assertEqual([["deadbeef"]], stopped)
+
+    def test_a_busy_worker_within_the_default_ceiling_keeps_running(self) -> None:
         update, _, _ = self.reconcile(
-            age_seconds=9000, inFlight={"tasks": 1, "queued": 0}
+            age_seconds=1800, inFlight={"tasks": 1, "queued": 0}
         )
 
         self.assertEqual("running", update["state"])
@@ -294,9 +316,21 @@ class ClaudeIdleReaperTest(unittest.TestCase):
 
         self.assertEqual("running", update["state"])
 
+    def test_the_hard_timeout_can_be_disabled_per_job(self) -> None:
+        update, stopped, _ = self.reconcile(
+            age_seconds=9000,
+            inFlight={"tasks": 1, "queued": 0},
+            hard_timeout=0,
+        )
+
+        self.assertEqual("running", update["state"])
+        self.assertEqual([], stopped)
+
     def test_a_genuinely_finished_worker_still_succeeds(self) -> None:
         update, stopped, _ = self.reconcile(
-            age_seconds=9000, state="done", output={"result": "all done"}
+            age_seconds=9000,
+            state="done",
+            output={"result": "all done: " + "verified detail. " * 40},
         )
 
         self.assertEqual("succeeded", update["state"])
@@ -413,6 +447,283 @@ class ClaudeProviderLaunchOptionsTest(unittest.TestCase):
         )
 
         self.assertNotIn("EnterWorktree", argv[-1])
+
+    def test_bypass_permissions_is_launched_as_an_allowed_mode(self) -> None:
+        """Selecting the mode is not enough; the CLI must also be told it is allowed.
+
+        Without --allow-dangerously-skip-permissions the requested bypass can be
+        refused and the worker falls back to prompting, which a background session
+        with no TTY cannot answer.
+        """
+
+        argv = self.build_command()
+
+        self.assertIn("--allow-dangerously-skip-permissions", argv)
+
+    def test_a_narrower_permission_mode_does_not_allow_bypass(self) -> None:
+        argv = self.build_command(provider_payload={"permission_mode": "dontAsk"})
+
+        self.assertNotIn("--allow-dangerously-skip-permissions", argv)
+
+    def test_workers_get_no_inherited_mcp_servers(self) -> None:
+        """A project .mcp.json server stalls a worker on an unanswerable prompt.
+
+        Measured: three jobs "succeeded" in under five seconds with a 64-byte
+        artifact reading "approve 1 new project MCP server (grafana) -- attach to
+        respond".
+        """
+
+        argv = self.build_command()
+
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertNotIn("--mcp-config", argv)
+
+    def test_a_named_mcp_config_is_the_only_one_a_worker_gets(self) -> None:
+        argv = self.build_command(
+            provider_payload={"mcp_config": ["/tmp/a.json", "/tmp/b.json"]}
+        )
+
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(
+            ["/tmp/a.json", "/tmp/b.json"],
+            [argv[index + 1] for index, item in enumerate(argv) if item == "--mcp-config"],
+        )
+
+    def test_mcp_isolation_can_be_declined(self) -> None:
+        argv = self.build_command(provider_payload={"strict_mcp_config": False})
+
+        self.assertNotIn("--strict-mcp-config", argv)
+
+    def test_the_background_worktree_guard_is_disabled(self) -> None:
+        """The guard refuses the first Write until the worker isolates itself.
+
+        That is the opposite of what a broker-launched worker must do -- the
+        orchestrator already assigned it a directory -- and bypassPermissions does
+        not cover it, because it is workspace policy, not a permission prompt.
+        """
+
+        argv = self.build_command()
+
+        self.assertIn("--settings", argv)
+        self.assertEqual(
+            {"worktree": {"bgIsolation": "none"}},
+            json.loads(argv[argv.index("--settings") + 1]),
+        )
+
+    def test_a_worker_managing_its_own_worktree_keeps_the_guard(self) -> None:
+        argv = self.build_command(provider_payload={"workspace_note": False})
+
+        self.assertNotIn("--settings", argv)
+
+
+class ClaudeFinalMessageTest(unittest.TestCase):
+    """The result artifact must be the worker's report, not the CLI's headline.
+
+    `output.result` is a one-line summary the CLI keeps for its job list. Recording
+    it as the result is why broker-launched Claude jobs returned a 138-byte median
+    result while Codex, which captures its last agent message, returned 1,929.
+    """
+
+    def reconcile(self, transcript: list[dict[str, object]] | None, **fields: object):
+        with tempfile.TemporaryDirectory(prefix="overmind-v2-final.") as root:
+            job_dir = Path(root) / "job"
+            job_dir.mkdir()
+            state: dict[str, object] = {"state": "done", **fields}
+            if transcript is not None:
+                transcript_path = job_dir / "session.jsonl"
+                transcript_path.write_text(
+                    "\n".join(json.dumps(record) for record in transcript),
+                    encoding="utf-8",
+                )
+                state["linkScanPath"] = str(transcript_path)
+            state_path = job_dir / "state.json"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            update = ClaudeProvider().reconcile(
+                {
+                    "provider_job_id": "deadbeef",
+                    "provider_state_path": str(state_path),
+                    "brief_path": str(job_dir / "brief.md"),
+                    "provider_payload": {"min_result_bytes": 0},
+                }
+            )
+            written = (
+                Path(str(update["result_path"])).read_text(encoding="utf-8")
+                if update.get("result_path")
+                else None
+            )
+            return update, written
+
+    @staticmethod
+    def _assistant(text: str, **extra: object) -> dict[str, object]:
+        return {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+            **extra,
+        }
+
+    def test_the_final_assistant_message_beats_the_cli_summary(self) -> None:
+        _, written = self.reconcile(
+            [
+                self._assistant("Reading the file."),
+                {"type": "user", "message": {"role": "user", "content": "go on"}},
+                self._assistant("Full report: the arithmetic is sound to 8 figures."),
+            ],
+            output={"result": "arithmetic sound"},
+        )
+
+        self.assertEqual(
+            "Full report: the arithmetic is sound to 8 figures.", written
+        )
+
+    def test_a_subagent_turn_is_not_the_workers_conclusion(self) -> None:
+        _, written = self.reconcile(
+            [
+                self._assistant("The worker's own last word."),
+                self._assistant("A subagent's last word.", isSidechain=True),
+            ]
+        )
+
+        self.assertEqual("The worker's own last word.", written)
+
+    def test_the_cli_summary_is_the_fallback_when_no_transcript_exists(self) -> None:
+        _, written = self.reconcile(None, output={"result": "arithmetic sound"})
+
+        self.assertEqual("arithmetic sound", written)
+
+    def test_a_terminal_state_waits_for_the_transcript_to_settle(self) -> None:
+        """The transcript is flushed after the state file goes terminal.
+
+        Measured: a report recorded at :41.5 and a terminal marker at :43.4 were
+        still not both on disk when the broker read at :44, so the artifact captured
+        was the worker's *first* message. A terminal job is never reconciled again,
+        so that was permanent.
+        """
+
+        just_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        update, _ = self.reconcile(
+            [self._assistant("I'll run the steps in order.")],
+            output={"result": "arithmetic sound"},
+            firstTerminalAt=just_now,
+        )
+
+        self.assertEqual("running", update["state"])
+
+    def test_the_wait_for_the_transcript_is_bounded(self) -> None:
+        stale = (
+            (datetime.now(timezone.utc) - timedelta(seconds=60))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        update, written = self.reconcile(
+            [{"type": "user", "message": {"role": "user", "content": "go"}}],
+            output={"result": "arithmetic sound"},
+            firstTerminalAt=stale,
+        )
+
+        self.assertEqual("succeeded", update["state"])
+        self.assertEqual("arithmetic sound", written)
+
+
+class ClaudeThinResultTest(unittest.TestCase):
+    """A success nobody can read is worse than an honest `unknown`.
+
+    A `succeeded` job is never reconciled again and the orchestrator is told to
+    trust it, so a no-op success means the brief looks done, nothing verifies it,
+    and the same work is dispatched again later.
+    """
+
+    def reconcile(self, **fields: object):
+        with tempfile.TemporaryDirectory(prefix="overmind-v2-thin.") as root:
+            job_dir = Path(root) / "job"
+            job_dir.mkdir()
+            payload = dict(fields.pop("payload", {}) or {})  # type: ignore[arg-type]
+            state_path = job_dir / "state.json"
+            state_path.write_text(
+                json.dumps({"state": "done", **fields}), encoding="utf-8"
+            )
+            return ClaudeProvider().reconcile(
+                {
+                    "provider_job_id": "deadbeef",
+                    "provider_state_path": str(state_path),
+                    "brief_path": str(job_dir / "brief.md"),
+                    "provider_payload": payload,
+                }
+            )
+
+    def test_a_progress_note_is_not_a_reported_result(self) -> None:
+        update = self.reconcile(
+            state="blocked",
+            needs="approve 1 new project MCP server (grafana) — attach to respond",
+        )
+
+        self.assertEqual("unknown", update["state"])
+        self.assertIn("below the 300-byte minimum", update["error"])
+        self.assertIn("not a report from the worker", update["error"])
+
+    def test_a_substantive_result_still_succeeds(self) -> None:
+        update = self.reconcile(output={"result": "verified detail. " * 40})
+
+        self.assertEqual("succeeded", update["state"])
+        self.assertNotIn("error", update)
+
+    def test_the_minimum_can_be_waived_for_a_one_word_verdict(self) -> None:
+        update = self.reconcile(
+            output={"result": "APPROVE"}, payload={"min_result_bytes": 0}
+        )
+
+        self.assertEqual("succeeded", update["state"])
+
+    def test_a_job_that_produced_nothing_at_all_is_not_a_success(self) -> None:
+        update = self.reconcile(output=None)
+
+        self.assertEqual("unknown", update["state"])
+
+
+class ClaudeLaunchRaceTest(unittest.TestCase):
+    """A job younger than the grace has not had time to produce an outcome.
+
+    Measured eleven times: a worker was declared terminal `unknown` with detail
+    "SIGTERM (143); respawning" between five and twelve seconds after launch, while
+    its state file carried an `updatedAt` older than the grace. One of those workers
+    was still running an hour later, doing exactly what it was asked. Terminal jobs
+    are never reconciled again, so each verdict was permanent.
+    """
+
+    def reconcile(self, *, job_age: float | None):
+        with tempfile.TemporaryDirectory(prefix="overmind-v2-race.") as root:
+            job_dir = Path(root) / "job"
+            job_dir.mkdir()
+            stale = (
+                (datetime.now(timezone.utc) - timedelta(seconds=900))
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            state_path = job_dir / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "state": "handoff",
+                        "detail": "SIGTERM (143); respawning",
+                        "updatedAt": stale,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            job: dict[str, object] = {
+                "provider_job_id": "deadbeef",
+                "provider_state_path": str(state_path),
+                "brief_path": str(job_dir / "brief.md"),
+                "provider_payload": {},
+            }
+            if job_age is not None:
+                job["created_at"] = time.time() - job_age
+            return ClaudeProvider().reconcile(job)
+
+    def test_a_seconds_old_job_is_not_judged_on_a_stale_state_file(self) -> None:
+        self.assertEqual("running", self.reconcile(job_age=7)["state"])
+
+    def test_an_old_job_with_a_frozen_unmapped_state_still_settles(self) -> None:
+        self.assertEqual("unknown", self.reconcile(job_age=3600)["state"])
 
 
 if __name__ == "__main__":

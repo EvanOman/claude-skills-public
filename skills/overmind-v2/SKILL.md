@@ -72,16 +72,25 @@ treating it as still running.
 
 ## Claude worker defaults
 
-Claude workers launch with `permission_mode: bypassPermissions` and `isolate_worker_config: true` by
-default, so a background worker can act on its brief unattended and skips the operator's user-level
-skill/hook ceremony. Both are per-job options on `run`/`run-many`/`reply` (inherited by continuations
-unless overridden); see [references/setup.md](references/setup.md#claude-worker-launch-options) to
-opt into a narrower permission mode or the operator's full config. Prefer `dontAsk` for read-only
-auditors and reviewers, and say in the brief that the work is read-only.
+Claude workers launch with `permission_mode: bypassPermissions`, `isolate_worker_config: true`, and
+`strict_mcp_config: true` by default. A background worker has no TTY, so anything that asks it a
+question ends its turn: a permission prompt, a session-start hook, or an MCP server it has not
+approved. Those defaults remove all three, and the worker acts on its brief unattended. All are
+per-job options on `run`/`run-many`/`reply` (inherited by continuations unless overridden); see
+[references/setup.md](references/setup.md#claude-worker-launch-options) to opt into a narrower
+permission mode, the operator's full config, or a specific `mcp_config`. Prefer `dontAsk` for
+read-only auditors and reviewers, and say in the brief that the work is read-only.
 
-A worker whose `cwd` is a git checkout is also told not to create its own nested worktree, so its
-commits land on the branch you assigned rather than one you are not watching. Keep assigning one
-worktree per writer yourself; pass `workspace_note: false` when a worker must manage its own.
+A worker's result artifact is its own final assistant message, not the CLI's one-line headline for
+it. A terminal job whose artifact is under `min_result_bytes` (default 300) is reported `unknown`
+rather than `succeeded`: nothing readable was reported, so the outcome is unverified and the brief's
+artifacts are what to check.
+
+A worker whose `cwd` is a git checkout is also told not to create its own nested worktree, and the
+CLI's background worktree-isolation guard — which otherwise refuses its first write until it calls
+`EnterWorktree` — is turned off, so its commits land on the branch you assigned rather than one you
+are not watching. Keep assigning one worktree per writer yourself; pass `workspace_note: false` when
+a worker must manage its own, which also restores the guard.
 
 Omit `model` unless a job genuinely needs a specific one, so workers inherit the configured default
 rather than a hardcoded tier.
@@ -95,9 +104,10 @@ job that legitimately sits idle, or set 0 to disable reaping for it.
 
 Reaping requires the CLI to report no work in flight, which matters more than it sounds: a parent
 waiting on a subagent reports `tempo: "idle"` for the whole wait, so idleness alone would kill
-orchestrating workers mid-flight. A worker the CLI still reports as busy is therefore never reaped by
-default, even if it is genuinely hung. Set `idle_hard_timeout_seconds` on a job when you know its real
-upper bound and want that case ended too.
+orchestrating workers mid-flight. A worker the CLI still reports as busy is ended instead by
+`idle_hard_timeout_seconds` (default 3600), which bounds silence rather than runtime: the CLI touches
+the worker's state file on every message and tool result, so an hour of no change means wedged, not
+slow. Raise it for a job with a single legitimately silent step longer than that.
 
 ## Use the command surface
 

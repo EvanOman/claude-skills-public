@@ -91,6 +91,33 @@ def build_parser() -> argparse.ArgumentParser:
             "settings/hooks/plugins instead of isolating it (default: isolated)"
         ),
     )
+    run.add_argument(
+        "--mcp-config",
+        action="append",
+        dest="mcp_config",
+        help=(
+            "MCP config file or inline JSON to give a Claude worker (repeatable). "
+            "Workers otherwise get no MCP servers at all"
+        ),
+    )
+    run.add_argument(
+        "--no-strict-mcp-config",
+        dest="strict_mcp_config",
+        action="store_false",
+        default=None,
+        help=(
+            "let a Claude worker inherit the operator's user- and project-scope MCP "
+            "servers, at the risk of an approval prompt it cannot answer"
+        ),
+    )
+    run.add_argument(
+        "--min-result-bytes",
+        type=int,
+        help=(
+            "smallest Claude result artifact reported as succeeded rather than "
+            "unknown (default 300; 0 disables the check)"
+        ),
+    )
     run.add_argument("--idempotency-key")
 
     run_many = commands.add_parser(
@@ -292,6 +319,8 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             "parent_job_id",
             "idempotency_key",
             "permission_mode",
+            "mcp_config",
+            "min_result_bytes",
         ):
             _set(params, key, getattr(args, key))
         if args.allow_billing_class_change:
@@ -301,6 +330,8 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             params["isolate_worker_config"] = False
         if getattr(args, "workspace_note", None) is False:
             params["workspace_note"] = False
+        if getattr(args, "strict_mcp_config", None) is False:
+            params["strict_mcp_config"] = False
     elif operation == "run_many":
         if args.spec is None:
             raise OvermindError(

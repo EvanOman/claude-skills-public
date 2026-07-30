@@ -14,7 +14,7 @@ import os
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,12 @@ from . import (
     STATES,
     TERMINAL_STATES,
 )
+
+
+# How long SQLite waits on the write lock before reporting the database busy, and
+# how long this module keeps retrying a start/commit that reported busy anyway.
+BUSY_TIMEOUT_SECONDS = 30.0
+BUSY_RETRY_SECONDS = 30.0
 
 
 def canonical_json(value: Any) -> str:
@@ -54,23 +60,52 @@ class Store:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.db_path,
-            timeout=10,
+            timeout=BUSY_TIMEOUT_SECONDS,
             isolation_level=None,
             check_same_thread=False,
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=10000")
+        connection.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_SECONDS * 1000)}")
         connection.execute("PRAGMA synchronous=NORMAL")
         return connection
+
+    @staticmethod
+    def _retry_locked(action: Callable[[], None]) -> None:
+        """Run one write-lock acquisition, retrying while SQLite reports busy.
+
+        A per-job watcher thread writes on every observation, so a fan-out of
+        workers means many short write transactions competing for the single
+        writer lock. `busy_timeout` covers most of that, but it does not cover
+        every path: SQLite returns SQLITE_BUSY immediately, without consulting the
+        busy handler, when a transaction cannot be started against a snapshot that
+        has moved. Six measured jobs were reported permanently unobservable
+        because of that bare "database is locked".
+        """
+
+        deadline = time.monotonic() + BUSY_RETRY_SECONDS
+        delay = 0.01
+        while True:
+            try:
+                action()
+                return
+            except sqlite3.OperationalError as error:
+                message = str(error).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.5)
 
     @contextlib.contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection = self._connect()
+        statement = "BEGIN IMMEDIATE" if immediate else "BEGIN"
         try:
-            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            self._retry_locked(lambda: connection.execute(statement))
             yield connection
-            connection.commit()
+            self._retry_locked(connection.commit)
         except Exception:
             connection.rollback()
             raise

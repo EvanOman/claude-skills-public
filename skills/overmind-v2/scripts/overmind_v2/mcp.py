@@ -73,11 +73,45 @@ JOB_PROPERTIES: dict[str, Any] = {
         "type": "number",
         "minimum": 0,
         "description": (
-            "Opt-in ceiling, disabled by default. Ends a worker that has made no "
-            "progress for this long even when the CLI still reports a task in "
-            "flight, which happens when an in-flight counter is never cleared. Off "
-            "by default because a genuinely long tool call looks identical, so only "
-            "the caller knows a safe upper bound for its own job."
+            "Ceiling on silence, default 3600. Ends a worker whose state file has "
+            "not changed for this long even when the CLI still reports a task in "
+            "flight, which happens when an in-flight counter is never cleared. The "
+            "CLI rewrites that file on every message and tool result, so this "
+            "cannot fire while a worker is making progress. Raise it for a job with "
+            "a single legitimately silent step longer than an hour; 0 disables it."
+        ),
+    },
+    "strict_mcp_config": {
+        "type": "boolean",
+        "default": True,
+        "description": (
+            "Give a Claude worker only the MCP servers named in mcp_config, "
+            "ignoring the operator's user- and project-scope configuration. On by "
+            "default: a background worker has no TTY, so an unapproved server in a "
+            "project .mcp.json ends its turn on an approval prompt nothing can "
+            "answer. Ignored by non-Claude providers."
+        ),
+    },
+    "mcp_config": {
+        "oneOf": [
+            {"type": "string"},
+            {"type": "array", "items": {"type": "string"}},
+        ],
+        "description": (
+            "MCP config file path(s) or inline JSON to give a Claude worker. Use "
+            "this to grant exactly the servers a brief needs instead of turning "
+            "strict_mcp_config off and inheriting every configured server."
+        ),
+    },
+    "min_result_bytes": {
+        "type": "number",
+        "minimum": 0,
+        "description": (
+            "Smallest result artifact that counts as a reported work product, "
+            "default 300. A Claude job that would succeed with less is reported "
+            "unknown instead, because a success no one can read is trusted, never "
+            "verified, and silently re-dispatched. Set 0 for a job whose "
+            "deliverable really is a one-word verdict."
         ),
     },
     "isolate_worker_config": {
@@ -244,6 +278,9 @@ TOOLS: list[dict[str, Any]] = [
                     "idle_hard_timeout_seconds"
                 ],
                 "isolate_worker_config": JOB_PROPERTIES["isolate_worker_config"],
+                "strict_mcp_config": JOB_PROPERTIES["strict_mcp_config"],
+                "mcp_config": JOB_PROPERTIES["mcp_config"],
+                "min_result_bytes": JOB_PROPERTIES["min_result_bytes"],
             },
             "additionalProperties": False,
         },

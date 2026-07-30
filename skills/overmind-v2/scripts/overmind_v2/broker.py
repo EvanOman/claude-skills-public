@@ -27,6 +27,10 @@ from .store import Store
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
+# Consecutive failed observations before a watcher gives up on a job. Retries are
+# backed off, so this is roughly half a minute of sustained failure.
+OBSERVATION_FAILURE_LIMIT = 5
+
 
 class Broker:
     # Per-job provider options that flow through unvalidated into
@@ -39,6 +43,9 @@ class Broker:
         "workspace_note",
         "idle_grace_seconds",
         "idle_hard_timeout_seconds",
+        "strict_mcp_config",
+        "mcp_config",
+        "min_result_bytes",
         # Which orchestrator session launched this worker. Recorded so a session
         # can find its own workers, and so workers orphaned by a dead session can
         # be identified rather than lingering unattributed.
@@ -479,12 +486,19 @@ class Broker:
             current.get(key) != value for key, value in fields.items()
         )
         if changed:
+            payload: dict[str, Any] = {"provider_state": observation.get("state")}
+            if observation.get("raw_state") is not None:
+                # The provider's own unnormalized state string. Recorded because a
+                # verdict of `unknown` is otherwise unattributable after the fact:
+                # the CLI state that produced eleven bad terminal verdicts could
+                # only be guessed at from the surrounding detail text.
+                payload["provider_raw_state"] = observation["raw_state"]
             current = self.store.update_job(
                 job_id,
                 kind=kind,
                 state=state,
                 fields=fields,
-                payload={"provider_state": observation.get("state")},
+                payload=payload,
             )
             self._notify()
         recorded_evidence = False
@@ -521,9 +535,24 @@ class Broker:
                 return
 
             def watch() -> None:
+                # A single failed observation is not evidence that a worker is
+                # unobservable, and declaring it so is destructive: the job goes
+                # terminal, is never reconciled again, and its real result is
+                # discarded. Six measured jobs were lost that way to a transient
+                # "database is locked" -- write contention between watchers, not a
+                # dead worker. Give up only after the failure persists.
+                failures = 0
                 try:
                     while not self._closing.is_set():
-                        job = self._reconcile_job(job_id)
+                        try:
+                            job = self._reconcile_job(job_id)
+                        except Exception as error:
+                            failures += 1
+                            if failures >= OBSERVATION_FAILURE_LIMIT:
+                                raise
+                            self._closing.wait(timeout=min(2.0**failures, 10.0))
+                            continue
+                        failures = 0
                         if job["state"] in TERMINAL_STATES:
                             return
                         self._closing.wait(
@@ -535,7 +564,12 @@ class Broker:
                             job_id,
                             kind="job.observation_lost",
                             state="unknown",
-                            fields={"error": f"provider observation failed: {error}"},
+                            fields={
+                                "error": (
+                                    "provider observation failed "
+                                    f"{failures} times in a row: {error}"
+                                )
+                            },
                         )
                         self._notify()
                     except Exception:
