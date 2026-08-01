@@ -15,7 +15,9 @@ Resolve the directory containing this `SKILL.md` to an absolute `SKILL_ROOT`; co
 relative to that directory, not the user's current working directory. Run
 `$SKILL_ROOT/scripts/om doctor --json` before the first cross-harness fan-out in a session. Use the
 returned provider and billing facts instead of assuming that a harness, model, or live-steering
-feature is available. Read [references/setup.md](references/setup.md) when installing the broker in
+feature is available. `doctor` also reports whether the long-lived broker daemon predates the code
+on disk (`code.stale`); after updating this skill, run `$SKILL_ROOT/scripts/om restart` — a stale
+daemon keeps old behavior silently while the documentation describes the new. Read [references/setup.md](references/setup.md) when installing the broker in
 Claude and Codex. Read [references/protocol.md](references/protocol.md) when debugging lifecycle
 behavior or using advanced filters. Read [references/testing.md](references/testing.md) for a
 deterministic bake-off or broker regression work.
@@ -29,7 +31,8 @@ deterministic bake-off or broker regression work.
 4. Continue useful control-plane work only while capacity remains. Never poll `jobs` in a reasoning
    loop.
 5. Call `await` once with `all_terminal`, or `any_terminal` when later work depends on the first
-   result. Resume an interrupted wait with its returned event cursor.
+   result. Omit `since_cursor` to wait from now; pass a prior response's cursor only when resuming
+   an interrupted wait, so no transition is lost and no history is replayed.
 6. Call `collect` for bounded previews. Read full result artifacts only for workers whose details are
    needed.
 7. Inspect produced artifacts and run the brief's named verification before synthesis.
@@ -46,15 +49,19 @@ DONE WHEN:   Acceptance criteria visible outside the worker's narrative.
 VERIFY:      Exact commands or checks.
 ```
 
-Each job records the session that launched it, derived automatically from process
-ancestry. `om orphans` shows workers whose owning session has exited and `--stop` ends
-them; it is a command, not a sweep, because workers are meant to be able to outlive the
-session that started them.
+Each job records the session that launched it, derived automatically from process ancestry, and
+that ownership is the visibility boundary: you see your own fleet, not other sessions'. A full
+group or job identifier is a deliberate capability that crosses sessions — that is how recovery
+and handoff work — and `scope: all` (`om jobs --all`) is the explicit wide view. Continuations
+inherit their parent's owner. `om orphans` shows workers whose owning session has exited and
+`--stop` ends them; it is a command, not a sweep, because workers are meant to be able to outlive
+the session that started them.
 
 ## Keep context and spend bounded
 
 - Prefer `run-many -> await -> collect` over one launch, wait, and result cycle per worker.
-- Ask `jobs` for active work in the current group, not global history.
+- `jobs` lists your session's workers, newest first, with `total` and `truncated` flags; trust
+  them rather than raising the limit reflexively, and filter by group when you mean one mission.
 - Keep result previews small; use artifact paths for full output.
 - Treat subscription quota and token counters as usage evidence, not dollar invoices.
 - Reject silent provider fallback across billing classes.
@@ -78,13 +85,14 @@ question ends its turn: a permission prompt, a session-start hook, or an MCP ser
 approved. Those defaults remove all three, and the worker acts on its brief unattended. All are
 per-job options on `run`/`run-many`/`reply` (inherited by continuations unless overridden); see
 [references/setup.md](references/setup.md#claude-worker-launch-options) to opt into a narrower
-permission mode, the operator's full config, or a specific `mcp_config`. Prefer `dontAsk` for
-read-only auditors and reviewers, and say in the brief that the work is read-only.
+permission mode, the operator's full config, or a specific `mcp_config`. Keep the default even for
+read-only work and constrain scope in the brief instead: `dontAsk` silently auto-denies Bash-shaped
+calls (`git -C <path>`, `find`, compound commands) while plain reads still work, so `VERIFY:` steps
+fail quietly; if you do use it, write VERIFY commands that run bare in the worker's own cwd and tell
+the worker to report denials rather than route around them.
 
 A worker's result artifact is its own final assistant message, not the CLI's one-line headline for
-it. A terminal job whose artifact is under `min_result_bytes` (default 300) is reported `unknown`
-rather than `succeeded`: nothing readable was reported, so the outcome is unverified and the brief's
-artifacts are what to check.
+it; the full session transcript is also registered as a `transcript` artifact.
 
 A worker whose `cwd` is a git checkout is also told not to create its own nested worktree, and the
 CLI's background worktree-isolation guard — which otherwise refuses its first write until it calls
@@ -95,19 +103,15 @@ a worker must manage its own, which also restores the guard.
 Omit `model` unless a job genuinely needs a specific one, so workers inherit the configured default
 rather than a hardcoded tier.
 
-A worker that finishes its work but never emits a final message parks at "working" forever. The
-broker reaps such a worker after `idle_grace_seconds` (default 300) of no turn in progress, ends its
-session, and reports it terminal as `unknown` with its last progress note as the result. `unknown`
-here means exactly what it says: the work may well be complete, but nothing reported it, so inspect
-the artifacts the brief asked for before trusting or redoing it. Raise `idle_grace_seconds` for a
-job that legitimately sits idle, or set 0 to disable reaping for it.
-
-Reaping requires the CLI to report no work in flight, which matters more than it sounds: a parent
-waiting on a subagent reports `tempo: "idle"` for the whole wait, so idleness alone would kill
-orchestrating workers mid-flight. A worker the CLI still reports as busy is ended instead by
-`idle_hard_timeout_seconds` (default 3600), which bounds silence rather than runtime: the CLI touches
-the worker's state file on every message and tool result, so an hour of no change means wedged, not
-slow. Raise it for a job with a single legitimately silent step longer than that.
+`unknown` always means one thing: the work may well be done, but nothing readable reported it —
+inspect the artifacts the brief asked for before trusting or redoing it. Three paths produce it: a
+`succeeded` result under `min_result_bytes` (default 300; set 0 for a genuinely one-word verdict),
+the broker reaping a worker that stopped reporting (`idle_grace_seconds`, default 300, for a worker
+with no turn in progress; `idle_hard_timeout_seconds`, default 3600, bounding silence for one still
+claiming work in flight — neither can fire while a worker makes progress, and a parent waiting on
+its own subagent is never reaped), and a provider that cannot be observed. Raise the reaping knobs
+for legitimately quiet jobs, or set 0 to disable; the measured incidents behind each rule are in
+[references/setup.md](references/setup.md#claude-worker-launch-options).
 
 ## Use the command surface
 

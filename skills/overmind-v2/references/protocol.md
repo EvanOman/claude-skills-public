@@ -35,6 +35,14 @@ Groups represent a fan-out mission. Jobs belong to one group and optionally to a
 Provider-native logs and results remain artifacts; SQLite stores metadata and paths, not transcript
 copies.
 
+Every job records `owner_session`, the orchestrator session that launched it, and ownership is the
+visibility boundary: list operations default to the calling session's jobs, enforced at the store
+layer (`list_jobs` requires an explicit scope — owner, group-capability, or all — so an unscoped
+listing cannot be written). A full group or job identifier is a capability that crosses sessions;
+`scope: all` and a named `owner_session` filter are the explicit wider views. Continuations inherit
+their parent's owner. Caller identity comes from the session registry via process ancestry, with an
+anonymous harness-process identity registered automatically when no session is registered.
+
 Normalized states are `queued`, `starting`, `running`, `succeeded`, `failed`, `interrupted`, and
 `unknown`. Every mutation appends an event with a monotonically increasing cursor. Full UUIDs are
 authoritative; short IDs are display-only and must resolve uniquely before any destructive action.
@@ -46,20 +54,37 @@ fallback must preserve billing class unless the caller explicitly opts into a ch
 
 - `run`: create one group or append one job to a group and launch it atomically.
 - `run-many`: create a group and launch a bounded list. Return one group ID and job summaries.
-- `jobs`: list concise snapshots using group, state, provider, label, or cursor filters.
+- `jobs`: list concise snapshots, newest first, scoped to the calling session by default (see
+  state model); filters cover group, state, provider, label, cursor, owner, and scope. Default
+  limit 20; the response carries `total`, `truncated`, `scope`, and a `hint` when something was
+  cut, so a partial answer can never read as a complete one.
 - `show`: read one group or job with freshness and artifact metadata.
-- `await`: block on `any_change`, `any_terminal`, or `all_terminal` after a cursor.
-- `collect`: return bounded terminal previews and artifact paths for a group or job list.
-- `reply`: steer a running provider turn when supported; otherwise create a related continuation.
-- `stop`: interrupt a job or group without deleting its record.
-- `forget`: delete terminal lifecycle metadata; provider-native deletion is separate and explicit.
+- `await`: block on `any_change`, `any_terminal`, or `all_terminal` after a cursor. An omitted
+  `since_cursor` waits from now; an explicit cursor resumes without loss; an explicit 0 replays
+  all history.
+- `collect`: return bounded terminal previews and artifact paths for a group or job list
+  (`target` may be an id or `{job_ids: [...]}`); `bounded` reports `jobs_total` and
+  `jobs_truncated` when the per-call cap bites.
+- `reply`: steer a running provider turn when supported; otherwise create a related continuation
+  owned by the parent's session.
+- `stop`: interrupt a job or group without deleting its record. Each returned job carries a
+  `stop_action` (`interrupt_requested`, `interrupted_before_launch`, `already_terminal`) and the
+  response an `actions` count, so a no-op stop is visible as one.
+- `forget`: delete terminal lifecycle metadata, the entity's prior events (a tombstone event
+  remains), and a group left empty by its last forgotten job; provider-native deletion is
+  separate and explicit.
 - `doctor`: report schema, daemon, provider, adapter, authentication, billing, and quota capabilities.
   Each provider entry also carries `last_failure`: the most recent terminal job for that provider
-  with a recorded error, as `{job_id, short_id, state, message, occurred_at}` (or `null` when the
-  broker has observed no such failure). CLI-based probing (`available`/`authenticated`) cannot see
-  capacity errors such as exhausted subscription quota; `last_failure` is factual evidence drawn
-  from the broker's own job history, not a fabricated quota snapshot, so a parent can see e.g. "usage
-  limit until Jul 29th" before fanning out more work to a provider that will immediately fail.
+  with a recorded error, as `{job_id, short_id, state, message, occurred_at,
+  superseded_by_success}` (or `null` when the broker has observed no such failure). CLI-based
+  probing (`available`/`authenticated`) cannot see capacity errors such as exhausted subscription
+  quota; `last_failure` is factual evidence drawn from the broker's own job history, not a
+  fabricated quota snapshot, so a parent can see e.g. "usage limit until Jul 29th" before fanning
+  out more work to a provider that will immediately fail — and `superseded_by_success: true` says
+  the provider has completed work since, so the failure is history rather than current health.
+  The report also carries `daemon.started_at` and a `code` block whose `stale` flag says the
+  running daemon predates the source on disk; the daemon accepts a `shutdown` method (used by
+  `om restart`) for a graceful swap onto current code.
 
 Mutating calls accept an idempotency key. Retrying the same logical launch returns the original
 entity. Conflicting payloads with the same key are errors.
@@ -120,6 +145,9 @@ registry.
 
 - Broker lifecycle records are shared across harnesses, but they do not become entries in each
   harness's native in-process subagent registry.
+- `om orphans` and `om restart` are deliberately CLI-only operator commands, not MCP tools: both
+  act beyond the calling session's own scope, which is an operator decision rather than an
+  orchestrator move.
 - Codex capability discovery reports app-server availability, while execution currently uses the
   subscription-authenticated `codex exec --json` adapter.
 - A provider interrupt can be retried after a crash. The broker verifies local process identity, but

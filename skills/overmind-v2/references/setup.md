@@ -22,6 +22,24 @@ To remove the integration, remove the `overmind-v2` MCP registration from each h
 delete the state directory while jobs are active. Lifecycle records and result artifacts remain
 under `~/.local/state/overmind-v2/` until explicitly forgotten or archived.
 
+## Broker lifecycle and upgrades
+
+The broker is one persistent per-user daemon, started on demand by the first client and holding
+the provider adapters in memory from that moment on. **Updating this skill does not update a
+running daemon**: Python loads code at process start, so a daemon started before a change keeps
+the old behavior indefinitely while the docs describe the new one. A four-day-stale daemon
+measured here silently discarded 91% of worker output and skipped the `min_result_bytes` guard,
+while every preflight looked green.
+
+Two defenses, use both:
+
+- `doctor` reports `daemon.started_at` and a `code` block comparing the source mtime the daemon
+  loaded against what is on disk now; `code.stale: true` means documented behavior may be missing.
+  Check it before trusting a long-lived broker.
+- `om restart` swaps the daemon gracefully after an upgrade. It is safe while workers run:
+  providers own the worker processes, not the daemon, and the fresh daemon reconciles every
+  nonterminal job on start without duplicating a launch.
+
 ## Claude worker launch options
 
 `run`, `run_many`, and `reply` accept the Claude-specific, per-job options below. All are ignored by
@@ -109,19 +127,29 @@ moment the subagent started, with `updatedAt` frozen for over three minutes, whi
 `local_agent` and `local_bash`. Without the in-flight check that parent would have been killed
 mid-flight, taking its subagent's work with it.
 
-## Session ownership and orphaned workers
+## Session ownership, scoped visibility, and orphaned workers
 
-Each job records the orchestrator session that launched it, in `owner_session`. Nothing
-needs to pass it: the MCP server is a child of the session process, so it walks its own
-process ancestry and matches a live entry in the session registry under
-`<state-dir>/sessions/`. Set `owner_session` on a job to attribute it deliberately, or
-`OVERMIND_V2_OWNER_SESSION` to force one.
+Each job records the orchestrator session that launched it, in `owner_session` (a real column,
+not payload metadata). Nothing needs to pass it: every client names its calling session
+automatically. A registered session is matched by walking process ancestry against the live
+registry under `<state-dir>/sessions/`; when nothing is registered, the client anchors an
+**anonymous identity** on its nearest harness-looking ancestor process and registers that, so
+isolation holds on a fresh install with no hook configured. Set `owner_session` on a job to
+attribute it deliberately, or `OVERMIND_V2_OWNER_SESSION` to force one.
 
-A session registers itself while it is alive. The Claude CLI hands the session id to the
-status line and nowhere else -- it is absent from the MCP server's environment and from a
-worker's own state file -- so the status line is what binds session id to a live process.
-Liveness is pid *plus* process start identity, never pid alone, because pids are recycled
-and claiming a stranger's process is the one mistake this must not make.
+Ownership is the visibility boundary. `jobs` lists only the calling session's workers by
+default; other sessions' work is reached by identifier — a group or job UUID is a deliberate
+capability that crosses sessions (that is how recovery and cross-harness handoff work) — by
+naming a session (`owner_session` filter), or by explicit opt-in (`scope: all`, `om jobs
+--all`). Continuations created with `reply` inherit the parent's owner, so a continued job
+never becomes unattributable. Registration liveness is pid *plus* process start identity,
+never pid alone, because pids are recycled and claiming a stranger's process is the one
+mistake this must not make.
+
+Optionally, a status-line or session hook can register the harness's real session id
+(`overmind_v2.sessions.register(state_dir, session_id, pid)`); that makes `owner_session`
+values meaningful across restarts instead of anonymous process-keyed names. Without it,
+everything above still works.
 
 `om orphans` lists running workers whose owning session is gone; `om orphans --stop` ends
 them. This is deliberately a command rather than an automatic sweep. Surviving the parent
