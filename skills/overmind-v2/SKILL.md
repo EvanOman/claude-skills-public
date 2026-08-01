@@ -16,8 +16,12 @@ relative to that directory, not the user's current working directory. Run
 `$SKILL_ROOT/scripts/om doctor --json` before the first cross-harness fan-out in a session. Use the
 returned provider and billing facts instead of assuming that a harness, model, or live-steering
 feature is available. `doctor` also reports whether the long-lived broker daemon predates the code
-on disk (`code.stale`); after updating this skill, run `$SKILL_ROOT/scripts/om restart` — a stale
-daemon keeps old behavior silently while the documentation describes the new. Read [references/setup.md](references/setup.md) when installing the broker in
+on disk (`code.stale`) — a stale daemon keeps old behavior silently while the documentation
+describes the new. When it reports stale, check `om jobs --all --state running` for other sessions'
+in-flight workers, then run `$SKILL_ROOT/scripts/om restart`: the swap is designed to be safe
+(workers survive; nonterminal jobs reconcile without duplicate launches), but their orchestrators'
+blocked awaits will return early once and must resume from their cursors, so restarting under
+someone else's live fan-out is an operator call, not a reflex. Read [references/setup.md](references/setup.md) when installing the broker in
 Claude and Codex. Read [references/protocol.md](references/protocol.md) when debugging lifecycle
 behavior or using advanced filters. Read [references/testing.md](references/testing.md) for a
 deterministic bake-off or broker regression work.
@@ -28,8 +32,8 @@ deterministic bake-off or broker regression work.
 2. Record the current checkout state before dispatching repository work. Isolate concurrent writers
    in separate worktrees.
 3. Launch a group in one operation with `run-many`; use an idempotency key when retrying a request.
-4. Continue useful control-plane work only while capacity remains. Never poll `jobs` in a reasoning
-   loop.
+4. Do remaining control-plane work now, before waiting — `await` blocks until it returns, so there
+   is no window during it. Never poll `jobs` in a reasoning loop.
 5. Call `await` once with `all_terminal`, or `any_terminal` when later work depends on the first
    result. Omit `since_cursor` to wait from now; pass a prior response's cursor only when resuming
    an interrupted wait, so no transition is lost and no history is replayed.
@@ -117,7 +121,8 @@ for legitimately quiet jobs, or set 0 to disable; the measured incidents behind 
 
 Use `$SKILL_ROOT/scripts/om --help` for the human CLI and `$SKILL_ROOT/scripts/overmind-v2-mcp` for
 the MCP stdio server. Canonical operations are `run`, `run-many`, `jobs`, `show`, `await`, `collect`,
-`reply`, `stop`, `forget`, and `doctor`. Human aliases are accepted, but do not teach duplicate MCP
+`reply`, `stop`, `forget`, and `doctor`; `om orphans` and `om restart` are deliberately CLI-only
+operator commands with no MCP tool. Human aliases are accepted, but do not teach duplicate MCP
 tool names.
 
 Use v1 only as the control during migration or when v2's doctor reports an unavailable required

@@ -570,7 +570,20 @@ def render_human(operation: str, value: Any) -> str:
                 ).rstrip()
                 preview = item.get("preview", item.get("result"))
                 if preview is not None:
-                    lines.append(f"{prefix}: {_one_line(preview)}")
+                    # The preview is already bounded by preview_bytes; flattening
+                    # it to one ~240-char line here re-created the exact "results
+                    # are one-liners" misread the artifacts were fixed to avoid.
+                    # Short previews stay inline; long ones become a block.
+                    text = str(preview).rstrip()
+                    if len(text) <= 240 and "\n" not in text:
+                        lines.append(f"{prefix}: {text}")
+                    else:
+                        lines.append(f"{prefix} ({len(text.encode('utf-8'))} bytes):")
+                        lines.append(text)
+                    if item.get("truncated"):
+                        hint = _artifact_hint(item, job)
+                        where = f"; full result at {hint}" if hint else ""
+                        lines.append(f"[preview truncated{where}]")
                 else:
                     hint = _artifact_hint(item, job)
                     detail = f"[artifact: {hint}]" if hint else "[no preview]"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import unittest
 
 from support import (
@@ -152,6 +153,31 @@ class ListingLimitsTest(IntegrationCase):
         ).json()
         replay_kinds = {event.get("kind") for event in replayed.get("events", [])}
         self.assertIn("job.queued", replay_kinds, replayed)
+
+    def test_collect_human_output_carries_the_full_preview(self) -> None:
+        """Flattening previews to one ~240-char line re-created the "results are
+        one-liners" misread; a long preview must render as a block."""
+
+        full = "paragraph one of a long report\n\n" + ("detail line\n" * 60)
+        created = self.harness.run_many(
+            [self.harness.job_spec("human-preview", result=full)],
+            key="limits-human-preview",
+        )
+        group_id = ids_from(created, "group")[0]
+        self.harness.call(
+            "await",
+            {**group_target(group_id), "condition": "all_terminal", "timeout": 5},
+        )
+        rendered = subprocess.run(
+            [str(self.harness.cli), "collect", group_id],
+            text=True,
+            capture_output=True,
+            env=self.harness.env,
+            timeout=15,
+        )
+        self.assertEqual(0, rendered.returncode, rendered.stderr)
+        self.assertIn("bytes):", rendered.stdout)
+        self.assertGreaterEqual(rendered.stdout.count("detail line"), 50)
 
     def test_collect_accepts_job_ids_inside_target(self) -> None:
         created = self.harness.run_many(
