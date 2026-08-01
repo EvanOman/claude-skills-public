@@ -16,6 +16,9 @@ MCP_PROTOCOL_VERSION = "2025-06-18"
 SERVER_VERSION = "0.2.0"
 
 
+# Per-job worker options. Descriptions are deliberately one line: every byte
+# here is loaded into each orchestrator's context three times (run, run_many,
+# reply). Rationale and measurements live in references/setup.md.
 JOB_PROPERTIES: dict[str, Any] = {
     "provider": {"type": "string", "description": "Provider adapter name."},
     "brief": {"type": "string", "minLength": 1},
@@ -34,62 +37,47 @@ JOB_PROPERTIES: dict[str, Any] = {
     "permission_mode": {
         "enum": ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"],
         "description": (
-            "Claude worker permission mode. Defaults to bypassPermissions so a "
-            "background worker can act without a TTY to answer prompts; dontAsk "
-            "auto-denies instead of auto-approving and can stall a worker "
-            "indefinitely. Ignored by non-Claude providers."
+            "Claude worker permission mode; default bypassPermissions (no TTY to "
+            "answer prompts). dontAsk auto-denies Bash-shaped calls silently; a "
+            "fully denied worker ends its turn and is reported unknown."
         ),
     },
     "workspace_note": {
         "type": "boolean",
         "default": True,
         "description": (
-            "Tell a Claude worker whose cwd is a git checkout not to create its own "
-            "nested worktree, so its commits land on the branch you assigned instead "
-            "of one you are not watching. Set false when a worker manages its own "
-            "worktree. Ignored by non-Claude providers."
+            "Pin a Claude worker to its assigned git checkout instead of a nested "
+            "worktree; false lets it manage its own isolation."
         ),
     },
     "idle_grace_seconds": {
         "type": "number",
         "minimum": 0,
         "description": (
-            "Seconds a Claude worker may sit with no turn in progress before the "
-            "broker ends the session and reports it terminal. Defaults to 300. A "
-            "worker that finishes without emitting a final message otherwise never "
-            "reaches a terminal state, so await hangs and reply refuses to continue "
-            "it. Set 0 to disable reaping for a long-idling job."
+            "Reap a Claude worker idle with no turn in progress after this many "
+            "seconds (default 300, terminal state unknown); 0 disables."
         ),
     },
     "owner_session": {
         "type": "string",
         "description": (
-            "Orchestrator session that owns this worker. Filled in automatically "
-            "from the calling session when available; set it explicitly to attribute "
-            "a job to a different owner."
+            "Owning orchestrator session; auto-filled from the calling session."
         ),
     },
     "idle_hard_timeout_seconds": {
         "type": "number",
         "minimum": 0,
         "description": (
-            "Ceiling on silence, default 3600. Ends a worker whose state file has "
-            "not changed for this long even when the CLI still reports a task in "
-            "flight, which happens when an in-flight counter is never cleared. The "
-            "CLI rewrites that file on every message and tool result, so this "
-            "cannot fire while a worker is making progress. Raise it for a job with "
-            "a single legitimately silent step longer than an hour; 0 disables it."
+            "Ceiling on a silent-but-busy Claude worker, seconds since its state "
+            "file last changed (default 3600); 0 disables."
         ),
     },
     "strict_mcp_config": {
         "type": "boolean",
         "default": True,
         "description": (
-            "Give a Claude worker only the MCP servers named in mcp_config, "
-            "ignoring the operator's user- and project-scope configuration. On by "
-            "default: a background worker has no TTY, so an unapproved server in a "
-            "project .mcp.json ends its turn on an approval prompt nothing can "
-            "answer. Ignored by non-Claude providers."
+            "Give a Claude worker only the servers in mcp_config, ignoring "
+            "operator MCP configuration that could prompt unanswerably."
         ),
     },
     "mcp_config": {
@@ -97,31 +85,22 @@ JOB_PROPERTIES: dict[str, Any] = {
             {"type": "string"},
             {"type": "array", "items": {"type": "string"}},
         ],
-        "description": (
-            "MCP config file path(s) or inline JSON to give a Claude worker. Use "
-            "this to grant exactly the servers a brief needs instead of turning "
-            "strict_mcp_config off and inheriting every configured server."
-        ),
+        "description": "MCP config path(s) or inline JSON for a Claude worker.",
     },
     "min_result_bytes": {
         "type": "number",
         "minimum": 0,
         "description": (
-            "Smallest result artifact that counts as a reported work product, "
-            "default 300. A Claude job that would succeed with less is reported "
-            "unknown instead, because a success no one can read is trusted, never "
-            "verified, and silently re-dispatched. Set 0 for a job whose "
-            "deliverable really is a one-word verdict."
+            "Smallest result that counts as a reported work product (default "
+            "300; smaller succeeded results are reported unknown); 0 disables."
         ),
     },
     "isolate_worker_config": {
         "type": "boolean",
         "default": True,
         "description": (
-            "Launch a Claude worker without the operator's user-level "
-            "settings/hooks/plugins so it skips session-start ceremony and "
-            "acts on the brief directly. Set false to inherit full user "
-            "config. Ignored by non-Claude providers."
+            "Launch a Claude worker without user-level settings/hooks/plugins; "
+            "false inherits full operator config."
         ),
     },
 }
@@ -190,7 +169,11 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "jobs",
-        "description": "List concise job snapshots with optional filters.",
+        "description": (
+            "List concise job snapshots, newest first, scoped to the calling "
+            "session. Default limit 20; the response carries total and a "
+            "truncated flag."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -198,8 +181,17 @@ TOOLS: list[dict[str, Any]] = [
                 "state": {"type": "array", "items": {"type": "string"}},
                 "provider": {"type": "array", "items": {"type": "string"}},
                 "label": {"type": "string"},
+                "scope": {
+                    "enum": ["mine", "all"],
+                    "default": "mine",
+                    "description": "all = every session's jobs, an explicit opt-in.",
+                },
+                "owner_session": {
+                    "type": "string",
+                    "description": "List a named session's jobs.",
+                },
                 "since_cursor": {"type": "integer", "minimum": 0},
-                "limit": {"type": "integer", "minimum": 1},
+                "limit": {"type": "integer", "minimum": 1, "default": 20},
             },
             "additionalProperties": False,
         },
@@ -229,7 +221,14 @@ TOOLS: list[dict[str, Any]] = [
                     "enum": ["any_change", "any_terminal", "all_terminal"],
                     "default": "all_terminal",
                 },
-                "since_cursor": {"type": "integer", "minimum": 0, "default": 0},
+                "since_cursor": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Cursor from a prior response to resume without losing "
+                        "events. Omit to wait from now; 0 replays all history."
+                    ),
+                },
                 "timeout": {
                     "type": "number",
                     "minimum": 0,
@@ -241,20 +240,48 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        # NOTE: this schema must stay a plain object with a `required` list.
+        # A root-level anyOf/oneOf makes the harness-side schema validator drop
+        # the tool silently, which is how collect vanished from tool discovery
+        # while the server kept advertising it. Guarded by test_mcp_contract.
         "name": "collect",
-        "description": "Return bounded terminal previews and artifact paths.",
+        "description": (
+            "Return bounded terminal previews and artifact paths for a group, "
+            "job, or explicit job_ids (pass either as target)."
+        ),
         "inputSchema": {
             "type": "object",
-            "anyOf": [{"required": ["target"]}, {"required": ["job_ids"]}],
+            "required": ["target"],
             "properties": {
-                "target": TARGET_SCHEMA,
-                "job_ids": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {"type": "string"},
+                "target": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "job_id": {"type": "string"},
+                                "group_id": {"type": "string"},
+                                "job_ids": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "additionalProperties": False,
+                            "minProperties": 1,
+                            "maxProperties": 1,
+                        },
+                    ]
                 },
                 "max_chars": {"type": "integer", "minimum": 0, "default": 4000},
                 "preview_bytes": {"type": "integer", "minimum": 0},
+                "max_jobs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 32,
+                    "description": "Previews per call; jobs_truncated flags overflow.",
+                },
                 "include_nonterminal": {"type": "boolean", "default": False},
             },
             "additionalProperties": False,
@@ -262,7 +289,11 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "reply",
-        "description": "Steer a running turn or create a related continuation.",
+        "description": (
+            "Continue a terminal worker in its provider thread (steering a live "
+            "turn requires provider support; doctor reports steer per provider, "
+            "currently none)."
+        ),
         "inputSchema": {
             "type": "object",
             "required": ["target", "prompt"],
@@ -512,19 +543,14 @@ class McpServer:
 
         try:
             broker_method = "run-many" if name == "run_many" else name
-            if broker_method in {"run", "run-many"}:
-                # The CLI never tells an MCP server which session invoked it, but this
-                # server is a child of that session, so ancestry plus the live-session
-                # registry names the owner without the caller supplying anything.
-                owner = self._owner_session()
-                if owner:
-                    jobs = arguments.get("jobs")
-                    if isinstance(jobs, list):
-                        for job in jobs:
-                            if isinstance(job, dict):
-                                job.setdefault("owner_session", owner)
-                    else:
-                        arguments.setdefault("owner_session", owner)
+            if broker_method in {"run", "run-many", "jobs", "reply"}:
+                # The CLI never tells an MCP server which session invoked it, but
+                # this server is a child of that session, so ancestry names the
+                # caller without the model supplying anything. The broker uses it
+                # as the launch owner and as the default jobs visibility scope.
+                caller = self._caller_session()
+                if caller:
+                    arguments.setdefault("caller_session", caller)
             result = self.client.request(
                 broker_method,
                 arguments,
@@ -538,7 +564,11 @@ class McpServer:
                     "content": [
                         {
                             "type": "text",
-                            "text": json.dumps(structured, ensure_ascii=False, indent=2),
+                            # Compact: this payload rides the wire next to
+                            # structuredContent, so indentation is pure cost.
+                            "text": json.dumps(
+                                structured, ensure_ascii=False, separators=(",", ":")
+                            ),
                         }
                     ],
                     "structuredContent": structured,
@@ -573,11 +603,11 @@ class McpServer:
             return metadata["progressToken"]
         return params.get("progressToken")
 
-    def _owner_session(self) -> str | None:
+    def _caller_session(self) -> str | None:
         try:
-            from .sessions import owning_session
+            from .sessions import caller_session
 
-            return owning_session(self.client.state_dir)
+            return caller_session(self.client.state_dir)
         except Exception:
             # Attribution is a convenience; never fail a launch over it.
             return None

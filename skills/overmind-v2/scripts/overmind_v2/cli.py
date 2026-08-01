@@ -153,6 +153,16 @@ def build_parser() -> argparse.ArgumentParser:
     jobs.add_argument("--state")
     jobs.add_argument("--provider")
     jobs.add_argument("--label")
+    jobs.add_argument(
+        "--all",
+        dest="all_sessions",
+        action="store_true",
+        help="list every session's jobs instead of only this session's",
+    )
+    jobs.add_argument(
+        "--owner-session",
+        help="list a specific session's jobs by identifier",
+    )
     jobs.add_argument("--since-cursor", type=int)
     jobs.add_argument("--limit", type=int)
 
@@ -173,7 +183,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["any_change", "any_terminal", "all_terminal"],
         default="all_terminal",
     )
-    wait.add_argument("--since-cursor", type=int, default=0)
+    wait.add_argument(
+        "--since-cursor",
+        type=int,
+        default=None,
+        help="resume from a prior response's cursor; omit to wait from now, 0 to replay all",
+    )
     wait.add_argument("--timeout", "--timeout-seconds", dest="timeout", type=float, default=3600)
 
     collect = commands.add_parser(
@@ -245,6 +260,13 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", parents=[common], help="report broker capabilities")
     doctor.set_defaults(operation="doctor")
 
+    restart = commands.add_parser(
+        "restart",
+        parents=[common],
+        help="gracefully swap the broker daemon onto the current code",
+    )
+    restart.set_defaults(operation="restart")
+
     orphans = commands.add_parser(
         "orphans",
         parents=[common],
@@ -297,7 +319,12 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         value = _read_json(input_path)
         if not isinstance(value, dict):
             raise OvermindError("--input must contain a JSON object", code="invalid_input")
-        return "run-many" if operation == "run_many" else operation, value
+        operation = "run-many" if operation == "run_many" else operation
+        if operation in {"run", "run-many", "reply", "jobs"} and value.get(
+            "scope"
+        ) != "all":
+            _attach_caller(value, getattr(args, "state_dir", None))
+        return operation, value
 
     params: dict[str, Any]
     if operation == "run":
@@ -325,7 +352,7 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             _set(params, key, getattr(args, key))
         if args.allow_billing_class_change:
             params["allow_billing_class_change"] = True
-        _attach_owner(params, getattr(args, "state_dir", None))
+        _attach_caller(params, getattr(args, "state_dir", None))
         if getattr(args, "isolate_worker_config", None) is False:
             params["isolate_worker_config"] = False
         if getattr(args, "workspace_note", None) is False:
@@ -349,12 +376,17 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         _set(params, "idempotency_key", args.idempotency_key)
         if args.allow_billing_class_change:
             params["allow_billing_class_change"] = True
+        _attach_caller(params, getattr(args, "state_dir", None))
         operation = "run-many"
     elif operation == "jobs":
         params = {}
-        for key in ("group_id", "state", "provider", "label", "limit"):
+        for key in ("group_id", "state", "provider", "label", "limit", "owner_session"):
             _set(params, key, getattr(args, key))
         _set(params, "after_cursor", args.since_cursor)
+        if getattr(args, "all_sessions", False):
+            params["scope"] = "all"
+        else:
+            _attach_caller(params, getattr(args, "state_dir", None))
     elif operation == "show":
         if args.target is None:
             raise OvermindError("show requires a target unless --input is used", code="invalid_input")
@@ -367,9 +399,9 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         params = {
             "target": args.target,
             "condition": args.condition,
-            "since_cursor": args.since_cursor,
             "timeout": args.timeout,
         }
+        _set(params, "since_cursor", args.since_cursor)
     elif operation == "collect":
         if not args.targets:
             raise OvermindError("collect requires a target unless --input is used", code="invalid_input")
@@ -391,6 +423,7 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         _set(params, "label", args.label)
         _set(params, "idempotency_key", args.idempotency_key)
         _set(params, "permission_mode", args.permission_mode)
+        _attach_caller(params, getattr(args, "state_dir", None))
         if getattr(args, "isolate_worker_config", None) is False:
             params["isolate_worker_config"] = False
     elif operation in {"stop", "forget"}:
@@ -409,20 +442,20 @@ def request_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
     return operation, params
 
 
-def _attach_owner(params: dict[str, Any], state_dir: Any) -> None:
-    """Record which session launched this worker, so it can be found or reaped later."""
+def _attach_caller(params: dict[str, Any], state_dir: Any) -> None:
+    """Name the calling session: launch owner for run/reply, visibility scope for jobs."""
 
-    if params.get("owner_session"):
+    if params.get("caller_session") or params.get("owner_session"):
         return
     try:
         from .client import default_state_dir
-        from .sessions import owning_session
+        from .sessions import caller_session
 
-        owner = owning_session(Path(state_dir) if state_dir else default_state_dir())
+        caller = caller_session(Path(state_dir) if state_dir else default_state_dir())
     except Exception:
         return
-    if owner:
-        params["owner_session"] = owner
+    if caller:
+        params["caller_session"] = caller
 
 
 def _display_id(value: Any) -> str:
@@ -549,8 +582,17 @@ def render_human(operation: str, value: Any) -> str:
     group_id = value.get("group_id")
     if group_id:
         lines.append(f"GROUP {_display_id(group_id)}")
-    if rows:
+    if rows or (operation == "jobs" and value.get("scope") is not None):
+        scope = value.get("scope")
+        if operation == "jobs" and scope is not None:
+            total = value.get("total", len(rows))
+            lines.append(
+                f"SCOPE {_display_id(scope)} ({len(rows)} of {total} jobs)"
+            )
         lines.extend(_job_table(rows))
+        hint = value.get("hint")
+        if hint:
+            lines.append(f"NOTE {hint}")
         cursor = value.get("cursor")
         if cursor is not None:
             lines.append(f"CURSOR {cursor}")
@@ -607,8 +649,6 @@ def _orphans(args: Any) -> int:
     live = {
         str(record["session_id"]) for record in read_all(client.state_dir) if is_live(record)
     }
-    # The jobs snapshot deliberately omits provider_payload, and owner_session lives
-    # there, so read the store directly rather than widening the wire format.
     import sqlite3
 
     orphaned = []
@@ -620,17 +660,12 @@ def _orphans(args: Any) -> int:
         raise OvermindError(f"cannot read the job store: {error}") from error
     try:
         rows = connection.execute(
-            "SELECT id, short_id, label, provider, provider_payload_json FROM jobs "
+            "SELECT id, short_id, label, provider, owner_session FROM jobs "
             "WHERE state IN ('running','starting','queued')"
         ).fetchall()
     finally:
         connection.close()
-    for job_id, short_id, label, provider, payload_json in rows:
-        try:
-            payload = json.loads(payload_json or "{}")
-        except ValueError:
-            continue
-        owner = payload.get("owner_session") if isinstance(payload, dict) else None
+    for job_id, short_id, label, provider, owner in rows:
         if owner and str(owner) not in live:
             orphaned.append(
                 (
@@ -689,12 +724,68 @@ def _orphans(args: Any) -> int:
     return 0
 
 
+def _restart(args: Any) -> int:
+    """Swap the daemon onto the code currently on disk, without losing jobs.
+
+    Nonterminal jobs are reconciled by the fresh daemon on start; workers keep
+    running throughout because providers own their processes, not the daemon.
+    """
+
+    import time
+
+    state_dir = getattr(args, "state_dir", None)
+    quiet = DaemonClient(state_dir, autostart=False)
+    old_pid = None
+    try:
+        old_pid = quiet.request("shutdown", {}).get("pid")
+    except OvermindError:
+        pass  # no daemon running; starting one loads current code anyway
+    deadline = time.monotonic() + 15
+    while old_pid is not None and time.monotonic() < deadline:
+        try:
+            quiet.request("doctor", {})
+            time.sleep(0.1)
+        except OvermindError:
+            break
+    fresh = DaemonClient(state_dir, autostart=True)
+    report: dict[str, Any] = {}
+    last_error: OvermindError | None = None
+    while time.monotonic() < deadline:
+        try:
+            report = fresh.request("doctor", {})
+            break
+        except OvermindError as error:
+            # The old daemon releases its singleton lock a beat after its
+            # socket closes; an early start attempt loses the lock race.
+            last_error = error
+            time.sleep(0.2)
+    if not report:
+        raise last_error or OvermindError("broker did not restart in time")
+    daemon = report.get("daemon") or {}
+    code = report.get("code") or {}
+    if getattr(args, "json", False):
+        json.dump(
+            {"old_pid": old_pid, "daemon": daemon, "code": code},
+            sys.stdout,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        sys.stdout.write("\n")
+    else:
+        origin = f"pid {old_pid}" if old_pid else "not running"
+        stale = "stale" if code.get("stale") else "current"
+        print(f"restarted: {origin} -> pid {daemon.get('pid')} (code {stale})")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if getattr(args, "operation", None) == "orphans":
+    if getattr(args, "operation", None) in {"orphans", "restart"}:
         try:
-            return _orphans(args)
+            if args.operation == "orphans":
+                return _orphans(args)
+            return _restart(args)
         except OvermindError as error:
             print(f"om: {error}", file=sys.stderr)
             return 1

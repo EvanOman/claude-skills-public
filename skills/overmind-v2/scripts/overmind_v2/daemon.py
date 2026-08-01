@@ -142,6 +142,28 @@ class Daemon:
                         params = request.get("params", {})
                         if not isinstance(params, dict):
                             raise OvermindError("request params must be an object")
+                        if method == "shutdown":
+                            # Graceful daemon swap (om restart). Answer first so
+                            # the caller knows the request landed, then stop
+                            # accepting; the next client autostarts a fresh
+                            # daemon on the code currently on disk.
+                            self._send(
+                                writer,
+                                write_lock,
+                                {
+                                    "id": request_id,
+                                    "ok": True,
+                                    "result": {"stopping": True, "pid": os.getpid()},
+                                },
+                            )
+                            self.log("shutdown requested")
+                            self.stop_event.set()
+                            if self.server is not None:
+                                try:
+                                    self.server.close()
+                                except OSError:
+                                    pass
+                            return
 
                         def progress(value: dict[str, Any]) -> None:
                             self._send(

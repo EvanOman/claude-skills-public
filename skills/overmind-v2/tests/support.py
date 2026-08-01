@@ -190,6 +190,10 @@ class Harness:
             OVERMIND_V2_FAKE_PROVIDER=str(TESTS / "fake_provider.py"),
             OVERMIND_V2_FAKE_STATE_DIR=str(self.provider_state),
             OVERMIND_V2_FAKE_CALL_LOG=str(self.calls),
+            # Pin the caller identity: on a developer machine the harness's own
+            # ancestry can contain a real agent process, and ancestry-derived
+            # identities would make ownership scoping nondeterministic per host.
+            OVERMIND_V2_OWNER_SESSION="blackbox-test-session",
             PYTHONUNBUFFERED="1",
         )
     def close(self) -> None:

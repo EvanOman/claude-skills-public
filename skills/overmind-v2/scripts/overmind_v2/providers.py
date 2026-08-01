@@ -1102,6 +1102,14 @@ class ClaudeProvider(Provider):
                 # or the CLI's headline, as the worker's report. Look again next poll.
                 update["state"] = "running"
                 return update
+            transcript = self._transcript_path(value)
+            if transcript is not None:
+                # The transcript is the one artifact that always holds the
+                # worker's full output; registering it keeps the deliverable a
+                # documented hop away even when result extraction goes wrong.
+                update["artifacts"].append(
+                    {"kind": "transcript", "path": str(transcript)}
+                )
             final_message = self._final_assistant_message(value)
             output = value.get("output")
             if final_message:
@@ -1619,8 +1627,11 @@ def _codex_runner(arguments: argparse.Namespace) -> int:
     if interrupted:
         terminal = "interrupted"
     else:
-        terminal = "succeeded" if return_code == 0 else "failed"
-    if return_code == 0:
+        # turn.failed is authoritative even on a zero exit code: a CLI that
+        # exits 0 after reporting a failed turn must not land `succeeded` with
+        # no error, because a terminal job is never reconciled again.
+        terminal = "succeeded" if return_code == 0 and not turn_error else "failed"
+    if terminal == "succeeded":
         error: str | None = None
     else:
         stderr_text = error_path.read_text(encoding="utf-8").strip()

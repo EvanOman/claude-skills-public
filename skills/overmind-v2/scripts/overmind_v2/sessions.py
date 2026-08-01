@@ -133,3 +133,46 @@ def owning_session(state_dir: Path, pid: int | None = None) -> str | None:
         if session:
             return session
     return None
+
+
+# Process names that look like an agent harness. Used only to anchor an
+# anonymous session identity; claiming the wrong ancestor costs nothing worse
+# than a private scope named after that process.
+HARNESS_COMMS = frozenset({"claude", "codex", "node", "bun"})
+
+
+def _process_comm(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def caller_session(state_dir: Path) -> str | None:
+    """The session this process runs under, registering an anonymous one if needed.
+
+    Session isolation must not depend on the operator having installed the
+    status-line registration hook. When no registered session matches, anchor an
+    identity on the nearest harness-looking ancestor process and register it —
+    every client spawned by the same session then resolves the same identity,
+    because the registry match walks the same ancestry. A process with no
+    harness ancestor (a bare terminal) gets no identity and sees only unowned
+    jobs unless it asks for a wider scope by name.
+    """
+
+    owner = owning_session(state_dir)
+    if owner:
+        return owner
+    for pid in ancestry(os.getpid())[1:]:
+        comm = _process_comm(pid)
+        if comm and comm.lower() in HARNESS_COMMS:
+            identity = process_start_identity(pid)
+            if not identity:
+                return None
+            session_id = f"proc-{pid}-{identity}"
+            try:
+                register(state_dir, session_id, pid)
+            except OSError:
+                pass
+            return session_id
+    return None

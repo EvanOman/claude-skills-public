@@ -19,6 +19,7 @@ from . import (
     NotFoundError,
     OvermindError,
     SCHEMA_VERSION,
+    STATES,
     TERMINAL_STATES,
 )
 from .providers import Provider, ensure_billing, provider_registry, write_private
@@ -30,6 +31,26 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 # Consecutive failed observations before a watcher gives up on a job. Retries are
 # backed off, so this is roughly half a minute of sustained failure.
 OBSERVATION_FAILURE_LIMIT = 5
+
+_SOURCE_DIR = Path(__file__).resolve().parent
+_STARTED_AT = time.time()
+
+
+def _source_mtime() -> float:
+    """Newest mtime across this package's modules, 0.0 when unreadable."""
+    try:
+        return max(
+            (path.stat().st_mtime for path in _SOURCE_DIR.glob("*.py")),
+            default=0.0,
+        )
+    except OSError:
+        return 0.0
+
+
+# Captured at import so a long-lived daemon can tell whether the code on disk
+# has moved on without it. A stale daemon silently lacks documented behavior,
+# and nothing else in the system can detect that.
+_LOADED_SOURCE_MTIME = _source_mtime()
 
 
 class Broker:
@@ -112,6 +133,7 @@ class Broker:
                 "result_path",
                 "log_path",
                 "error",
+                "owner_session",
                 "created_at",
                 "updated_at",
                 "terminal_at",
@@ -210,11 +232,18 @@ class Broker:
             else:
                 parent_id = None
             provider_payload = dict(raw)
+            provider_payload.pop("caller_session", None)
             for option in self._PASSTHROUGH_PROVIDER_OPTIONS:
                 if option not in provider_payload and defaults.get(option) is not None:
                     provider_payload[option] = defaults[option]
+            owner = provider_payload.get("owner_session") or defaults.get(
+                "caller_session"
+            )
+            if owner is not None:
+                provider_payload["owner_session"] = str(owner)
             prepared.append(
                 {
+                    "owner_session": str(owner) if owner is not None else None,
                     "id": job_id,
                     "short_id": short_id,
                     "group_id": group_id,
@@ -250,7 +279,7 @@ class Broker:
     def run(self, params: Mapping[str, Any]) -> dict[str, Any]:
         raw = dict(params)
         job = dict(raw.pop("job", {})) if raw.get("job") else dict(raw)
-        for key in ("idempotency_key", "group_id", "group_label"):
+        for key in ("idempotency_key", "group_id", "group_label", "caller_session"):
             job.pop(key, None)
         group = params.get("group") if isinstance(params.get("group"), dict) else {}
         label = str(
@@ -294,8 +323,26 @@ class Broker:
         requested_group: Any,
         group_label: str,
     ) -> dict[str, Any]:
+        # The idempotency hash covers what the caller asked for, not who asked.
+        # owner_session is injected per calling session, so hashing it would make
+        # the same logical launch, replayed after a parent restart from a new
+        # session, a conflict instead of the original entity — the exact recovery
+        # the key exists for. The worker options ARE hashed: a same-key request
+        # that changes them is a different request and must conflict loudly.
+        hashed_options = tuple(
+            option
+            for option in self._PASSTHROUGH_PROVIDER_OPTIONS
+            if option != "owner_session"
+        )
         request_payload = {
-            "jobs": [dict(item) for item in raw_jobs],
+            "jobs": [
+                {
+                    key: value
+                    for key, value in dict(item).items()
+                    if key not in {"owner_session", "caller_session"}
+                }
+                for item in raw_jobs
+            ],
             "defaults": {
                 key: defaults.get(key)
                 for key in (
@@ -307,6 +354,7 @@ class Broker:
                     "allow_billing_class_change",
                     "parent_job_id",
                     "resume_thread",
+                    *hashed_options,
                 )
                 if defaults.get(key) is not None
             },
@@ -457,15 +505,7 @@ class Broker:
     ) -> dict[str, Any]:
         current = self.store.get_job(job_id)
         state = str(observation.get("state", current["state"]))
-        if state not in {
-            "queued",
-            "starting",
-            "running",
-            "succeeded",
-            "failed",
-            "interrupted",
-            "unknown",
-        }:
+        if state not in STATES:
             state = "unknown"
         fields = {
             key: observation[key]
@@ -606,18 +646,60 @@ class Broker:
 
     def jobs(self, params: Mapping[str, Any]) -> dict[str, Any]:
         filters = dict(params)
+        caller = filters.pop("caller_session", None)
+        scope_request = str(filters.pop("scope", "") or "")
+        explicit_owner = filters.pop("owner_session", None)
         if filters.get("since_cursor") is not None and filters.get("after_cursor") is None:
             filters["after_cursor"] = filters["since_cursor"]
-        if filters.get("group") and not filters.get("group_id"):
-            _, filters["group_id"] = self.store.resolve(
-                str(filters.pop("group")), kind="group"
-            )
-        rows = self.store.list_jobs(filters)
-        return {
+        for key in ("group", "group_id"):
+            # Resolve every group reference, short IDs included. A short ID that
+            # silently matched nothing used to return a well-formed empty list,
+            # which reads as "my group is done" and invites a duplicate launch.
+            if filters.get(key):
+                _, filters["group_id"] = self.store.resolve(
+                    str(filters.pop(key)), kind="group"
+                )
+                break
+        # Visibility: a session sees its own workers. Anything wider must be
+        # asked for by identifier (a group, a named owner) or with scope=all.
+        scope: dict[str, Any]
+        if scope_request == "all":
+            scope = {"all": True}
+        elif filters.get("group_id") is not None:
+            scope = {"group": True}
+        elif explicit_owner is not None:
+            scope = {"owner_session": str(explicit_owner)}
+        elif scope_request in {"", "mine"}:
+            scope = {"owner_session": str(caller) if caller else None}
+        else:
+            raise OvermindError(f"invalid jobs scope: {scope_request}")
+        rows, total = self.store.list_jobs(filters, scope=scope)
+        described = (
+            "all"
+            if scope.get("all")
+            else "group"
+            if scope.get("group")
+            else scope.get("owner_session") or "unowned"
+        )
+        response = {
             "jobs": [self._job_snapshot(job) for job in rows],
             "cursor": self.store.latest_cursor(),
             "count": len(rows),
+            "total": total,
+            "truncated": total > len(rows),
+            "scope": described,
         }
+        if described == "unowned" and not scope.get("all"):
+            response["hint"] = (
+                "no calling session was identified, so only unowned jobs are "
+                "listed; pass scope=all (om jobs --all) for every session"
+            )
+        if response["truncated"]:
+            response["hint"] = (
+                f"showing newest {len(rows)} of {total}; raise limit or narrow "
+                "filters for the rest"
+            )
+        return response
 
     def _resolve_target(
         self,
@@ -742,10 +824,14 @@ class Broker:
             raise OvermindError("await requires target")
         target, jobs = self._target_jobs(target_value)
         condition = str(params.get("condition", "all_terminal"))
-        cursor = int(params.get("since_cursor", 0))
+        since = params.get("since_cursor")
+        # An omitted cursor means "from now": replaying a group's whole event
+        # history is 3-4x the payload and is only wanted when explicitly resuming
+        # (pass the cursor from a prior response, or an explicit 0 for everything).
+        cursor = int(since) if since is not None else self.store.latest_cursor()
         timeout = max(
             0.0,
-            min(float(params.get("timeout", params.get("timeout_seconds", 300))), 86400.0),
+            min(float(params.get("timeout", params.get("timeout_seconds", 3600))), 86400.0),
         )
         deadline = time.monotonic() + timeout
         while True:
@@ -809,12 +895,20 @@ class Broker:
         preview_bytes = max(
             0,
             min(
-                int(params.get("preview_bytes", params.get("max_chars", 2000))),
+                int(params.get("preview_bytes", params.get("max_chars", 4000))),
                 20000,
             ),
         )
-        if params.get("target") or params.get("id"):
-            target, jobs = self._target_jobs(params.get("target", params.get("id")))
+        raw_target = params.get("target", params.get("id"))
+        if isinstance(raw_target, Mapping) and isinstance(
+            raw_target.get("job_ids"), list
+        ):
+            # The MCP schema folds an explicit job list into target so the tool
+            # keeps a plain `required` list (a root anyOf gets it dropped).
+            params = {**dict(params), "job_ids": raw_target["job_ids"]}
+            raw_target = None
+        if raw_target:
+            target, jobs = self._target_jobs(raw_target)
         elif isinstance(params.get("targets"), list):
             jobs = []
             seen: set[str] = set()
@@ -827,7 +921,7 @@ class Broker:
             target = {"kind": "jobs", "id": None}
         elif isinstance(params.get("job_ids"), list):
             jobs = []
-            for value in params["job_ids"][:max_jobs]:
+            for value in params["job_ids"]:
                 _, job_id = self.store.resolve(str(value), kind="job")
                 jobs.append(self.store.get_job(job_id))
             target = {"kind": "jobs", "id": None}
@@ -860,7 +954,14 @@ class Broker:
         return {
             "target": target,
             "results": results,
-            "bounded": {"max_jobs": max_jobs, "preview_bytes": preview_bytes},
+            "bounded": {
+                "max_jobs": max_jobs,
+                "preview_bytes": preview_bytes,
+                # Silent truncation reads as "collected everything". Say when
+                # the cap bit and how many terminal jobs were actually eligible.
+                "jobs_total": len(selected_jobs),
+                "jobs_truncated": len(selected_jobs) > max_jobs,
+            },
             "cursor": self.store.latest_cursor(),
         }
 
@@ -899,6 +1000,15 @@ class Broker:
                 child_params[option] = params[option]
             elif parent_payload.get(option) is not None:
                 child_params[option] = parent_payload[option]
+        # A continuation of an owned job stays owned. Prefer the parent's owner
+        # (set above via passthrough); otherwise attribute to whoever is asking,
+        # so the continuation does not become an unattributable orphan.
+        if not child_params.get("owner_session"):
+            child_params["owner_session"] = parent.get("owner_session") or params.get(
+                "caller_session"
+            )
+        if not child_params.get("owner_session"):
+            child_params.pop("owner_session", None)
         response = self._run_many(
             [child_params],
             defaults={**child_params, "resume_thread": parent["provider_thread_id"]},
@@ -928,9 +1038,15 @@ class Broker:
             {f"{kind}_id": entity_id}
         )
         results = []
+        actions = Counter()
         for job in jobs:
             if job["state"] in TERMINAL_STATES:
-                results.append(self._job_snapshot(job))
+                # Nothing was interrupted; without saying so, the caller cannot
+                # tell a landed stop from one that arrived after the fact.
+                snapshot = self._job_snapshot(job)
+                snapshot["stop_action"] = "already_terminal"
+                actions["already_terminal"] += 1
+                results.append(snapshot)
                 continue
             if not (
                 job.get("provider_job_id")
@@ -943,6 +1059,7 @@ class Broker:
                     state="interrupted",
                     fields={"error": "stopped before provider launch"},
                 )
+                action = "interrupted_before_launch"
             else:
                 observation = self._provider(job["provider"]).interrupt(job)
                 updated = self._apply_observation(
@@ -950,11 +1067,16 @@ class Broker:
                 )
                 if updated["state"] not in TERMINAL_STATES:
                     self._watch(job["id"])
-            results.append(self._job_snapshot(updated))
+                action = "interrupt_requested"
+            snapshot = self._job_snapshot(updated)
+            snapshot["stop_action"] = action
+            actions[action] += 1
+            results.append(snapshot)
         self._notify()
         result = {
             "target": target,
             "jobs": results,
+            "actions": dict(sorted(actions.items())),
             "cursor": self.store.latest_cursor(),
         }
         self.store.remember_idempotency("stop", request_payload, key, result)
@@ -994,12 +1116,21 @@ class Broker:
         excerpt = str(job.get("error") or "")
         if len(excerpt) > 500:
             excerpt = excerpt[:500] + "…"
+        occurred_at = job.get("terminal_at") or job.get("updated_at")
+        last_success = self.store.last_provider_success(provider)
         return {
             "job_id": job.get("id"),
             "short_id": job.get("short_id"),
             "state": job.get("state"),
             "message": excerpt,
-            "occurred_at": job.get("terminal_at") or job.get("updated_at"),
+            "occurred_at": occurred_at,
+            # A failure older than the newest success is history. Without this
+            # flag a parent keeps avoiding a provider that already recovered.
+            "superseded_by_success": bool(
+                last_success is not None
+                and occurred_at is not None
+                and last_success > float(occurred_at)
+            ),
         }
 
     def doctor(self, _params: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -1022,7 +1153,11 @@ class Broker:
                 production[name] = capabilities
             else:
                 tests[name] = capabilities
-        return {
+        disk_mtime = _source_mtime()
+        code_stale = bool(
+            _LOADED_SOURCE_MTIME and disk_mtime > _LOADED_SOURCE_MTIME + 1.0
+        )
+        report = {
             "schema_version": SCHEMA_VERSION,
             "database": str(self.store.db_path),
             "state_dir": str(self.state_dir),
@@ -1030,12 +1165,26 @@ class Broker:
                 "pid": os.getpid(),
                 "socket": str(self.state_dir / "overmind.sock"),
                 "socket_present": (self.state_dir / "overmind.sock").exists(),
+                "started_at": _STARTED_AT,
+                "uptime_seconds": max(0.0, time.time() - _STARTED_AT),
+            },
+            "code": {
+                "source_dir": str(_SOURCE_DIR),
+                "loaded_mtime": _LOADED_SOURCE_MTIME,
+                "disk_mtime": disk_mtime,
+                "stale": code_stale,
             },
             "journal_mode": "wal",
             "providers": production,
             "test_providers": tests,
             "latest_cursor": self.store.latest_cursor(),
         }
+        if code_stale:
+            report["code"]["hint"] = (
+                "broker source changed on disk after this daemon loaded it; "
+                "documented behavior may be missing until you run `om restart`"
+            )
+        return report
 
     def dispatch(
         self,

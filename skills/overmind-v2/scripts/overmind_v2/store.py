@@ -162,6 +162,7 @@ class Store:
                     capabilities_json TEXT NOT NULL DEFAULT '{{}}',
                     provider_payload_json TEXT NOT NULL DEFAULT '{{}}',
                     allow_billing_class_change INTEGER NOT NULL DEFAULT 0,
+                    owner_session TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     terminal_at REAL
@@ -217,6 +218,20 @@ class Store:
                 connection.execute(
                     "ALTER TABLE jobs ADD COLUMN allow_billing_class_change INTEGER NOT NULL DEFAULT 0"
                 )
+            if "owner_session" not in columns:
+                # Ownership used to live only inside provider_payload_json. It is
+                # now the session-isolation boundary, so it must be a real column
+                # the default query path can filter on. Backfill from the payload.
+                connection.execute("ALTER TABLE jobs ADD COLUMN owner_session TEXT")
+                connection.execute(
+                    "UPDATE jobs SET owner_session="
+                    "json_extract(provider_payload_json, '$.owner_session') "
+                    "WHERE owner_session IS NULL"
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_owner_idx "
+                "ON jobs(owner_session, created_at)"
+            )
             row = connection.execute(
                 "SELECT version FROM schema_meta LIMIT 1"
             ).fetchone()
@@ -333,8 +348,9 @@ class Store:
                     """INSERT INTO jobs(
                          id,short_id,group_id,parent_job_id,provider,label,cwd,model,
                          billing_class,state,brief_path,capabilities_json,
-                         provider_payload_json,allow_billing_class_change,created_at,updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         provider_payload_json,allow_billing_class_change,owner_session,
+                         created_at,updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         job["id"],
                         job["short_id"],
@@ -350,6 +366,7 @@ class Store:
                         canonical_json(job.get("capabilities", {})),
                         canonical_json(job.get("provider_payload", {})),
                         int(bool(job.get("allow_billing_class_change", False))),
+                        job.get("owner_session"),
                         now,
                         now,
                     ),
@@ -638,11 +655,40 @@ class Store:
         ]
 
     def list_jobs(
-        self, filters: Mapping[str, Any] | None = None
-    ) -> list[dict[str, Any]]:
+        self,
+        filters: Mapping[str, Any] | None = None,
+        *,
+        scope: Mapping[str, Any],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """List job snapshots, newest first, within an explicit visibility scope.
+
+        ``scope`` is required so no call site can list jobs without deciding who
+        may see them. It is one of ``{"all": True}``, ``{"owner_session": id}``
+        (``None`` selects only unowned jobs), or ``{"group": True}`` when a
+        ``group_id`` filter already names the entity — a full identifier is a
+        capability that crosses sessions. Returns ``(rows, total_matched)``.
+        """
+
         filters = dict(filters or {})
         clauses: list[str] = []
         values: list[Any] = []
+        scope = dict(scope)
+        if scope.get("all"):
+            pass
+        elif scope.get("group"):
+            if filters.get("group_id") is None:
+                raise ValueError("group scope requires a group_id filter")
+        elif "owner_session" in scope:
+            owner = scope["owner_session"]
+            if owner is None:
+                clauses.append("j.owner_session IS NULL")
+            else:
+                clauses.append("j.owner_session=?")
+                values.append(str(owner))
+        else:
+            raise ValueError(
+                "list_jobs requires an explicit scope: all, owner_session, or group"
+            )
         for key in ("group_id", "label"):
             if filters.get(key) is not None:
                 clauses.append(f"j.{key}=?")
@@ -676,13 +722,21 @@ class Store:
             )
             values.append(int(after_cursor))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        limit = max(1, min(int(filters.get("limit", 200)), 5000))
+        limit = max(1, min(int(filters.get("limit", 20)), 5000))
         with self.connection() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM jobs j{where}", tuple(values)
+                ).fetchone()[0]
+            )
+            # Newest first: the caller asking "what is going on" wants the jobs
+            # it just launched, not the oldest 200 in a long-lived shared store.
             rows = connection.execute(
-                f"SELECT j.* FROM jobs j{where} ORDER BY j.created_at LIMIT ?",
+                f"SELECT j.* FROM jobs j{where} "
+                "ORDER BY j.created_at DESC, j.rowid DESC LIMIT ?",
                 (*values, limit),
             ).fetchall()
-        return [self._decode_job(row) for row in rows]
+        return [self._decode_job(row) for row in rows], total
 
     def group_jobs(self, group_id: str) -> list[dict[str, Any]]:
         with self.connection() as connection:
@@ -719,6 +773,24 @@ class Store:
                 (provider, *sorted(TERMINAL_STATES)),
             ).fetchone()
         return self._decode_job(row) if row is not None else None
+
+    def last_provider_success(self, provider: str) -> float | None:
+        """When this provider last completed a job successfully.
+
+        Companion evidence to ``last_provider_failure``: a failure older than the
+        newest success is history, not current health, and a parent deciding
+        whether to fan out needs to see which is which.
+        """
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(terminal_at, updated_at) AS at FROM jobs
+                WHERE provider=? AND state='succeeded'
+                ORDER BY at DESC LIMIT 1
+                """,
+                (provider,),
+            ).fetchone()
+        return float(row["at"]) if row is not None else None
 
     def events_since(
         self,
@@ -766,6 +838,10 @@ class Store:
             if row["state"] not in TERMINAL_STATES:
                 raise ConflictError(f"cannot forget nonterminal job {job_id}")
             connection.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+            # Forgetting removes the lifecycle record; its event history must go
+            # with it, or a cursor consumer replays events for an id that `show`
+            # says does not exist. The tombstone below is the one record kept.
+            connection.execute("DELETE FROM events WHERE job_id=?", (job_id,))
             connection.execute(
                 "DELETE FROM idempotency WHERE entity_json LIKE ?",
                 (f"%{job_id}%",),
@@ -777,6 +853,21 @@ class Store:
                 kind="job.forgotten",
                 payload={"forgotten_job_id": job_id},
             )
+            remaining = connection.execute(
+                "SELECT COUNT(*) FROM jobs WHERE group_id=?", (row["group_id"],)
+            ).fetchone()[0]
+            if not int(remaining):
+                # Do not leave a zero-job shell behind: a group exists to hold a
+                # fan-out, and an empty one only reads as a broken record.
+                connection.execute(
+                    "DELETE FROM groups WHERE id=?", (row["group_id"],)
+                )
+                self._event(
+                    connection,
+                    entity_type="group",
+                    kind="group.forgotten",
+                    payload={"forgotten_group_id": str(row["group_id"])},
+                )
 
     def forget_group(self, group_id: str) -> None:
         with self.transaction(immediate=True) as connection:
@@ -792,6 +883,10 @@ class Store:
             ).rowcount
             if not deleted:
                 raise NotFoundError(f"group not found: {group_id}")
+            connection.execute(
+                "DELETE FROM events WHERE group_id=? AND kind != 'group.forgotten'",
+                (group_id,),
+            )
             connection.execute(
                 "DELETE FROM idempotency WHERE entity_json LIKE ?",
                 (f"%{group_id}%",),
