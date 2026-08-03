@@ -86,18 +86,37 @@ Size:       S | M | L
 
 Findings that recommend a pattern above the tier do not go in the report. If one feels genuinely necessary, that means the gate was scored wrong — go back and rescore it with the new evidence rather than smuggling the pattern in.
 
+### The evidence list is a sample, not an inventory
+
+When a finding is "this rule lives in N places," **N is a lower bound and must be labelled as one.** Write it as "at least five sites, found by <the search you ran>" — never as a closed list.
+
+This is not a hedge. Measured on a real audit: the finding named four duplicated sites; verification found five; and after the rule was extracted, a further three turned up — the audit had located 44% of them. A refactor that treats the finding as an inventory stops at the listed sites and ships a module named as the single home that isn't one, which is worse than leaving the duplication alone, because now the name lies.
+
+So: state the search you used, so the next person can widen it. And whoever does the work re-runs discovery rather than working from your list.
+
+**Extraction is itself a discovery tool.** Those last three sites were findable only *after* the rule had a name and a module — at which point you can grep for everything that computes the rule without calling it. Build the re-grep into the sequence as its own step, positioned after the first extraction lands, not before.
+
 ## Step 5 — Sequence the work
 
 Findings are not a plan. Convert them into an ordered list of changes where **each step is independently shippable and leaves the tests green.** For each: what it touches, what it unblocks, roughly how big.
 
 Ordering rules that hold up in practice:
 
-1. **Fix live bugs first**, especially any the audit uncovered. Never refactor over a known correctness bug — you will lose track of whether the refactor caused it.
+1. **Fix live bugs first**, especially any the audit uncovered. Never refactor over a known correctness bug — you will lose track of whether the refactor caused it. The exception is a bug you intend to preserve while restructuring: pin it with a test asserting the *current wrong value*, and correct it later in its own commit that deliberately updates that test. That keeps the behavior change visible in history instead of buried inside a refactor diff.
 2. **Get a test around it before moving it.** Where coverage is missing for something about to change, adding a characterization test is its own first step.
-3. **Seams before models.** Extracting an I/O boundary — an LLM client, a notifier, a store — is mechanical, low-risk, and makes everything after it testable. Model changes before seams means changing untested code.
-4. **Names before structure.** Renaming is cheap, reviewable, and often reveals that a planned structural change is unnecessary.
-5. **One aggregate at a time**, each with its use cases moved along with it.
-6. **Duplication is acceptable in transit.** Copying a use case to a new home and cleaning it there beats a chain of calls into the old mess. Delete the original once callers move.
+3. **Re-run discovery after the first extraction.** Once the rule has a name, grep for everything that still computes it without calling it. Expect to find sites the audit missed; see "The evidence list is a sample" above.
+4. **Seams before models.** Extracting an I/O boundary — an LLM client, a notifier, a store — is mechanical, low-risk, and makes everything after it testable. Model changes before seams means changing untested code.
+5. **Names before structure.** Renaming is cheap, reviewable, and often reveals that a planned structural change is unnecessary.
+6. **One aggregate at a time**, each with its use cases moved along with it.
+7. **Duplication is acceptable in transit.** Copying a use case to a new home and cleaning it there beats a chain of calls into the old mess. Delete the original once callers move.
+
+### Prove the safety net before you trust it
+
+A characterization suite is only a net if it fails when the behavior changes. Coverage percentage does not tell you that. Before the first extraction, **mutate the rule and confirm the suite goes red**: move each threshold by one, drop a term from the formula, invert a comparison. Revert every mutation once you have the failure count.
+
+If a mutation passes, you have no net at that point — find out why before touching anything. Two common causes: a test that transcribes the rule instead of calling the code (it will happily agree with any value you write into both places), and a boundary that no test exercises. Both are invisible to coverage tools and both are fatal to the refactor.
+
+Worth having a second reader look specifically for the transcription failure. It is the way characterization suites most often die, and the author is the person least likely to see it.
 
 Do not propose a big-bang rewrite. If the honest answer is that a subsystem should be rebuilt, describe it as a strangler: raise events or write an adapter at the boundary, build the replacement beside it, cut over, delete.
 
