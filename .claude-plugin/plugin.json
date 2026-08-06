@@ -1,7 +1,7 @@
 {
   "name": "evan-skills",
-  "description": "Claude Code skills for research, development, and content creation",
-  "version": "1.0.0",
+  "description": "Cross-harness skills for research, development, and content creation",
+  "version": "1.1.0",
   "author": {
     "name": "Evan Oman"
   },
