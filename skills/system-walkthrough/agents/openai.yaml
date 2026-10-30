@@ -1,0 +1,4 @@
+interface:
+  display_name: "System Walkthrough"
+  short_description: "Source-grounded interactive architecture and behavior guides"
+  default_prompt: "Use $system-walkthrough to explain a bounded behavior in this system with a portable interactive guide."

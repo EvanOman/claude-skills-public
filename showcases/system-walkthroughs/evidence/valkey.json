@@ -1,0 +1,64 @@
+{
+  "input": "index.html",
+  "sha256": "99abb1b8076f7741abcc2992958c659eaab3cd31f4c0f2e93a60df4c2eb968a8",
+  "checkedAt": "2026-10-30T20:09:50.555Z",
+  "browser": "Chrome/156.0.8078.79",
+  "viewports": [
+    {
+      "title": "An absent consumer leaves pending work",
+      "revision": "29173b67508b2de4c0f0ed551f3b47cf19fc3ca8",
+      "width": 1440,
+      "screenshots": [
+        "map-1440.png",
+        "sequence-1440.png"
+      ],
+      "checks": 854,
+      "failures": []
+    },
+    {
+      "title": "An absent consumer leaves pending work",
+      "revision": "29173b67508b2de4c0f0ed551f3b47cf19fc3ca8",
+      "width": 900,
+      "screenshots": [
+        "map-900.png",
+        "sequence-900.png"
+      ],
+      "checks": 854,
+      "failures": []
+    },
+    {
+      "title": "An absent consumer leaves pending work",
+      "revision": "29173b67508b2de4c0f0ed551f3b47cf19fc3ca8",
+      "width": 390,
+      "screenshots": [
+        "map-390.png",
+        "sequence-390.png"
+      ],
+      "checks": 854,
+      "failures": []
+    }
+  ],
+  "environment": [
+    {
+      "name": "Theme survives file reload",
+      "passed": true
+    },
+    {
+      "name": "Reduced-motion path and no automatic animations",
+      "passed": true
+    },
+    {
+      "name": "Denied storage still permits reading and theme switching",
+      "passed": true
+    }
+  ],
+  "limits": [
+    "Checks local exported HTML in desktop Chromium emulation; not physical mobile/Safari or a factual source audit.",
+    "Source hrefs and rendered evidence are checked locally; remote target availability is separate."
+  ],
+  "summary": {
+    "checks": 2565,
+    "passed": 2565,
+    "failed": 0
+  }
+}
