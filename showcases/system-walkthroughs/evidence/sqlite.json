@@ -1,40 +1,36 @@
 {
   "input": "index.html",
-  "sha256": "9a086f677a558c1fe7cb06d893f7276dc9a3d7d1c2e2534f52b0407b8da7161d",
-  "checkedAt": "2026-10-30T20:09:50.552Z",
+  "sha256": "5652cb029dd29cc1c1962375205a647ce128dbb18a0ed03cb63c80799798d7dc",
+  "checkedAt": "2026-10-30T22:17:04.011Z",
   "browser": "Chrome/156.0.8078.79",
   "viewports": [
     {
       "title": "A reader can outlive a WAL commit",
       "revision": "57520227c95396ce39ba6ecaac8d475b78dd3964",
       "width": 1440,
-      "screenshots": [
-        "map-1440.png",
-        "sequence-1440.png"
-      ],
-      "checks": 993,
+      "height": 800,
+      "screenshots": [],
+      "checks": 1134,
       "failures": []
     },
     {
       "title": "A reader can outlive a WAL commit",
       "revision": "57520227c95396ce39ba6ecaac8d475b78dd3964",
       "width": 900,
-      "screenshots": [
-        "map-900.png",
-        "sequence-900.png"
-      ],
-      "checks": 993,
+      "height": 700,
+      "screenshots": [],
+      "checks": 1128,
       "failures": []
     },
     {
       "title": "A reader can outlive a WAL commit",
       "revision": "57520227c95396ce39ba6ecaac8d475b78dd3964",
       "width": 390,
+      "height": 844,
       "screenshots": [
-        "map-390.png",
-        "sequence-390.png"
+        "sqlite-mobile.png"
       ],
-      "checks": 977,
+      "checks": 1118,
       "failures": []
     }
   ],
@@ -57,8 +53,8 @@
     "Source hrefs and rendered evidence are checked locally; remote target availability is separate."
   ],
   "summary": {
-    "checks": 2966,
-    "passed": 2966,
+    "checks": 3383,
+    "passed": 3383,
     "failed": 0
   }
 }

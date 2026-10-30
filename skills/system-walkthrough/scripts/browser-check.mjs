@@ -176,6 +176,63 @@ function exercise() {
   return {title:model.title,revision:model.project.revision,results};
 }
 
+// Unlike the model checks above, these measurements use the physical browser
+// viewport and every clipping ancestor. An element inside an offscreen panel is
+// not readable merely because it fits that panel's own coordinate system.
+function readerGeometry(view) {
+  const block=document.querySelector(`[data-view="${view}"]`);
+  const q=selector=>block?.querySelector(selector);
+  const stage=q('[data-reader-stage]')||q('.sw-diagram-shell');
+  const reader=q('[data-reader]')||q('.sw-inspector-host');
+  const panel=q('.sw-viewport'),heading=q('.sw-inspector h3');
+  const body=heading?.nextElementSibling;
+  const rectangle=r=>({left:r.left,top:r.top,right:r.right,bottom:r.bottom,width:r.width,height:r.height});
+  function visible(element,firstLine=false) {
+    if(!element)return {visible:false,hit:false};
+    let rect=element.getBoundingClientRect();
+    if(firstLine) {
+      const walker=document.createTreeWalker(element,NodeFilter.SHOW_TEXT),text=walker.nextNode();
+      if(text?.length){const range=document.createRange();range.setStart(text,0);range.setEnd(text,Math.min(text.length,40));rect=range.getClientRects()[0]||rect;}
+    }
+    let clip={left:0,top:0,right:innerWidth,bottom:innerHeight};
+    for(let parent=element.parentElement;parent;parent=parent.parentElement) {
+      const style=getComputedStyle(parent),box=parent.getBoundingClientRect();
+      if(style.overflowX!=='visible'){clip.left=Math.max(clip.left,box.left+parent.clientLeft);clip.right=Math.min(clip.right,box.left+parent.clientLeft+parent.clientWidth);}
+      if(style.overflowY!=='visible'){clip.top=Math.max(clip.top,box.top+parent.clientTop);clip.bottom=Math.min(clip.bottom,box.top+parent.clientTop+parent.clientHeight);}
+    }
+    const style=getComputedStyle(element),displayed=style.visibility==='visible'&&style.display!=='none'&&Number(style.opacity)>0;
+    const full=displayed&&rect.width>0&&rect.height>0&&rect.left>=clip.left-1&&rect.right<=clip.right+1&&rect.top>=clip.top-1&&rect.bottom<=clip.bottom+1;
+    const center={x:(rect.left+rect.right)/2,y:(rect.top+rect.bottom)/2},hit=document.elementFromPoint(center.x,center.y);
+    return {visible:full,hit:!!hit&&(element===hit||element.contains(hit)),bounds:rectangle(rect),clip,center};
+  }
+  const previous=q('[data-action="previous"]')||q('.sw-step-navigation button:first-child');
+  const next=q('[data-action="next"]')||q('.sw-step-navigation button:last-child');
+  const diagram=visible(panel),title=visible(heading),start=visible(body,true),prev=visible(previous),forward=visible(next);
+  const choosers=Object.fromEntries([...block.querySelectorAll('select[data-chooser]')].map(select=>[select.dataset.chooser,visible(select)]));
+  const mapControl=choosers.map||visible(q('.sw-controls button[aria-pressed="true"]'));
+  const active=[];
+  let diagramTop=diagram.bounds?.top;
+  if(view==='sequence') {
+    const path=q('.sw-sequence-event[data-active="true"] .sw-message');
+    if(path){const point=path.getPointAtLength(path.getTotalLength()),screen=new DOMPoint(point.x,point.y).matrixTransform(path.getScreenCTM());active.push({x:screen.x,y:screen.y});}
+    diagramTop=Math.max(diagramTop,q('[data-sequence-header]')?.getBoundingClientRect().bottom||diagramTop);
+  } else {
+    const model=JSON.parse(document.getElementById('walkthrough-model').textContent);
+    const item=(view==='map'?[...model.map.lenses,...(model.map.intents||[])]:model.walkthrough.steps).find(item=>item.id===block.dataset.selection);
+    // A clipped overview must reveal a receiver from the selected exchange (or
+    // an explicitly selected node), not merely an unrelated highlighted origin.
+    const receivers=model.map.edges.filter(edge=>item.edges.includes(edge.id)).map(edge=>edge.to);
+    const targets=receivers.length?receivers:item.nodes;
+    for(const id of targets){const info=visible(q(`.sw-map-node[data-node="${id}"] .sw-node-label`));if(info.visible)active.push(info.center);}
+  }
+  const activeVisible=active.some(point=>diagram.visible&&point.x>=diagram.bounds.left+1&&point.x<=diagram.bounds.right-1&&point.y>=diagramTop+1&&point.y<=diagram.bounds.bottom-1);
+  const diagramReadable=diagram.visible&&diagram.hit&&diagram.bounds.height>=(innerWidth<600?140:180)&&diagram.bounds.width>=220&&title.visible&&title.hit&&start.visible&&start.hit;
+  return {stage:visible(stage),reader:visible(reader),diagram,title,start,previous:prev,next:forward,choosers,activeVisible,selection:block.dataset.selection,scenario:block.dataset.scenario,scrollY,readerScroll:reader?.scrollTop,
+    readable:!!heading&&!!body&&parseFloat(getComputedStyle(heading).fontSize)>=20&&parseFloat(getComputedStyle(body).fontSize)>=15,
+    navigationSize:!!previous&&!!next&&[previous,next].every(button=>button.getBoundingClientRect().height>=42&&parseFloat(getComputedStyle(button).fontSize)>=14),
+    coVisible:diagramReadable&&(view==='map'?mapControl.visible&&mapControl.hit:prev.visible&&prev.hit&&forward.visible&&forward.hit)};
+}
+
 export async function verify(input, output) {
   input=resolve(input); output=resolve(output);
   await access(input); await mkdir(output,{recursive:true});
@@ -205,6 +262,8 @@ export async function verify(input, output) {
       throw new Error('Generated walkthrough did not mount');
     };
     const key=async(value)=>{await call('Input.dispatchKeyEvent',{type:'keyDown',key:value,code:value});await call('Input.dispatchKeyEvent',{type:'keyUp',key:value,code:value});};
+    const settle=()=>evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+    const pointer=async point=>{await call('Input.dispatchMouseEvent',{type:'mouseMoved',...point});await call('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...point});await call('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...point});await settle();};
     const checkKey=async(selector,view,kind,field='selection')=>{
       if(!await evaluate(`!!document.querySelector(${JSON.stringify(selector)})`))return [];
       await evaluate(`document.querySelector(${JSON.stringify(selector)}).focus()`);
@@ -216,22 +275,125 @@ export async function verify(input, output) {
       }
       return results;
     };
-    for(const width of [1440,900,390]){
-      await call('Emulation.setDeviceMetricsOverride',{width,height:1000,deviceScaleFactor:1,mobile:false});
-      await call('Network.emulateNetworkConditions',{offline:true,latency:0,downloadThroughput:0,uploadThroughput:0});
-      const start=cdp.events.length; await navigate();
-      const viewport=await evaluate(`(${exercise.toString()})()`);viewport.width=width;
-      viewport.results.push(...await checkKey('button[data-lens]','map','lens'));
-      viewport.results.push(...await checkKey('button[data-intent]','map','intent'));
-      viewport.results.push(...await checkKey('button[data-step]','walkthrough','step'));
-      viewport.results.push(...await checkKey('button[data-event-select]','sequence','eventSelect'));
-      viewport.results.push(...await checkKey('button[data-scenario]','sequence','scenario','scenario'));
-      for(const view of ['map','sequence'])if(await evaluate(`!!document.querySelector('[data-view="${view}"]')`)){
-        await evaluate(`document.querySelector('[data-view="${view}"]').scrollIntoView({block:'start'});`);
+    const checkChooser=async(view,kind,field='selection')=>{
+      const selector=`[data-view="${view}"] select[data-chooser="${kind}"]`;
+      if(!await evaluate(`!!document.querySelector(${JSON.stringify(selector)})`))return null;
+      await evaluate(`document.querySelector(${JSON.stringify(selector)}).focus({preventScroll:true})`);
+      const results=[];
+      for(const [value,which] of [['End','last'],['Home','first']]){
+        await key(value);await settle();
+        const detail=await evaluate(`(()=>{const select=document.querySelector(${JSON.stringify(selector)}),block=select.closest('[data-view]'),want=${which==='last'?'select.options[select.options.length-1]':'select.options[0]'};return {selected:block.dataset[${JSON.stringify(field)}],expected:want.value,focus:document.activeElement===select};})()`);
+        const passed=detail.selected===detail.expected&&detail.focus;
+        results.push({name:`${view}: native ${kind} chooser keyboard ${value} selects ${which}`,passed,...(passed?{}:{detail})});
+      }
+      return results;
+    };
+    const readerTasks=async viewport=>{
+      const results=viewport.results,record=(name,passed,detail)=>results.push({name,passed:!!passed,...(passed?{}:{detail})});
+      const geometry=view=>evaluate(`(${readerGeometry.toString()})(${JSON.stringify(view)})`);
+      const anchor=async view=>{await evaluate(`(()=>{const block=document.querySelector('[data-view="${view}"]');(block.querySelector('[data-reader-stage]')||block.querySelector('.sw-diagram-shell')).scrollIntoView({block:'start',behavior:'instant'});})()`);await settle();};
+      const choose=async(view,kind,index,fallback,expected,field='selection')=>{
+        const selector=`[data-view="${view}"] select[data-chooser="${kind}"]`;
+        const available=await evaluate(`!!document.querySelector(${JSON.stringify(selector)})`);
+        const before=await geometry(view);
+        if(available){
+          // Native selection receives real browser key events. Assigning value or
+          // calling a hidden button's click() would not prove reader usability.
+          await evaluate(`document.querySelector(${JSON.stringify(selector)}).focus({preventScroll:true})`);
+          await key('Home');for(let i=0;i<index;i++)await key('ArrowDown');await settle();
+          record(`${view}: ${kind} chooser is visible and reachable`,before.choosers[kind]?.visible&&before.choosers[kind]?.hit,before.choosers[kind]);
+        } else await evaluate(`document.querySelector(${JSON.stringify(fallback)}).click()`);
+        const after=await geometry(view);
+        record(`${view}: direct ${kind} choice ${expected}`,after[field]===expected,{selected:after[field],expected});
+        if(available)record(`${view}: direct ${kind} choice keeps page position`,Math.abs(after.scrollY-before.scrollY)<=1,{before:before.scrollY,after:after.scrollY});
+      };
+      const visible=async(view,label)=>{
+        const detail=await geometry(view);
+        record(`${label}: diagram, heading, body and Previous/Next co-visible`,detail.coVisible,detail);
+        record(`${label}: narrative and navigation retain readable type and targets`,detail.readable&&detail.navigationSize,{readable:detail.readable,navigationSize:detail.navigationSize});
+        record(`${label}: active diagram context revealed in physical viewport`,detail.activeVisible,{diagram:detail.diagram,selection:detail.selection});
+        return detail;
+      };
+      const navigateReader=async(view,direction,expected,label)=>{
+        const before=await geometry(view),button=before[direction];
+        if(button.visible&&button.hit)await pointer(button.center);
+        const after=await geometry(view);
+        record(`${label}: pointer ${direction} changes selected state`,after.selection===expected,{selected:after.selection,expected,button});
+        record(`${label}: ${direction} leaves outer page still`,Math.abs(after.scrollY-before.scrollY)<=1,{before:before.scrollY,after:after.scrollY});
+        record(`${label}: ${direction} resets reader to heading`,after.readerScroll<=1&&after.title.visible&&after.start.visible,{readerScroll:after.readerScroll,title:after.title,start:after.start});
+        return after;
+      };
+      const scrollReader=async(view,label)=>{
+        const selector=`[data-view="${view}"] .sw-inspector-host`;
+        const initial=await geometry(view);
+        if(!initial.reader.visible||!initial.reader.hit){
+          record(`${label}: state and evidence scroll independently of diagram/navigation`,false,{reason:'Reader is clipped or outside the physical viewport',reader:initial.reader});return;
+        }
+        for(const disclosure of ['[data-reader-state]','.sw-evidence']){
+          const point=await evaluate(`(()=>{const reader=document.querySelector(${JSON.stringify(selector)}),details=reader.querySelector(${JSON.stringify(disclosure)});if(!details||details.open)return null;const summary=details.querySelector('summary');reader.scrollTop+=summary.getBoundingClientRect().top-reader.getBoundingClientRect().top-12;const box=summary.getBoundingClientRect();return {x:(box.left+box.right)/2,y:(box.top+box.bottom)/2};})()`);
+          if(point)await pointer(point);
+        }
+        const before=await geometry(view);
+        const point=await evaluate(`(()=>{const r=document.querySelector(${JSON.stringify(selector)}),b=r.getBoundingClientRect();return {x:b.left+b.width/2,y:b.top+b.height/2};})()`);
+        await call('Input.dispatchMouseEvent',{type:'mouseWheel',...point,deltaX:0,deltaY:1200});await settle();
+        const after=await geometry(view);
+        const content=await evaluate(`(()=>{const r=document.querySelector(${JSON.stringify(selector)}),state=r.querySelector('[data-reader-state]'),evidence=r.querySelector('.sw-evidence'),links=[...r.querySelectorAll('.sw-evidence a')],box=r.getBoundingClientRect();return {scrollable:r.scrollHeight>r.clientHeight+1,stateOpen:!state||state.open,evidenceOpen:!evidence||evidence.open,evidenceVisible:!links.length||links.some(a=>{const b=a.getBoundingClientRect();return b.top>=box.top&&b.bottom<=box.bottom;})};})()`);
+        record(`${label}: state and evidence scroll independently of diagram/navigation`,after.diagram.visible&&after.previous.visible&&after.previous.hit&&after.next.visible&&after.next.hit&&Math.abs(after.scrollY-before.scrollY)<=1&&(!content.scrollable||after.readerScroll>0)&&content.stateOpen&&content.evidenceOpen&&content.evidenceVisible,{beforePage:before.scrollY,afterPage:after.scrollY,readerScroll:after.readerScroll,content,diagram:after.diagram,previous:after.previous,next:after.next});
+      };
+      const model=await evaluate(`JSON.parse(document.getElementById('walkthrough-model').textContent)`);
+      if(model.map){
+        const view='map',items=[...model.map.lenses,...(model.map.intents||[])];await anchor(view);
+        for(const index of [...new Set([0,Math.floor(items.length/2),items.length-1])]){
+          const item=items[index],kind=model.map.lenses.some(lens=>lens.id===item.id)?'lens':'intent';
+          await choose(view,'map',index,`[data-view="map"] [data-${kind}="${item.id}"]`,item.id);
+          const detail=await geometry(view),label=`Map reader ${item.id}`;
+          record(`${label}: diagram, heading, body and chooser co-visible`,detail.coVisible,detail);
+          record(`${label}: active diagram context revealed in physical viewport`,detail.activeVisible,{diagram:detail.diagram,selection:detail.selection});
+        }
+      }
+      if(model.walkthrough){
+        const view='walkthrough',items=model.walkthrough.steps;await anchor(view);
+        for(const index of [...new Set([0,Math.floor(items.length/2),items.length-1])]){
+          await choose(view,'step',index,`[data-view="${view}"] [data-step="${items[index].id}"]`,items[index].id);
+          const label=`Walk reader ${items[index].id}`;await visible(view,label);await scrollReader(view,label);
+          if(index<items.length-1){await navigateReader(view,'next',items[index+1].id,label);await navigateReader(view,'previous',items[index].id,label);}
+          else if(index>0){await navigateReader(view,'previous',items[index-1].id,label);await navigateReader(view,'next',items[index].id,label);}
+        }
+      }
+      if(model.sequence){
+        const view='sequence';await anchor(view);
+        for(let scenarioIndex=0;scenarioIndex<model.sequence.scenarios.length;scenarioIndex++){
+          const scenario=model.sequence.scenarios[scenarioIndex];
+          await choose(view,'scenario',scenarioIndex,`[data-view="sequence"] [data-scenario="${scenario.id}"]`,scenario.id,'scenario');
+          record(`Sequence reader ${scenario.id}: scenario starts at first event`,(await geometry(view)).selection===scenario.events[0].id);
+          for(const index of [...new Set([0,Math.floor(scenario.events.length/2),scenario.events.length-1])]){
+            const event=scenario.events[index],label=`Sequence reader ${scenario.id}/${event.id}`;
+            await choose(view,'event',index,`[data-view="sequence"] [data-event-select="${event.id}"]`,event.id);
+            await visible(view,label);await scrollReader(view,label);
+            if(index<scenario.events.length-1){await navigateReader(view,'next',scenario.events[index+1].id,label);await navigateReader(view,'previous',event.id,label);}
+            else if(index>0){await navigateReader(view,'previous',scenario.events[index-1].id,label);await navigateReader(view,'next',event.id,label);}
+          }
+        }
+      }
+      // Capture the actual bounded reading stages, including the walkthrough.
+      for(const view of ['map','walkthrough','sequence'])if(await evaluate(`!!document.querySelector('[data-view="${view}"]')`)){
+        await anchor(view);
         const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
-        const name=`${view}-${width}.png`;await writeFile(join(output,name),Buffer.from(shot.data,'base64'));
+        const name=`${view}-${viewport.width}x${viewport.height}.png`;await writeFile(join(output,name),Buffer.from(shot.data,'base64'));
         (viewport.screenshots??=[]).push(name);
       }
+    };
+    for(const {width,height} of [{width:1440,height:800},{width:900,height:700},{width:390,height:844}]){
+      await call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+      await call('Network.emulateNetworkConditions',{offline:true,latency:0,downloadThroughput:0,uploadThroughput:0});
+      const start=cdp.events.length; await navigate();
+      const viewport=await evaluate(`(${exercise.toString()})()`);viewport.width=width;viewport.height=height;
+      const mapKeyboard=await checkChooser('map','map');
+      viewport.results.push(...(mapKeyboard||[...await checkKey('button[data-lens]','map','lens'),...await checkKey('button[data-intent]','map','intent')]));
+      viewport.results.push(...(await checkChooser('walkthrough','step')||await checkKey('button[data-step]','walkthrough','step')));
+      viewport.results.push(...(await checkChooser('sequence','event')||await checkKey('button[data-event-select]','sequence','eventSelect')));
+      viewport.results.push(...(await checkChooser('sequence','scenario','scenario')||await checkKey('button[data-scenario]','sequence','scenario','scenario')));
+      await readerTasks(viewport);
       const events=cdp.events.slice(start).filter(e=>e.sessionId===session);
       const errors=events.filter(e=>e.method==='Runtime.exceptionThrown'||(e.method==='Log.entryAdded'&&['error','warning'].includes(e.params.entry.level))||(e.method==='Runtime.consoleAPICalled'&&['error','warning'].includes(e.params.type)));
       const external=events.filter(e=>e.method==='Network.requestWillBeSent'&&!/^(file:|data:|about:)/.test(e.params.request.url));

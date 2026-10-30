@@ -67,7 +67,7 @@
   }
   function viewport(svg, label) {
     return el('div', { class: 'sw-diagram-shell' },
-      para('Wide diagram · scroll inside this panel on a narrow screen. A full text version follows.', 'sw-scroll-hint'),
+      para('Diagram · scroll inside to explore. Highlights follow the current selection.', 'sw-scroll-hint'),
       el('div', { class: 'sw-viewport', tabindex: '0', role: 'region', 'aria-label': label }, svg));
   }
   function statePanel(items) {
@@ -96,6 +96,7 @@
   function mount(root, model) {
     if (!root) throw new Error('SystemWalkthrough.mount needs a root element.');
     const uid = `sw-${++serial}`;
+    const observers = [];
     const sources = indexById(model.sources), claims = indexById(model.claims), roles = indexById(model.roles);
     root.replaceChildren();
     root.classList.add('sw');
@@ -118,9 +119,31 @@
       box.append(el('h3', {}, item.title || item.label), para(item.body));
       if (item.why) box.append(el('h4', {}, 'Why it matters'), para(item.why));
       if (item.boundary) box.append(el('p', { class: 'sw-boundary' }, el('strong', {}, 'Boundary · '), item.boundary));
-      if (item.state) box.append(statePanel(item.state));
+      if (item.state) box.append(el('details', { class: 'sw-reader-state', 'data-reader-state': '' }, el('summary', {}, 'State after this step'), statePanel(item.state)));
       box.append(evidence(item.claims));
       return box;
+    }
+    function reader(label) {
+      return el('div', { class: 'sw-inspector-host', 'data-reader': '', tabindex: '0', role: 'region', 'aria-label': label });
+    }
+    function updateReader(host, item, ordinal, context = []) {
+      host.replaceChildren(inspector(item, ordinal), ...context);
+      host.scrollTop = 0;
+    }
+    function chooser(label, kind, items, choose) {
+      const select = el('select', { 'data-chooser': kind, 'aria-label': label }, items.map(item => el('option', { value: item.id }, item.label || item.title)));
+      select.addEventListener('change', () => choose(select.selectedIndex));
+      return { select, view: el('label', { class: 'sw-chooser' }, el('span', {}, label), select) };
+    }
+    function readingStage(block, label, diagram, host, choices, navigation) {
+      const stage = el('div', { id: `${block.id}-stage`, class: 'sw-reader-stage', 'data-reader-stage': '', role: 'region', 'aria-label': `${label} reading view`, tabindex: '-1' },
+        el('div', { class: 'sw-stage-toolbar', 'data-stage-navigation': '' }, el('div', { class: 'sw-stage-choices' }, choices), navigation),
+        el('div', { class: 'sw-stage-content' }, el('div', { class: 'sw-reader-canvas' }, diagram), host));
+      block.querySelector('.sw-section-heading').append(link('Open reading view ↓', `#${stage.id}`));
+      return stage;
+    }
+    function contextDetails(title, ...content) {
+      return el('details', { class: 'sw-reader-context' }, el('summary', {}, title), content);
     }
     function textAlternative(title, children) {
       return el('details', { class: 'sw-text-alternative' }, el('summary', {}, title), el('div', { class: 'sw-text-body' }, children));
@@ -133,9 +156,9 @@
       theme.textContent = next === 'light' ? 'Dark mode' : 'Light mode';
     });
     const navigation = el('nav', { class: 'sw-nav', 'aria-label': 'Walkthrough sections' });
-    if (model.map) navigation.append(link('System map', `#${uid}-map`));
-    if (model.walkthrough) navigation.append(link('Walkthrough', `#${uid}-walk`));
-    if (model.sequence) navigation.append(link('Scenarios', `#${uid}-sequence`));
+    if (model.map) navigation.append(link('System map', `#${uid}-map-stage`));
+    if (model.walkthrough) navigation.append(link('Walkthrough', `#${uid}-walk-stage`));
+    if (model.sequence) navigation.append(link('Scenarios', `#${uid}-sequence-stage`));
     navigation.append(link('Sources & limits', `#${uid}-sources`));
     root.append(el('header', { class: 'sw-hero' },
       el('div', { class: 'sw-topline' }, para('SYSTEM WALKTHROUGH · SOURCE-DERIVED', 'sw-kicker'), theme),
@@ -184,24 +207,52 @@
           svgText(node.detail, node.x + 16, node.y + 28 + labelLines.length * 20, { class: 'sw-node-detail' }, Math.max(12, Math.floor((node.w - 28) / 7)), 17));
         svg.append(group); nodeElements.set(node.id, group);
       }
+      const view = viewport(svg, `${map.title}, scrollable`), panel = view.querySelector('.sw-viewport');
+      let selected;
+      function reveal() {
+        if (!selected || !panel.clientWidth || !panel.clientHeight) return;
+        const active = [...nodeElements.values(), ...edgeElements.values()].filter(item => item.dataset.active === 'true');
+        if (!active.length) return;
+        const bounds = active.map(item => item.getBoundingClientRect());
+        let target = { left: Math.min(...bounds.map(r => r.left)), right: Math.max(...bounds.map(r => r.right)), top: Math.min(...bounds.map(r => r.top)), bottom: Math.max(...bounds.map(r => r.bottom)) };
+        const margin = 20;
+        if (target.right - target.left > panel.clientWidth - margin * 2 || target.bottom - target.top > panel.clientHeight - margin * 2) {
+          const edge = map.edges.find(item => (selected.edges || []).includes(item.id));
+          const focus = nodeElements.get(edge?.to || selected.nodes?.[0]);
+          if (focus) target = focus.getBoundingClientRect();
+        }
+        const area = panel.getBoundingClientRect();
+        if (target.left < area.left + margin) panel.scrollLeft += target.left - area.left - margin;
+        else if (target.right > area.left + panel.clientWidth - margin) panel.scrollLeft += target.right - area.left - panel.clientWidth + margin;
+        if (target.top < area.top + margin) panel.scrollTop += target.top - area.top - margin;
+        else if (target.bottom > area.top + panel.clientHeight - margin) panel.scrollTop += target.bottom - area.top - panel.clientHeight + margin;
+      }
       function highlight(selection) {
+        selected = selection;
         const nodes = new Set(selection.nodes || []), edges = new Set(selection.edges || []);
         for (const edge of map.edges) if (edges.has(edge.id)) { nodes.add(edge.from); nodes.add(edge.to); }
         for (const [id, node] of nodeElements) node.dataset.active = String(nodes.has(id));
         for (const [id, edge] of edgeElements) edge.dataset.active = String(edges.has(id));
+        view.querySelector('.sw-scroll-hint').textContent = `${nodes.size} highlighted components · ${edges.size} relationships. Scroll for surrounding context.`;
+        reveal();
       }
-      return { view: viewport(svg, `${map.title}, horizontally scrollable`), highlight };
+      if (global.ResizeObserver) { const observer = new ResizeObserver(reveal); observer.observe(panel); observers.push(observer); }
+      return { view, highlight };
     }
     if (model.map) {
       const map = model.map;
       const block = section(`${uid}-map`, '01 · ONE MODEL, SEVERAL QUESTIONS', map.title, map.description);
       block.dataset.view = 'map';
       const controls = el('div', { class: 'sw-controls', role: 'group', 'aria-label': 'Map lenses' });
-      const diagram = mapDiagram(`${uid}-map-svg`), host = el('div', { class: 'sw-inspector-host' });
+      const diagram = mapDiagram(`${uid}-map-svg`), host = reader('Current map explanation');
+      const items = [...map.lenses, ...(map.intents || [])];
+      const choice = chooser('Explore the map', 'map', items, i => select(items[i], allButtons[i]));
       const allButtons = [];
+      const context = [contextDetails('Map lenses and actions', controls), contextDetails('Diagram key', legend())];
       function select(item, active) {
         for (const control of allButtons) control.setAttribute('aria-pressed', String(control === active));
-        diagram.highlight(item); host.replaceChildren(inspector(item));
+        choice.select.value = item.id;
+        diagram.highlight(item); updateReader(host, item, null, context);
         block.dataset.selection = item.id;
       }
       const lenses = map.lenses.map(item => {
@@ -209,7 +260,6 @@
         control.addEventListener('click', () => select(item, control)); controls.append(control); allButtons.push(control); return control;
       });
       keyboardGroup(controls, lenses, i => select(map.lenses[i], lenses[i]), true);
-      block.append(controls);
       if (map.intents?.length) {
         const intentControls = el('div', { class: 'sw-controls sw-intents', role: 'group', 'aria-label': 'Feature intents' }, el('span', { class: 'sw-control-label' }, 'Follow an action'));
         const intents = map.intents.map(item => {
@@ -217,11 +267,9 @@
           control.addEventListener('click', () => select(item, control)); intentControls.append(control); allButtons.push(control); return control;
         });
         keyboardGroup(intentControls, intents, i => select(map.intents[i], intents[i]), true);
-        block.append(intentControls);
+        context[0].append(intentControls);
       }
-      const layout = el('div', { class: 'sw-map-layout' }, diagram.view, host);
-      layout.style.setProperty('--sw-map-width', `${map.width + 2}px`);
-      block.append(legend(), layout, textAlternative('Read the map as text', [
+      block.append(readingStage(block, 'System map', diagram.view, host, choice.view), textAlternative('Read the map as text', [
         el('h3', {}, 'Components'), el('dl', { class: 'sw-state' }, map.nodes.map(node => el('div', {}, el('dt', {}, node.label), el('dd', {}, node.detail)))),
         el('h3', {}, 'Directed relationships'), el('ul', {}, map.edges.map(edge => el('li', {}, `${map.nodes.find(n => n.id === edge.from).label} → ${map.nodes.find(n => n.id === edge.to).label}: ${edge.label} (${edge.kind})`))),
         ...[...map.lenses, ...(map.intents || [])].map(item => el('article', {}, el('h3', {}, item.title), para(item.body), evidence(item.claims)))
@@ -234,9 +282,11 @@
       block.dataset.view = 'walkthrough';
       const diagram = mapDiagram(`${uid}-walk-svg`);
       const list = el('ol', { class: 'sw-step-list', role: 'list', 'aria-label': 'Walkthrough steps' });
-      const host = el('div', { class: 'sw-inspector-host' });
-      const previous = button('← Previous'), next = button('Next →');
+      const host = reader('Current walkthrough step explanation');
+      const previous = button('← Previous', { 'data-action': 'previous' }), next = button('Next →', { 'data-action': 'next' });
       const position = el('span', { class: 'sw-position', 'aria-live': 'off' });
+      const choice = chooser('Walkthrough step', 'step', walk.steps.map((step, i) => ({ id: step.id, label: `${i + 1}. ${step.title}` })), select);
+      const context = [contextDetails('All walkthrough steps', list), contextDetails('Diagram key', legend())];
       let current = 0;
       const buttons = walk.steps.map((step, i) => {
         const control = button([String(i + 1).padStart(2, '0'), ' · ', step.title].join(''), { 'data-step': step.id });
@@ -248,12 +298,13 @@
         buttons.forEach((control, index) => { control.setAttribute('aria-current', index === current ? 'step' : 'false'); control.dataset.active = String(index === current); });
         previous.disabled = current === 0; next.disabled = current === walk.steps.length - 1;
         position.textContent = `${current + 1} / ${walk.steps.length}`;
-        diagram.highlight(step); host.replaceChildren(inspector(step, `STEP ${current + 1}`)); block.dataset.selection = step.id;
+        choice.select.value = step.id;
+        diagram.highlight(step); updateReader(host, step, `STEP ${current + 1}`, context); block.dataset.selection = step.id;
       }
       previous.addEventListener('click', () => select(current - 1)); next.addEventListener('click', () => select(current + 1));
       keyboardGroup(list, buttons, select);
-      block.append(legend(), diagram.view, el('div', { class: 'sw-step-navigation', role: 'group', 'aria-label': 'Walkthrough navigation' }, previous, position, next),
-        el('div', { class: 'sw-walk-layout' }, list, host),
+      block.append(readingStage(block, 'Walkthrough', diagram.view, host, choice.view,
+        el('div', { class: 'sw-step-navigation', role: 'group', 'aria-label': 'Walkthrough navigation' }, previous, position, next)),
         textAlternative('Read every walkthrough step', walk.steps.map((step, i) => el('article', {}, el('h3', {}, `${i + 1}. ${step.title}`), para(step.body), para(`Why: ${step.why}`), para(`Boundary: ${step.boundary}`), statePanel(step.state), evidence(step.claims)))));
       root.append(block); select(0);
     }
@@ -264,11 +315,14 @@
       block.dataset.view = 'sequence';
       const scenarioControls = el('div', { class: 'sw-controls', role: 'group', 'aria-label': 'Sequence scenarios' });
       const summary = el('div', { class: 'sw-scenario-summary' });
-      const diagramHost = el('div');
+      const diagramHost = el('div', { class: 'sw-diagram-host' });
       const eventList = el('ol', { class: 'sw-step-list', 'aria-label': 'Sequence events' });
-      const host = el('div', { class: 'sw-inspector-host' });
-      const previous = button('← Previous'), next = button('Next →'), position = el('span', { class: 'sw-position' });
-      let scenarioIndex = 0, eventIndex = 0, eventButtons = [], eventGroups = [], scrollPanel, laneHeader;
+      const host = reader('Current sequence event explanation');
+      const previous = button('← Previous', { 'data-action': 'previous' }), next = button('Next →', { 'data-action': 'next' }), position = el('span', { class: 'sw-position' });
+      let scenarioIndex = 0, eventIndex = 0, eventButtons = [], eventGroups = [], scrollPanel, laneHeader, sequenceObserver;
+      const scenarioChoice = chooser('Scenario', 'scenario', sequence.scenarios, selectScenario);
+      const eventChoice = chooser('Sequence event', 'event', [], i => selectEvent(i, true));
+      const context = [contextDetails('Scenario and assumptions', summary), contextDetails('All events and scenarios', eventList, scenarioControls), contextDetails('Diagram key', legend())];
       const scenarioButtons = sequence.scenarios.map((scenario, i) => {
         const control = button(scenario.label, { 'data-scenario': scenario.id, 'aria-pressed': 'false' });
         control.addEventListener('click', () => selectScenario(i)); scenarioControls.append(control); return control;
@@ -306,6 +360,11 @@
         scrollPanel = view.querySelector('.sw-viewport');
         scrollPanel.prepend(el('div', { class: 'sw-sequence-sticky' }, laneHeader));
         diagramHost.replaceChildren(view);
+        if (global.ResizeObserver) {
+          sequenceObserver?.disconnect();
+          sequenceObserver = new ResizeObserver(revealEvent);
+          sequenceObserver.observe(scrollPanel); observers.push(sequenceObserver);
+        }
       }
       function selectEvent(i, scroll = false) {
         const scenario = sequence.scenarios[scenarioIndex];
@@ -315,40 +374,45 @@
         eventButtons.forEach((control, index) => { control.setAttribute('aria-current', index === eventIndex ? 'step' : 'false'); control.dataset.active = String(index === eventIndex); });
         previous.disabled = eventIndex === 0; next.disabled = eventIndex === scenario.events.length - 1;
         position.textContent = `${eventIndex + 1} / ${scenario.events.length}`;
-        host.replaceChildren(inspector({ ...event, title: event.label }, `EVENT ${eventIndex + 1} · ${lanes.get(event.from).label} → ${lanes.get(event.to).label}`));
+        eventChoice.select.value = event.id;
+        updateReader(host, { ...event, title: event.label }, `EVENT ${eventIndex + 1} · ${lanes.get(event.from).label} → ${lanes.get(event.to).label}`, context);
         block.dataset.selection = event.id;
-        if (scroll) {
-          const row = eventGroups[eventIndex].getBoundingClientRect();
-          const panel = scrollPanel.getBoundingClientRect();
-          const headerHeight = laneHeader.getBoundingClientRect().height;
-          if (row.top < panel.top + headerHeight + 12 || row.bottom > panel.bottom) scrollPanel.scrollTop += row.top - panel.top - headerHeight - 18;
-          const path = eventGroups[eventIndex].querySelector('.sw-message');
-          const message = path.getBoundingClientRect();
-          const label = eventGroups[eventIndex].querySelector('.sw-edge-label').getBoundingClientRect();
-          let left = Math.min(message.left, label.left), right = Math.max(message.right, label.right);
-          const margin = 24, visibleRight = panel.left + scrollPanel.clientWidth;
-          const owners = [...laneHeader.querySelectorAll('[data-lane]')]
-            .filter(lane => lane.dataset.lane === event.from || lane.dataset.lane === event.to)
-            .map(lane => lane.querySelector('text').getBoundingClientRect());
-          const ownerLeft = Math.min(left, ...owners.map(owner => owner.left));
-          const ownerRight = Math.max(right, ...owners.map(owner => owner.right));
-          if (ownerRight - ownerLeft <= scrollPanel.clientWidth - margin * 2) {
-            left = ownerLeft; right = ownerRight;
-          }
-          if (right - left <= scrollPanel.clientWidth - margin * 2) {
-            if (left < panel.left + margin) scrollPanel.scrollLeft += left - panel.left - margin;
-            else if (right > visibleRight - margin) scrollPanel.scrollLeft += right - visibleRight + margin;
-          } else {
-            const end = path.getPointAtLength(path.getTotalLength());
-            const destination = new DOMPoint(end.x, end.y).matrixTransform(path.getScreenCTM());
-            if (destination.x < panel.left + margin) scrollPanel.scrollLeft += destination.x - panel.left - margin;
-            else if (destination.x > visibleRight - margin) scrollPanel.scrollLeft += destination.x - visibleRight + margin;
-          }
+        if (scroll) revealEvent();
+      }
+      function revealEvent() {
+        const event = sequence.scenarios[scenarioIndex].events[eventIndex];
+        if (!scrollPanel?.clientWidth || !eventGroups[eventIndex]) return;
+        const row = eventGroups[eventIndex].getBoundingClientRect();
+        const panel = scrollPanel.getBoundingClientRect();
+        const headerHeight = laneHeader.getBoundingClientRect().height;
+        if (row.top < panel.top + headerHeight + 12 || row.bottom > panel.bottom) scrollPanel.scrollTop += row.top - panel.top - headerHeight - 18;
+        const path = eventGroups[eventIndex].querySelector('.sw-message');
+        const message = path.getBoundingClientRect();
+        const label = eventGroups[eventIndex].querySelector('.sw-edge-label').getBoundingClientRect();
+        let left = Math.min(message.left, label.left), right = Math.max(message.right, label.right);
+        const margin = 24, visibleRight = panel.left + scrollPanel.clientWidth;
+        const owners = [...laneHeader.querySelectorAll('[data-lane]')]
+          .filter(lane => lane.dataset.lane === event.from || lane.dataset.lane === event.to)
+          .map(lane => lane.querySelector('text').getBoundingClientRect());
+        const ownerLeft = Math.min(left, ...owners.map(owner => owner.left));
+        const ownerRight = Math.max(right, ...owners.map(owner => owner.right));
+        if (ownerRight - ownerLeft <= scrollPanel.clientWidth - margin * 2) {
+          left = ownerLeft; right = ownerRight;
+        }
+        if (right - left <= scrollPanel.clientWidth - margin * 2) {
+          if (left < panel.left + margin) scrollPanel.scrollLeft += left - panel.left - margin;
+          else if (right > visibleRight - margin) scrollPanel.scrollLeft += right - visibleRight + margin;
+        } else {
+          const end = path.getPointAtLength(path.getTotalLength());
+          const destination = new DOMPoint(end.x, end.y).matrixTransform(path.getScreenCTM());
+          if (destination.x < panel.left + margin) scrollPanel.scrollLeft += destination.x - panel.left - margin;
+          else if (destination.x > visibleRight - margin) scrollPanel.scrollLeft += destination.x - visibleRight + margin;
         }
       }
       function selectScenario(i) {
         scenarioIndex = i;
         const scenario = sequence.scenarios[i];
+        scenarioChoice.select.value = scenario.id;
         scenarioButtons.forEach((control, index) => control.setAttribute('aria-pressed', String(index === i)));
         summary.replaceChildren(para('Source-derived illustrative scenario · no measured timing', 'sw-kicker'), para(scenario.summary), el('ul', { class: 'sw-assumptions' }, scenario.assumptions.map(item => el('li', {}, item))));
         drawScenario(scenario); eventList.replaceChildren();
@@ -356,7 +420,8 @@
           const control = button(`${String(index + 1).padStart(2, '0')} · ${event.label}`, { 'data-event-select': event.id });
           control.addEventListener('click', () => selectEvent(index, true)); eventList.append(el('li', {}, control)); return control;
         });
-        block.dataset.scenario = scenario.id; selectEvent(0);
+        eventChoice.select.replaceChildren(...scenario.events.map((event, index) => el('option', { value: event.id }, `${index + 1}. ${event.label}`)));
+        block.dataset.scenario = scenario.id; selectEvent(0, true);
       }
       previous.addEventListener('click', () => selectEvent(eventIndex - 1, true)); next.addEventListener('click', () => selectEvent(eventIndex + 1, true));
       eventList.addEventListener('keydown', event => {
@@ -367,9 +432,8 @@
         selectEvent(nextIndex, true); eventButtons[nextIndex].focus({ preventScroll: true });
       });
       keyboardGroup(scenarioControls, scenarioButtons, selectScenario, true);
-      block.append(scenarioControls, summary, legend(), diagramHost,
-        el('div', { class: 'sw-step-navigation', role: 'group', 'aria-label': 'Sequence navigation' }, previous, position, next),
-        el('div', { class: 'sw-walk-layout' }, eventList, host),
+      block.append(readingStage(block, 'Scenarios', diagramHost, host, [scenarioChoice.view, eventChoice.view],
+        el('div', { class: 'sw-step-navigation', role: 'group', 'aria-label': 'Sequence navigation' }, previous, position, next)),
         textAlternative('Read all scenarios and directed exchanges', sequence.scenarios.map(scenario => el('article', {}, el('h3', {}, scenario.label), para(scenario.summary), el('ul', {}, scenario.assumptions.map(item => el('li', {}, item))), el('ol', {}, scenario.events.map(event => el('li', {}, el('h4', {}, `${lanes.get(event.from).label} → ${lanes.get(event.to).label}: ${event.label}`), para(event.body), statePanel(event.state), evidence(event.claims))))))));
       root.append(block); selectScenario(0);
     }
@@ -388,6 +452,7 @@
     global.addEventListener('beforeprint', beforePrint);
     global.addEventListener('afterprint', afterPrint);
     return { destroy() {
+      observers.forEach(observer => observer.disconnect());
       global.removeEventListener('beforeprint', beforePrint);
       global.removeEventListener('afterprint', afterPrint);
       root.replaceChildren(); root.classList.remove('sw');

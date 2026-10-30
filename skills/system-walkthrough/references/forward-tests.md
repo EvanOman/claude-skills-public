@@ -28,7 +28,7 @@ a native security review. The final examples are in `examples/`.
 | The desktop inspector could clip the right edge of an intrinsically wide map. | The shared layout stacks the inspector when the complete diagram cannot fit beside it. |
 | Direct embedding could inject CSS through an unvalidated map width. | Runtime dimensions must be finite positive numbers; custom width uses `style.setProperty`. The exact exploit was rejected on recheck. Packed builds already validated dimensions. |
 
-## Final verification
+## First-release verification
 
 On 30 October 2026, the final generated Valkey page passed 2,565 browser assertions
 and SQLite passed 2,966 across 1440, 900 and 390 widths. Checks cover every control,
@@ -49,3 +49,32 @@ built or executed for this release, and no production configuration or durabilit
 claim was tested. Browser tests used desktop Chromium at resized viewports, not
 physical phones, Safari or a screen-reader session. Print expansion and no-script
 text are provided; a physical print/accessibility-device audit was not performed.
+
+## Usability follow-up: reading beside the diagram
+
+Reader feedback exposed a gap in the first-release checks: controls could update
+correctly while the diagram, explanation and Next button were separated by more
+than a screen. At 1440×800, SQLite's walkthrough diagram was 967 px tall and its
+explanation began over 1,050 px below the diagram's top. The old tests always used
+a 1,000 px viewport height and mostly activated controls programmatically, so they
+did not establish that the reading task was usable.
+
+The shared renderer now groups the diagram, active explanation and navigation in
+a viewport-budgeted reading stage. Wide screens use columns; narrow screens use
+bounded rows. Diagrams keep their authored text scale and pan internally to the
+selection. The reader scrolls independently, resets to the selected heading, and
+keeps longer state/evidence and direct-selection controls accessible. Previous and
+Next remain outside both scrolling panels. Print and full text alternatives remain
+available.
+
+The quality guide and browser verifier now require physical co-visibility and a
+reader task at 1440×800, 900×700 and 390×844, including pointer/keyboard stepping,
+stable outer scroll, selected diagram content and reader reset. A layout mutation
+must fail even when the selected model data is still correct. Source models and
+their factual claims are unchanged by this layout correction.
+
+Both regenerated showcases passed the strengthened offline Chromium checks:
+3,383 for SQLite and 3,117 for Valkey. All nine helper/mutation tests passed.
+The old published SQLite artifact fails the new physical-viewport checks at all
+three reference sizes. Desktop and phone screenshots were inspected separately;
+the viewport and browser limitations above still apply.
