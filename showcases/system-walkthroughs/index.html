@@ -1,0 +1,170 @@
+<!doctype html>
+<!--
+MIT License
+
+Copyright (c) 2026 Evan Oman
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="Source-grounded interactive guides to Valkey consumer groups and SQLite WAL, plus a reusable skill for explaining other systems.">
+  <meta name="color-scheme" content="dark light">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:">
+  <title>System Walkthroughs</title>
+  <script>
+    try { if (localStorage.getItem('system-walkthrough-theme') === 'light') document.documentElement.dataset.swTheme = 'light'; } catch (_) {}
+  </script>
+  <style>
+    :root{color-scheme:dark;--bg:#10171b;--panel:#182226;--panel-alt:#1b292e;--ink:#edf2ef;--muted:#b0c2c8;--border:#43565e;--teal:#7bddc8;--blue:#8dbaff;--amber:#edc47c;--violet:#c6a8ff}
+    :root[data-sw-theme="light"]{color-scheme:light;--bg:#f6f5ef;--panel:#fffefa;--panel-alt:#ecefe9;--ink:#152c32;--muted:#435d66;--border:#a0b2b6;--teal:#146958;--blue:#275eae;--amber:#805209;--violet:#6e42a5}
+    *{box-sizing:border-box}html{background:var(--bg);color:var(--ink);scroll-behavior:smooth}body{margin:0;font:16px/1.65 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere}a{color:var(--teal);text-underline-offset:4px}a:hover{text-decoration-thickness:2px}a:focus-visible,button:focus-visible,pre:focus-visible{outline:3px solid var(--amber);outline-offset:5px}button{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--border);border-radius:24px;padding:9px 16px;cursor:pointer;min-height:42px;font-size:12px}button:hover{border-color:var(--teal)}h1,h2,h3,p{margin-top:0}h1,h2{font-family:Georgia,"Times New Roman",serif;font-weight:600;line-height:1.1;letter-spacing:-.025em;text-wrap:balance}h1{font-size:clamp(46px,7.2vw,90px);margin:32px 0 25px;max-width:980px}h1 em{color:var(--teal);font-weight:500}h2{font-size:clamp(31px,4vw,48px);margin-bottom:20px}h3{font-size:23px;line-height:1.3;margin-bottom:13px}p{margin-bottom:18px}main,header,footer{max-width:1240px;margin:auto;padding-left:clamp(22px,5vw,68px);padding-right:clamp(22px,5vw,68px)}header{padding-top:30px;display:flex;align-items:center;justify-content:space-between;gap:20px}header a{font-size:13px;color:var(--muted)}main{padding-top:52px;padding-bottom:20px}.kicker{font-size:11px;letter-spacing:.16em;font-weight:650;color:var(--muted);margin-bottom:16px}.lede{font:clamp(21px,2.5vw,27px)/1.5 Georgia,serif;color:var(--muted);max-width:860px;margin-bottom:28px}.hero-note{border-left:2px solid var(--border);padding-left:18px;max-width:830px;color:var(--muted);font-size:14px}.jump{display:flex;gap:16px 28px;flex-wrap:wrap;border-top:1px solid var(--border);border-bottom:1px solid var(--border);padding:19px 0;margin-top:34px;font-size:13px}section{margin-top:76px;scroll-margin-top:30px}.section-top{max-width:800px;margin-bottom:28px}.section-top>p{color:var(--muted)}.guides{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}.card{display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:28px;min-width:0}.card[data-guide="valkey"]{border-top:3px solid var(--teal)}.card[data-guide="sqlite"]{border-top:3px solid var(--blue)}.card .number{font:26px/1 Georgia,serif;color:var(--teal);margin-bottom:20px}.card[data-guide="sqlite"] .number{color:var(--blue)}.card p{color:var(--muted);font-size:15px}.card .guide-link{font-size:15px;font-weight:600;margin-top:auto;align-self:flex-start;padding:8px 0}.card .meta{font:12px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;padding-top:18px;margin:20px 0 0;border-top:1px solid var(--border)}.card .source-links{display:flex;flex-wrap:wrap;gap:7px 18px;font-size:12px;margin-top:9px}.features{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:26px;padding:0;list-style:none;margin:34px 0 0;counter-reset:feature}.features li{border-top:1px solid var(--border);padding-top:18px;counter-increment:feature}.features li::before{content:"0" counter(feature);font:22px/1 Georgia,serif;color:var(--amber);display:block;margin-bottom:16px}.features h3{font-size:18px}.features p{font-size:14px;color:var(--muted)}.authoring{border-top:1px solid var(--border);padding-top:34px}.usage-grid{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);gap:38px}.usage-grid>div{min-width:0}.usage-grid p{color:var(--muted);font-size:15px}.usage-grid h3{font-size:18px;margin-top:24px}.usage-grid h3:first-child{margin-top:0}pre{max-width:100%;overflow-x:auto;overscroll-behavior-inline:contain;background:var(--panel);border:1px solid var(--border);border-radius:9px;padding:20px;margin:15px 0 18px;font:12px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre;tab-size:2;color:var(--ink)}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.84em}pre code{font-size:inherit}.small{font-size:12px!important}.plain-list{padding-left:20px;color:var(--muted);font-size:14px}.plain-list li{margin-bottom:13px}.link-list{display:flex;gap:10px 24px;flex-wrap:wrap;font-size:13px;margin-top:24px}.evidence{max-width:890px}.evidence p{color:var(--muted);font-size:14px}.pins{margin:25px 0;display:grid;gap:14px}.pin{padding:15px 18px;border-left:2px solid var(--border);background:var(--panel)}.pin strong{display:block;font-size:13px;margin-bottom:6px}.pin a{font:12px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace}.attribution{font-size:12px!important;border-top:1px solid var(--border);padding-top:20px;margin-top:28px}footer{border-top:1px solid var(--border);padding-top:24px;padding-bottom:35px;margin-top:55px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:15px;flex-wrap:wrap}footer p{margin:0}@media(max-width:760px){header{padding-top:20px}main{padding-top:36px}h1{margin-top:24px}.guides,.usage-grid{grid-template-columns:minmax(0,1fr)}.features{grid-template-columns:minmax(0,1fr);gap:16px}.features li{display:grid;grid-template-columns:35px minmax(0,1fr);gap:0 16px}.features li::before{grid-row:1/3}.features h3{margin:0 0 6px}.features p{margin-bottom:0}.card{padding:24px}section{margin-top:55px}.usage-grid{gap:25px}.jump{gap:14px 22px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}@media print{:root{--bg:#fff;--ink:#152c32;--muted:#435d66;--panel:#fff;--border:#a0b2b6;--teal:#146958;--blue:#275eae;--amber:#805209}button,.jump{display:none}main{padding-top:0}h1{font-size:42pt}.guides,.usage-grid{display:block}.card{margin-bottom:20px;break-inside:avoid}a{color:inherit}pre{white-space:pre-wrap}footer{margin-top:25px}}
+  </style>
+</head>
+<body>
+  <header>
+    <a href="https://evanoman.com/">← evanoman.com</a>
+    <button id="theme" type="button" aria-label="Switch color theme">Light mode</button>
+  </header>
+  <main>
+    <div class="hero">
+      <p class="kicker">REUSABLE SKILL · PINNED PRIMARY SOURCES</p>
+      <h1>System <em>walkthroughs.</em></h1>
+      <p class="lede">Follow a concrete request, see who owns the state, and explore what changes when the usual path breaks.</p>
+      <p class="hero-note">These guides combine a stable system map, selective highlighting and a step inspector. Both examples use the same offline renderer; the system evidence and structured content change.</p>
+      <nav class="jump" aria-label="On this page">
+        <a href="#guides">Explore the guides</a>
+        <a href="#use">Use the skill</a>
+        <a href="#sources">Sources and limits</a>
+      </nav>
+    </div>
+    <section id="guides" aria-labelledby="guides-title">
+      <div class="section-top">
+        <p class="kicker">01 · TWO BOUNDED BEHAVIORS</p>
+        <h2 id="guides-title">Choose a system.</h2>
+        <p>Each guide starts with a specific engineering question and stays close to the source. Choose a lens, select a step directly, or follow an alternative scenario.</p>
+      </div>
+      <div class="guides">
+        <article class="card" data-guide="valkey">
+          <p class="number" aria-hidden="true">01</p>
+          <h3>Valkey consumer groups</h3>
+          <p>Follow stream delivery, acknowledgement and recovery after a consumer disappears. Inspect the commands, their replies and the state between them.</p>
+          <a class="guide-link" href="valkey/">Open the Valkey guide →</a>
+          <p class="meta">Valkey 9.1.3 · 29173b67508b</p>
+          <div class="source-links">
+            <a href="valkey/index.html" download="valkey-consumer-groups.html">Download offline HTML</a>
+            <a href="https://github.com/valkey-io/valkey/tree/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8">Pinned upstream source</a>
+            <a href="https://github.com/EvanOman/claude-skills-public/blob/main/skills/system-walkthrough/examples/valkey.json">Authoring model</a>
+          </div>
+        </article>
+        <article class="card" data-guide="sqlite">
+          <p class="number" aria-hidden="true">02</p>
+          <h3>SQLite WAL checkpoints</h3>
+          <p>Follow readers, a writer and a checkpoint request. Inspect the snapshot, WAL and database state as one selected interleaving unfolds.</p>
+          <a class="guide-link" href="sqlite/">Open the SQLite guide →</a>
+          <p class="meta">SQLite 3.54.1 · 57520227c953</p>
+          <div class="source-links">
+            <a href="sqlite/index.html" download="sqlite-wal-checkpoints.html">Download offline HTML</a>
+            <a href="https://github.com/sqlite/sqlite/tree/57520227c95396ce39ba6ecaac8d475b78dd3964">Pinned upstream source</a>
+            <a href="https://github.com/EvanOman/claude-skills-public/blob/main/skills/system-walkthrough/examples/sqlite.json">Authoring model</a>
+          </div>
+        </article>
+      </div>
+      <ol class="features" aria-label="Shared reading tools">
+        <li><h3>Keep one mental map</h3><p>Lenses change the highlighted path while component identities and positions stay fixed. Other context remains visible.</p></li>
+        <li><h3>Follow the boundary</h3><p>Ordered steps pair the diagram with an explanation, source evidence and the state after that step.</p></li>
+        <li><h3>Check the return path</h3><p>Scenario sequences show sender, receiver and supported replies. Alternative paths expose recovery assumptions.</p></li>
+      </ol>
+    </section>
+    <section id="use" class="authoring" aria-labelledby="use-title">
+      <div class="section-top">
+        <p class="kicker">02 · REUSE THE COMPONENTS</p>
+        <h2 id="use-title">Explain another system.</h2>
+        <p>The <code>system-walkthrough</code> skill provides an evidence workflow, one authoring model, a validator and a shared renderer. Agents collect and distill the source; the components handle the diagrams and interactions.</p>
+      </div>
+      <div class="usage-grid">
+        <div>
+          <h3>Install in Codex</h3>
+          <pre tabindex="0" aria-label="Codex installation commands"><code>git clone https://github.com/EvanOman/claude-skills-public.git
+mkdir -p ~/.codex/skills
+cp -R claude-skills-public/skills/system-walkthrough \
+  ~/.codex/skills/system-walkthrough</code></pre>
+          <p class="small">Use a destination that does not already contain a copy of the skill. Refresh the skill catalog after installation.</p>
+          <h3>Or install the Claude Code plugin</h3>
+          <pre tabindex="0" aria-label="Claude Code plugin installation commands"><code>/plugin marketplace add EvanOman/claude-skills-public
+/plugin install evan-skills@evan-skills</code></pre>
+          <p>Ask Codex to use <code>$system-walkthrough</code>, or invoke <code>/evan-skills:system-walkthrough</code> in Claude Code, with a repository, a reader question and a bounded behavior.</p>
+        </div>
+        <div>
+          <h3>Author once, build a portable page</h3>
+          <pre tabindex="0" aria-label="Authoring and build commands"><code>cd claude-skills-public
+node skills/system-walkthrough/scripts/walkthrough.mjs \
+  init model.json
+# Replace the starter with researched system content.
+node skills/system-walkthrough/scripts/walkthrough.mjs \
+  validate model.json
+node skills/system-walkthrough/scripts/walkthrough.mjs \
+  build model.json output</code></pre>
+          <p class="small">Authoring requires Node 22 or newer. The generated <code>output/index.html</code> embeds its content, styles and renderer. Reading needs only a browser, including from a local file.</p>
+          <ul class="plain-list">
+            <li>Choose a map, walkthrough, sequence, or the combination that answers the question.</li>
+            <li>Record claims and primary-source pointers alongside nodes, edges, steps and state snapshots.</li>
+            <li>Reuse <code>SystemWalkthrough.mount(element, model)</code> when embedding the components in an existing page.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="link-list">
+        <a href="https://github.com/EvanOman/claude-skills-public/tree/main/skills/system-walkthrough">Skill and reusable implementation</a>
+        <a href="https://github.com/EvanOman/claude-skills-public/blob/main/skills/system-walkthrough/references/model.md">Authoring model and component API</a>
+        <a href="https://github.com/EvanOman/claude-skills-public/blob/main/skills/system-walkthrough/references/quality.md">Design and verification guidance</a>
+        <a href="https://github.com/EvanOman/claude-skills-public/blob/main/skills/system-walkthrough/references/forward-tests.md">Forward-test findings and corrections</a>
+      </div>
+    </section>
+    <section id="sources" class="evidence" aria-labelledby="sources-title">
+      <p class="kicker">03 · EVIDENCE AND LIMITS</p>
+      <h2 id="sources-title">Read the source behind each step.</h2>
+      <p>The guides cite implementation files at these fixed revisions. Each document also identifies live documentation, preconditions, illustrative scenarios and material simplifications. The selected sequence is one ordering of events; it does not establish that concurrent operations always occur in that order.</p>
+      <div class="pins">
+        <div class="pin"><strong>Valkey 9.1.3</strong><a href="https://github.com/valkey-io/valkey/tree/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8">29173b67508b2de4c0f0ed551f3b47cf19fc3ca8</a></div>
+        <div class="pin"><strong>SQLite 3.54.1</strong><a href="https://github.com/sqlite/sqlite/tree/57520227c95396ce39ba6ecaac8d475b78dd3964">57520227c95396ce39ba6ecaac8d475b78dd3964</a></div>
+      </div>
+      <p>These are source-derived explanations, with no runtime telemetry or measured timings. They cover the configurations stated in each guide; other versions, deployment choices and failure conditions can change the behavior.</p>
+      <p>The reusable tooling and newly authored showcase content are MIT licensed. Valkey source uses <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/COPYING">BSD-3-Clause</a>; SQLite's core source is <a href="https://sqlite.org/copyright.html">public domain</a>. Upstream documentation retains its own terms. The guides use original paraphrases and primary-source links.</p>
+      <p class="attribution">AI attribution: Codex authored the tooling and guides with Claude design review and independent agent forward tests. Source evidence and explicit limits appear in the guides.</p>
+    </section>
+  </main>
+  <footer>
+    <p>System Walkthroughs · reusable, static, source-grounded</p>
+    <a href="https://github.com/EvanOman/claude-skills-public/tree/main/showcases/system-walkthroughs">Showcase source</a>
+  </footer>
+  <script>
+    const theme = document.getElementById('theme');
+    const label = () => { theme.textContent = document.documentElement.dataset.swTheme === 'light' ? 'Dark mode' : 'Light mode'; };
+    label();
+    theme.addEventListener('click', () => {
+      const next = document.documentElement.dataset.swTheme === 'light' ? 'dark' : 'light';
+      document.documentElement.dataset.swTheme = next;
+      try { localStorage.setItem('system-walkthrough-theme', next); } catch (_) {}
+      label();
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,1605 @@
+{
+  "version": 1,
+  "title": "A reader can outlive a WAL commit",
+  "subtitle": "SQLite WAL: follow one held snapshot, a successful writer commit, and a checkpoint that cannot yet finish.",
+  "question": "Why can the writer commit while an old reader keeps checkpointing from reaching the end?",
+  "scope": "R = reader snapshot end; L = committed WAL end; C = cumulative backfill progress. For readers who know transactions. SQLite 3.54.1, journal_mode=WAL, separate connections on one host, shared-cache disabled, with ordinary shared wal-index coordination. One active WAL-reading transaction holds read mark 6; a writer later commits through 10. Checkpoint calls name main and have no active transaction on their own connection. Automatic checkpoints, crashes, unusual VFS modes, network filesystems and power-loss guarantees are outside this trace.",
+  "navigation": [
+    {
+      "label": "← System Walkthroughs",
+      "url": "../"
+    },
+    {
+      "label": "evanoman.com",
+      "url": "https://evanoman.com/"
+    }
+  ],
+  "project": {
+    "name": "SQLite",
+    "repository": "https://github.com/sqlite/sqlite",
+    "revision": "57520227c95396ce39ba6ecaac8d475b78dd3964",
+    "version": "3.54.1 · version-3.54.1",
+    "license": "SQLite source is public domain. This is an AI-authored source paraphrase; no upstream text or diagrams are reproduced."
+  },
+  "sources": [
+    {
+      "id": "reader",
+      "label": "wal.c · reader algorithm",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L101-L117"
+    },
+    {
+      "id": "marks",
+      "label": "wal.c · read marks, backfill and WAL reuse",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L335-L388"
+    },
+    {
+      "id": "commit",
+      "label": "wal.c · publish a successful commit",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4320-L4351"
+    },
+    {
+      "id": "bound",
+      "label": "walCheckpoint · compute safe progress",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2310-L2332"
+    },
+    {
+      "id": "iterator",
+      "label": "walIteratorNext · latest frame per page",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L1786-L1799"
+    },
+    {
+      "id": "copy",
+      "label": "walCheckpoint · page writes and progress",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2384-L2432"
+    },
+    {
+      "id": "release",
+      "label": "sqlite3WalEndReadTransaction · release read lock",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L3561-L3602"
+    },
+    {
+      "id": "api-entry",
+      "label": "sqlite3_wal_checkpoint_v2 · entry and result",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/main.c#L2582-L2642"
+    },
+    {
+      "id": "api-route",
+      "label": "sqlite3Checkpoint · database dispatch",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/main.c#L2679-L2702"
+    },
+    {
+      "id": "btree-route",
+      "label": "sqlite3BtreeCheckpoint · pager dispatch",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/btree.c#L11403-L11421"
+    },
+    {
+      "id": "pager-route",
+      "label": "sqlite3PagerCheckpoint · WAL dispatch",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/pager.c#L7580-L7614"
+    },
+    {
+      "id": "modes",
+      "label": "Checkpoint API · PASSIVE, FULL, RESTART, TRUNCATE",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/sqlite.h.in#L10155-L10189"
+    },
+    {
+      "id": "counts",
+      "label": "Checkpoint API · cumulative counts and busy fallback",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/sqlite.h.in#L10197-L10221"
+    },
+    {
+      "id": "output",
+      "label": "sqlite3WalCheckpoint · output frame counts",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4475-L4517"
+    },
+    {
+      "id": "restart",
+      "label": "walCheckpoint · completion versus restart",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2435-L2455"
+    },
+    {
+      "id": "wal-doc",
+      "label": "Official WAL overview · concurrency",
+      "url": "https://sqlite.org/wal.html#concurrency",
+      "note": "Live official documentation snapshot acquired 2026-10-30; not pinned to this Git revision. Core claims above are reconciled with pinned source."
+    },
+    {
+      "id": "slot-zero-copy",
+      "label": "walCheckpoint · slot 0 lock before backfill",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2340-L2345"
+    },
+    {
+      "id": "slot-zero-reader",
+      "label": "walTryBeginRead · database-only reader blocks backfill",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L3216-L3243"
+    },
+    {
+      "id": "full-incomplete",
+      "label": "walCheckpoint · incomplete FULL returns BUSY",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2440-L2444"
+    },
+    {
+      "id": "full-writer-fallback",
+      "label": "sqlite3WalCheckpoint · writer-lock fallback",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4444-L4451"
+    },
+    {
+      "id": "checkpoint-count-results",
+      "label": "sqlite3WalCheckpoint · counts on OK or BUSY",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4484-L4488"
+    },
+    {
+      "id": "full-mode-return",
+      "label": "sqlite3WalCheckpoint · mode fallback returns BUSY",
+      "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4513-L4517"
+    }
+  ],
+  "claims": [
+    {
+      "id": "snapshot",
+      "kind": "source",
+      "text": "A read transaction keeps its starting mxFrame and ignores later appended frames. It searches the WAL at that snapshot, with the database file as fallback.",
+      "sources": [
+        "reader",
+        "release"
+      ]
+    },
+    {
+      "id": "commit-publish",
+      "kind": "source",
+      "text": "WAL changes commit with a commit-marked frame. On successful commit, the writer publishes mxFrame in the wal-index; this does not rewrite existing readers’ private snapshots.",
+      "sources": [
+        "reader",
+        "commit"
+      ]
+    },
+    {
+      "id": "readmark",
+      "kind": "source",
+      "text": "An active WAL reader holds a shared read lock. Its read mark cannot change while held; checkpointing cannot pass any active WAL read mark.",
+      "sources": [
+        "marks",
+        "bound"
+      ]
+    },
+    {
+      "id": "passive",
+      "kind": "source",
+      "text": "PASSIVE makes progress without waiting for readers or writers and never calls the busy handler. Reader contention can leave it incomplete with SQLITE_OK.",
+      "sources": [
+        "modes",
+        "copy"
+      ]
+    },
+    {
+      "id": "backfill-horizon",
+      "kind": "source",
+      "text": "The checkpoint iterator selects the latest frame for each page, then skips frames outside the safe bound or already covered by prior progress. Advancing C does not mean copying each frame as a separate page write.",
+      "sources": [
+        "iterator",
+        "copy"
+      ]
+    },
+    {
+      "id": "count-meaning",
+      "kind": "source",
+      "text": "pnLog reports WAL frames and pnCkpt reports cumulative checkpointed progress, including earlier calls. These are frame counts, not bytes or this call’s copied-page count.",
+      "sources": [
+        "counts",
+        "output"
+      ]
+    },
+    {
+      "id": "api-path",
+      "kind": "source",
+      "text": "For a named database, sqlite3_wal_checkpoint_v2 dispatches through sqlite3Checkpoint, sqlite3BtreeCheckpoint and sqlite3PagerCheckpoint to sqlite3WalCheckpoint, then returns the result to its caller.",
+      "sources": [
+        "api-entry",
+        "api-route",
+        "btree-route",
+        "pager-route"
+      ]
+    },
+    {
+      "id": "full-busy",
+      "kind": "source",
+      "text": "FULL waits via the busy handler for the writer and older readers; it blocks new writers while pending. If further waiting is declined, it makes passive-style progress and returns SQLITE_BUSY.",
+      "sources": [
+        "modes",
+        "counts",
+        "bound",
+        "copy",
+        "full-incomplete",
+        "full-writer-fallback",
+        "checkpoint-count-results",
+        "full-mode-return"
+      ]
+    },
+    {
+      "id": "release-retry",
+      "kind": "inference",
+      "text": "In this chosen schedule, ending the only old WAL reader releases its read lock. A later checkpoint can reach the latest committed frame if no other reader, writer, checkpoint or I/O error intervenes. Ending the reader does not itself issue that checkpoint.",
+      "sources": [
+        "release",
+        "bound",
+        "copy"
+      ]
+    },
+    {
+      "id": "file-not-empty",
+      "kind": "source",
+      "text": "Completed backfill is distinct from WAL restart and truncation. WAL reuse requires all content backfilled and no WAL readers. RESTART additionally waits for WAL readers; TRUNCATE shrinks the WAL on success.",
+      "sources": [
+        "marks",
+        "modes",
+        "restart"
+      ]
+    },
+    {
+      "id": "illustration",
+      "kind": "inference",
+      "text": "The illustrative WAL begins at committed end 6, then grows to committed end 10; the sole old reader uses read mark 6. With checkpoint access otherwise available and no errors, progress can stop at 6 and later reach 10. Another page Q has its latest version at frame 5 and is eligible for a safe page write. Numbers are chosen frame indices, not measured SQL output.",
+      "sources": [
+        "bound",
+        "copy",
+        "output"
+      ]
+    },
+    {
+      "id": "not-all-readers",
+      "kind": "source",
+      "text": "A connection without an active read transaction holds none of these reader locks. A slot 0 read transaction reads only the database file and can block all backfill while its shared slot 0 lock is held. This guide traces a nonzero-slot reader whose read mark bounds safe progress.",
+      "sources": [
+        "marks",
+        "slot-zero-copy",
+        "slot-zero-reader"
+      ]
+    },
+    {
+      "id": "checkpoint-lock",
+      "kind": "source",
+      "text": "PASSIVE can return SQLITE_BUSY if another checkpoint already owns the checkpoint lock. That lock failure does not call the busy handler.",
+      "sources": [
+        "counts"
+      ]
+    }
+  ],
+  "roles": [
+    {
+      "id": "reader",
+      "label": "Snapshot owner",
+      "color": "blue"
+    },
+    {
+      "id": "writer",
+      "label": "Commit operation",
+      "color": "violet"
+    },
+    {
+      "id": "control",
+      "label": "Checkpoint operation",
+      "color": "amber"
+    },
+    {
+      "id": "wal",
+      "label": "WAL + coordination",
+      "color": "teal"
+    },
+    {
+      "id": "db",
+      "label": "Database file",
+      "color": "slate"
+    }
+  ],
+  "takeaways": [
+    {
+      "text": "The old reader keeps A after the writer has committed B. An open connection without an active read transaction creates no reader-lock barrier.",
+      "claims": [
+        "snapshot",
+        "not-all-readers"
+      ]
+    },
+    {
+      "text": "PASSIVE may return OK with C < L. Compare cumulative checkpoint progress with committed WAL frames.",
+      "claims": [
+        "passive",
+        "count-meaning"
+      ]
+    },
+    {
+      "text": "End the old transaction, then retry checkpointing. FULL may wait and return BUSY; completed backfill still differs from truncation.",
+      "claims": [
+        "release-retry",
+        "full-busy",
+        "file-not-empty"
+      ]
+    }
+  ],
+  "limits": [
+    "AI-authored explanation from public primary sources. SQLite’s source is public domain. Renderer licensing remains with the bundled skill.",
+    "Frame indices 6 and 10, a safely copyable page Q at frame 5, page values A and B, and event ordering are source-derived illustrations, not observed runtime measurements. All repetitive frame writes and API layers are condensed.",
+    "R is the existing reader’s snapshot end, L is the committed log end, and C is cumulative backfill progress. The chosen read mark equals R; actual read-slot selection and WAL resets may produce other values.",
+    "C = 6 is a safe progress horizon, not six physical page writes. The checkpoint iterator can skip older versions of pages. This guide does not model file bytes, page caches or each lock transition.",
+    "The checkpoint operation is local SQLite code invoked by a connection. It is not a separate server or automatic worker; arrows to files describe logical I/O.",
+    "This trace assumes checkpoint lock acquisition succeeds and no I/O error occurs. Another checkpoint can instead cause immediate SQLITE_BUSY, even for PASSIVE.",
+    "No SQLite binary was built or executed for this guide. The pinned implementation and API contract establish the behavior; browser tests verify only the interactive explanation."
+  ],
+  "map": {
+    "title": "Two files, independent transaction lifetimes",
+    "description": "Connections and their local operations sit beside storage. WAL + wal-index groups the append-only page frames with shared coordination metadata. File arrows are logical I/O, not network messages. The database can lag the latest committed WAL.",
+    "width": 1000,
+    "height": 700,
+    "nodes": [
+      {
+        "id": "reader",
+        "label": "Reader connection",
+        "detail": "Owns snapshot end R",
+        "role": "reader",
+        "x": 40,
+        "y": 40,
+        "w": 210,
+        "h": 90
+      },
+      {
+        "id": "writer",
+        "label": "Writer connection",
+        "detail": "Publishes committed end L",
+        "role": "writer",
+        "x": 40,
+        "y": 300,
+        "w": 210,
+        "h": 90
+      },
+      {
+        "id": "wal",
+        "label": "WAL + wal-index",
+        "detail": "Frames; read marks; progress C",
+        "role": "wal",
+        "x": 390,
+        "y": 170,
+        "w": 210,
+        "h": 90
+      },
+      {
+        "id": "db",
+        "label": "Main database file",
+        "detail": "Receives safe page versions",
+        "role": "db",
+        "x": 760,
+        "y": 170,
+        "w": 210,
+        "h": 90
+      },
+      {
+        "id": "checkpointer",
+        "label": "Checkpoint operation",
+        "detail": "In-process SQLite work",
+        "role": "control",
+        "x": 390,
+        "y": 460,
+        "w": 210,
+        "h": 90
+      },
+      {
+        "id": "caller",
+        "label": "Checkpoint caller",
+        "detail": "Another SQLite connection",
+        "role": "control",
+        "x": 760,
+        "y": 460,
+        "w": 210,
+        "h": 90
+      }
+    ],
+    "edges": [
+      {
+        "id": "read",
+        "from": "reader",
+        "to": "wal",
+        "label": "Read at R",
+        "kind": "request",
+        "via": [
+          {
+            "x": 350,
+            "y": 85
+          },
+          {
+            "x": 350,
+            "y": 310
+          }
+        ]
+      },
+      {
+        "id": "read-return",
+        "from": "wal",
+        "to": "reader",
+        "label": "Snapshot page",
+        "kind": "return",
+        "via": [
+          {
+            "x": 370,
+            "y": 170
+          },
+          {
+            "x": 145,
+            "y": 170
+          }
+        ]
+      },
+      {
+        "id": "append",
+        "from": "writer",
+        "to": "wal",
+        "label": "Append + publish commit",
+        "kind": "data"
+      },
+      {
+        "id": "checkpoint",
+        "from": "caller",
+        "to": "checkpointer",
+        "label": "Checkpoint call",
+        "kind": "request"
+      },
+      {
+        "id": "checkpoint-return",
+        "from": "checkpointer",
+        "to": "caller",
+        "label": "Return rc, L, C",
+        "kind": "return",
+        "via": [
+          {
+            "x": 495,
+            "y": 630
+          },
+          {
+            "x": 865,
+            "y": 630
+          }
+        ]
+      },
+      {
+        "id": "bound",
+        "from": "checkpointer",
+        "to": "wal",
+        "label": "Inspect read marks",
+        "kind": "control"
+      },
+      {
+        "id": "backfill",
+        "from": "checkpointer",
+        "to": "db",
+        "label": "Write safe WAL pages",
+        "kind": "data"
+      }
+    ],
+    "lenses": [
+      {
+        "id": "snapshot",
+        "label": "Reader’s view",
+        "title": "One reader owns an old snapshot",
+        "body": "The reader uses R = 6 even when L has advanced to 10. A page absent from its WAL view is read from the main database file; this simplified map highlights the WAL hit for P = A.",
+        "nodes": [
+          "reader",
+          "wal",
+          "db"
+        ],
+        "edges": [
+          "read",
+          "read-return"
+        ],
+        "claims": [
+          "snapshot",
+          "illustration"
+        ]
+      },
+      {
+        "id": "commit",
+        "label": "Commit path",
+        "title": "A commit publishes a newer end",
+        "body": "The writer appends and commits, publishing L = 10. The old reader continues using R = 6; no snapshot update arrow goes to it.",
+        "nodes": [
+          "writer",
+          "wal",
+          "reader"
+        ],
+        "edges": [
+          "append"
+        ],
+        "claims": [
+          "commit-publish",
+          "snapshot"
+        ]
+      },
+      {
+        "id": "checkpoint",
+        "label": "Checkpoint path",
+        "title": "The caller receives progress, not an empty-file promise",
+        "body": "The local checkpoint operation inspects read marks, makes safe file writes, and returns rc plus frame counts L and C. PASSIVE can stop short.",
+        "nodes": [
+          "caller",
+          "checkpointer",
+          "wal",
+          "db"
+        ],
+        "edges": [
+          "checkpoint",
+          "bound",
+          "backfill",
+          "checkpoint-return"
+        ],
+        "claims": [
+          "api-path",
+          "readmark",
+          "passive",
+          "count-meaning"
+        ]
+      }
+    ],
+    "intents": [
+      {
+        "id": "diagnose",
+        "label": "Interpret OK + C < L",
+        "title": "Recognize an unfinished PASSIVE checkpoint",
+        "body": "Under the chosen interleaving, OK with L = 10 and C = 6 means safe progress was made while the held old read mark stopped completion. Other readers or writers can also affect a real checkpoint.",
+        "nodes": [
+          "reader",
+          "caller",
+          "checkpointer",
+          "wal",
+          "db"
+        ],
+        "edges": [
+          "bound",
+          "backfill",
+          "checkpoint-return"
+        ],
+        "claims": [
+          "passive",
+          "count-meaning",
+          "illustration"
+        ]
+      },
+      {
+        "id": "finish",
+        "label": "Finish after release",
+        "title": "Release the transaction, then call again",
+        "body": "Ending the old reader removes its lock. It does not issue a checkpoint; the application explicitly requests the retry shown here. Even C = L does not promise a zero-byte WAL.",
+        "nodes": [
+          "reader",
+          "caller",
+          "checkpointer",
+          "wal",
+          "db"
+        ],
+        "edges": [
+          "checkpoint",
+          "backfill",
+          "checkpoint-return"
+        ],
+        "claims": [
+          "release-retry",
+          "file-not-empty"
+        ]
+      }
+    ]
+  },
+  "walkthrough": {
+    "title": "One old reader, one commit, two checkpoint calls",
+    "intro": "A source-derived schedule with chosen frame indices. Each selectable step includes a complete post-step state so it can be read in any order. The reader’s WAL hit for P stays A until that transaction ends.",
+    "steps": [
+      {
+        "id": "pin",
+        "title": "Pin an old WAL snapshot",
+        "body": "The reader starts a real read transaction after committed frame 6 and uses a WAL read slot with read mark 6. Page P has value A at frame 6. An open connection alone is insufficient.",
+        "why": "The held read lock protects the snapshot throughout the transaction.",
+        "boundary": "Local connection state and shared wal-index coordination; no network hop.",
+        "nodes": [
+          "reader",
+          "wal"
+        ],
+        "edges": [
+          "read",
+          "read-return"
+        ],
+        "claims": [
+          "snapshot",
+          "readmark",
+          "not-all-readers",
+          "illustration"
+        ],
+        "state": [
+          {
+            "owner": "Reader",
+            "detail": "R = 6 held; page P reads A."
+          },
+          {
+            "owner": "Writer",
+            "detail": "Commit through frame 6 already complete."
+          },
+          {
+            "owner": "WAL + wal-index",
+            "detail": "L = 6; C = 0; P = A at frame 6."
+          },
+          {
+            "owner": "Main database",
+            "detail": "Baseline pages; no new checkpoint yet."
+          },
+          {
+            "owner": "Checkpoint caller",
+            "detail": "No checkpoint request yet."
+          }
+        ]
+      },
+      {
+        "id": "commit",
+        "title": "Commit newer frames",
+        "body": "A separate writer appends frames through a commit at frame 10, where P becomes B. Its commit succeeds. The old reader still reads A from its R = 6 snapshot.",
+        "why": "Publishing L = 10 permits a new snapshot to include B; it does not advance this reader.",
+        "boundary": "Writer to WAL storage, then local commit result; no checkpoint promise.",
+        "nodes": [
+          "writer",
+          "reader",
+          "wal"
+        ],
+        "edges": [
+          "append",
+          "read-return"
+        ],
+        "claims": [
+          "snapshot",
+          "commit-publish",
+          "illustration"
+        ],
+        "state": [
+          {
+            "owner": "Reader",
+            "detail": "R = 6 held; page P reads A."
+          },
+          {
+            "owner": "Writer",
+            "detail": "Commit through frame 10 returned OK."
+          },
+          {
+            "owner": "WAL + wal-index",
+            "detail": "L = 10; C = 0. P = A at frame 6; P = B at frame 10."
+          },
+          {
+            "owner": "Main database",
+            "detail": "Baseline pages; no new checkpoint yet."
+          },
+          {
+            "owner": "Checkpoint caller",
+            "detail": "No checkpoint request yet."
+          }
+        ]
+      },
+      {
+        "id": "request",
+        "title": "Ask for PASSIVE",
+        "body": "A different connection calls sqlite3_wal_checkpoint_v2(db, \"main\", PASSIVE, &L, &C). The API passes through B-tree and pager layers to WAL checkpointing.",
+        "why": "The caller asks for safe progress without waiting for transactions to finish.",
+        "boundary": "In-process API dispatch; the checkpoint operation is not an automatic daemon.",
+        "nodes": [
+          "caller",
+          "checkpointer",
+          "wal"
+        ],
+        "edges": [
+          "checkpoint",
+          "bound"
+        ],
+        "claims": [
+          "api-path",
+          "passive",
+          "checkpoint-lock"
+        ],
+        "state": [
+          {
+            "owner": "Reader",
+            "detail": "R = 6 held; page P reads A."
+          },
+          {
+            "owner": "Writer",
+            "detail": "Commit through frame 10 returned OK."
+          },
+          {
+            "owner": "WAL + wal-index",
+            "detail": "L = 10; C = 0. Active old read mark = 6."
+          },
+          {
+            "owner": "Main database",
+            "detail": "Baseline pages; no new checkpoint yet."
+          },
+          {
+            "owner": "Checkpoint caller",
+            "detail": "PASSIVE in progress; checkpoint lock acquired."
+          }
+        ]
+      },
+      {
+        "id": "partial",
+        "title": "Return OK with work remaining",
+        "body": "The held read mark limits safe checkpoint progress to 6. In this schedule, safe page writes advance C to 6; the API returns SQLITE_OK with L = 10 and C = 6.",
+        "why": "Advancing beyond the old read mark could overwrite database pages still needed by the old snapshot. OK reports this PASSIVE attempt succeeded, not that the WAL is empty.",
+        "boundary": "WAL page content to the main file, then an API return to the checkpoint caller.",
+        "nodes": [
+          "reader",
+          "wal",
+          "db",
+          "checkpointer",
+          "caller"
+        ],
+        "edges": [
+          "bound",
+          "backfill",
+          "checkpoint-return"
+        ],
+        "claims": [
+          "readmark",
+          "passive",
+          "count-meaning",
+          "illustration",
+          "file-not-empty"
+        ],
+        "state": [
+          {
+            "owner": "Reader",
+            "detail": "R = 6 held; page P reads A."
+          },
+          {
+            "owner": "Writer",
+            "detail": "Commit through frame 10 returned OK."
+          },
+          {
+            "owner": "WAL + wal-index",
+            "detail": "L = 10; C = 6. WAL frames remain available."
+          },
+          {
+            "owner": "Main database",
+            "detail": "Safe page writes made; not the whole latest snapshot."
+          },
+          {
+            "owner": "Checkpoint caller",
+            "detail": "PASSIVE returned SQLITE_OK, L = 10, C = 6."
+          }
+        ]
+      },
+      {
+        "id": "release",
+        "title": "End the old reader",
+        "body": "The application ends that read transaction, releasing its WAL read lock. This action does not automatically retry the completed checkpoint call.",
+        "why": "The barrier is gone because its owner released it; SQLite did not force the old snapshot forward.",
+        "boundary": "Local transaction lifetime and shared lock release.",
+        "nodes": [
+          "reader",
+          "wal"
+        ],
+        "edges": [],
+        "claims": [
+          "release-retry"
+        ],
+        "state": [
+          {
+            "owner": "Reader",
+            "detail": "Old read transaction ended; its read lock released."
+          },
+          {
+            "owner": "Writer",
+            "detail": "Commit through frame 10 returned OK."
+          },
+          {
+            "owner": "WAL + wal-index",
+            "detail": "L = 10; C = 6. No WAL reader remains."
+          },
+          {
+            "owner": "Main database",
+            "detail": "Safe earlier progress; latest backfill incomplete."
+          },
+          {
+            "owner": "Checkpoint caller",
+            "detail": "Previous PASSIVE returned OK with C < L; no retry yet."
+          }
+        ]
+      },
+      {
+        "id": "retry",
+        "title": "Explicitly retry and finish",
+        "body": "With no other active transactions or errors, the caller requests PASSIVE again. Progress can reach C = L = 10. The returned counts include earlier checkpoint work.",
+        "why": "The main file now has required latest pages, while PASSIVE still does not promise a zero-byte WAL. Restart and truncation have separate conditions.",
+        "boundary": "A second API request, safe file writes, and its return.",
+        "nodes": [
+          "caller",
+          "checkpointer",
+          "wal",
+          "db"
+        ],
+        "edges": [
+          "checkpoint",
+          "bound",
+          "backfill",
+          "checkpoint-return"
+        ],
+        "claims": [
+          "release-retry",
+          "count-meaning",
+          "file-not-empty",
+          "illustration"
+        ],
+        "state": [
+          {
+            "owner": "Reader",
+            "detail": "Old read transaction ended; no reader remains."
+          },
+          {
+            "owner": "Writer",
+            "detail": "Commit through frame 10 returned OK."
+          },
+          {
+            "owner": "WAL + wal-index",
+            "detail": "L = 10; C = 10. WAL not truncated by PASSIVE."
+          },
+          {
+            "owner": "Main database",
+            "detail": "All required latest page versions backfilled."
+          },
+          {
+            "owner": "Checkpoint caller",
+            "detail": "Second PASSIVE returned SQLITE_OK, L = 10, C = 10."
+          }
+        ]
+      }
+    ]
+  },
+  "sequence": {
+    "title": "Change the checkpoint mode, keep the old snapshot",
+    "intro": "Choose a source-derived interleaving. Lanes represent connections, a local checkpoint operation, and files—not separate network services. Repetitive writes and internal API calls are condensed; vertical order is illustrative rather than elapsed time.",
+    "lanes": [
+      {
+        "id": "reader",
+        "label": "Reader",
+        "role": "reader"
+      },
+      {
+        "id": "writer",
+        "label": "Writer",
+        "role": "writer"
+      },
+      {
+        "id": "caller",
+        "label": "Caller",
+        "role": "control"
+      },
+      {
+        "id": "checkpointer",
+        "label": "Checkpoint",
+        "role": "control"
+      },
+      {
+        "id": "wal",
+        "label": "WAL + index",
+        "role": "wal"
+      },
+      {
+        "id": "db",
+        "label": "Main file",
+        "role": "db"
+      }
+    ],
+    "scenarios": [
+      {
+        "id": "passive-retry",
+        "label": "PASSIVE → release → retry",
+        "summary": "The writer commits, an old reader limits the first PASSIVE call, then the application ends the reader and explicitly retries successfully.",
+        "assumptions": [
+          "Source-derived illustration; R = read mark = 6, initial C = 0, and newer committed L = 10. Page P changes from A to B; another page Q has its latest frame at 5 and can be copied safely.",
+          "No concurrent checkpoint, new transaction, I/O failure or automatic checkpoint intervenes. The old reader ends only at the shown release event.",
+          "Checkpoint callers name main, provide both counts, and hold no active transaction of their own. The shown calls and replies are local C API boundaries."
+        ],
+        "events": [
+          {
+            "id": "read-start",
+            "from": "reader",
+            "to": "reader",
+            "label": "Start read: R = 6",
+            "kind": "control",
+            "body": "Source-derived illustration. The reader selects and holds WAL read mark 6. It can read P = A.",
+            "claims": [
+              "snapshot",
+              "readmark",
+              "illustration"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 6 already complete."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 6; C = 0; P = A at frame 6."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Baseline pages; no new checkpoint yet."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "No checkpoint request yet."
+              }
+            ]
+          },
+          {
+            "id": "commit-frames",
+            "from": "writer",
+            "to": "wal",
+            "label": "Commit through frame 10",
+            "kind": "data",
+            "body": "Condensed WAL writes include a commit marker and publication of L = 10; P now has B at frame 10. The reader’s R remains 6.",
+            "claims": [
+              "commit-publish",
+              "snapshot",
+              "illustration"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Committed through frame 10; local result pending."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 0. P = A at frame 6; P = B at frame 10."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Baseline pages; no new checkpoint yet."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "No checkpoint request yet."
+              }
+            ]
+          },
+          {
+            "id": "commit-result",
+            "from": "writer",
+            "to": "writer",
+            "label": "COMMIT returns OK to app",
+            "kind": "control",
+            "body": "Local control event: the writer connection returns a successful COMMIT result to its application; the application has no separate lane here. Power-loss durability settings are outside this illustration.",
+            "claims": [
+              "commit-publish"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 0. P = A at frame 6; P = B at frame 10."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Baseline pages; no new checkpoint yet."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "No checkpoint request yet."
+              }
+            ]
+          },
+          {
+            "id": "old-read",
+            "from": "reader",
+            "to": "reader",
+            "label": "Read P again: A",
+            "kind": "control",
+            "body": "The existing transaction continues using frame 6; later committed B is outside its snapshot.",
+            "claims": [
+              "snapshot",
+              "illustration"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 0. P = A at frame 6; P = B at frame 10."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Baseline pages; no new checkpoint yet."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "No checkpoint request yet."
+              }
+            ]
+          },
+          {
+            "id": "request",
+            "from": "caller",
+            "to": "checkpointer",
+            "label": "PASSIVE(main)",
+            "kind": "request",
+            "body": "The separate checkpoint caller requests progress without waiting. API layers are condensed into the checkpoint lane.",
+            "claims": [
+              "api-path",
+              "passive",
+              "checkpoint-lock"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 0. Active old read mark = 6."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Baseline pages; no new checkpoint yet."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "PASSIVE in progress; checkpoint lock acquired."
+              }
+            ]
+          },
+          {
+            "id": "safe-limit",
+            "from": "checkpointer",
+            "to": "checkpointer",
+            "label": "Safe bound = 6",
+            "kind": "control",
+            "body": "Local wal-index inspection finds the held old read mark; it cannot safely pass that mark.",
+            "claims": [
+              "readmark",
+              "illustration"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 0. Active old read mark = 6."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Baseline pages; no new checkpoint yet."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "PASSIVE in progress; checkpoint lock acquired."
+              }
+            ]
+          },
+          {
+            "id": "copy-safe",
+            "from": "checkpointer",
+            "to": "db",
+            "label": "Write safe WAL pages; C = 6",
+            "kind": "data",
+            "body": "The checkpoint operation reads page versions from the WAL and writes safe versions to the main file. C is a progress horizon, not a promise that every earlier frame was copied as a separate page write. Duplicate page versions can be skipped.",
+            "claims": [
+              "readmark",
+              "count-meaning",
+              "backfill-horizon",
+              "illustration"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 6. Old read mark remains 6."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Safe required page versions written; latest snapshot incomplete."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "PASSIVE preparing its return."
+              }
+            ]
+          },
+          {
+            "id": "partial-result",
+            "from": "checkpointer",
+            "to": "caller",
+            "label": "OK; L = 10, C = 6",
+            "kind": "return",
+            "body": "The result returns to the invoking connection. Check C < L: the reader is still open and the checkpoint is incomplete.",
+            "claims": [
+              "passive",
+              "count-meaning",
+              "illustration"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 6. WAL frames remain available."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Safe page writes made; not the whole latest snapshot."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "PASSIVE returned SQLITE_OK, L = 10, C = 6."
+              }
+            ]
+          },
+          {
+            "id": "reader-end",
+            "from": "reader",
+            "to": "reader",
+            "label": "End read transaction",
+            "kind": "control",
+            "body": "The application releases the old read lock. No automatic retry is implied.",
+            "claims": [
+              "release-retry"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "Old read transaction ended; its read lock released."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 6. No WAL reader remains."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Safe earlier progress; latest backfill incomplete."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "Previous PASSIVE returned OK with C < L; no retry yet."
+              }
+            ]
+          },
+          {
+            "id": "retry",
+            "from": "caller",
+            "to": "checkpointer",
+            "label": "PASSIVE(main) again",
+            "kind": "request",
+            "body": "A second explicit call occurs after release. No other reader, writer or checkpoint intervenes in this chosen schedule.",
+            "claims": [
+              "api-path",
+              "release-retry",
+              "checkpoint-lock"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "Old read transaction ended; no reader remains."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 6. No WAL reader remains."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Safe earlier progress; latest backfill incomplete."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "Second PASSIVE request in progress."
+              }
+            ]
+          },
+          {
+            "id": "finish",
+            "from": "checkpointer",
+            "to": "db",
+            "label": "Write remaining WAL pages",
+            "kind": "data",
+            "body": "Without the old barrier, checkpointing can reach the latest committed end.",
+            "claims": [
+              "release-retry",
+              "illustration"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "No old reader remains."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 10; WAL retained."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Latest required page versions backfilled."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "Second PASSIVE preparing its return."
+              }
+            ]
+          },
+          {
+            "id": "complete-result",
+            "from": "checkpointer",
+            "to": "caller",
+            "label": "OK; L = 10, C = 10",
+            "kind": "return",
+            "body": "Backfill is complete for this log. The physical WAL file need not shrink; PASSIVE is not TRUNCATE.",
+            "claims": [
+              "count-meaning",
+              "file-not-empty",
+              "illustration"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "Old read transaction ended; no reader remains."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 10. WAL not truncated by PASSIVE."
+              },
+              {
+                "owner": "Main database",
+                "detail": "All required latest page versions backfilled."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "Second PASSIVE returned SQLITE_OK, L = 10, C = 10."
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "full-busy",
+        "label": "FULL → waiting declined → BUSY",
+        "summary": "With the same old reader, FULL attempts to wait. The busy handler declines further waiting, so safe partial progress is followed by SQLITE_BUSY. The reader stays old.",
+        "assumptions": [
+          "Source-derived alternative schedule starting from the same R = 6 and L = 10 state; no retry from the PASSIVE scenario carries over. Another page Q has its latest frame at 5 and can be copied safely.",
+          "The writer has released its write lock. FULL acquires checkpoint and writer locks, then encounters the old WAL reader.",
+          "A configured busy handler eventually returns 0; any earlier waiting attempts are condensed. No automatic cancellation of the old reader is invented."
+        ],
+        "events": [
+          {
+            "id": "read-start",
+            "from": "reader",
+            "to": "reader",
+            "label": "Start read: R = 6",
+            "kind": "control",
+            "body": "Source-derived illustration. The reader selects and holds WAL read mark 6. It can read P = A.",
+            "claims": [
+              "snapshot",
+              "readmark",
+              "illustration"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 6 already complete."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 6; C = 0; P = A at frame 6."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Baseline pages; no new checkpoint yet."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "No checkpoint request yet."
+              }
+            ]
+          },
+          {
+            "id": "commit-frames",
+            "from": "writer",
+            "to": "wal",
+            "label": "Commit through frame 10",
+            "kind": "data",
+            "body": "Condensed WAL writes include a commit marker and publication of L = 10; P now has B at frame 10. The reader’s R remains 6.",
+            "claims": [
+              "commit-publish",
+              "snapshot",
+              "illustration"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Committed through frame 10; local result pending."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 0. P = A at frame 6; P = B at frame 10."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Baseline pages; no new checkpoint yet."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "No checkpoint request yet."
+              }
+            ]
+          },
+          {
+            "id": "commit-result",
+            "from": "writer",
+            "to": "writer",
+            "label": "COMMIT returns OK to app",
+            "kind": "control",
+            "body": "Local control event: the writer connection returns a successful COMMIT result to its application; the application has no separate lane here. Power-loss durability settings are outside this illustration.",
+            "claims": [
+              "commit-publish"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 0. P = A at frame 6; P = B at frame 10."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Baseline pages; no new checkpoint yet."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "No checkpoint request yet."
+              }
+            ]
+          },
+          {
+            "id": "old-read",
+            "from": "reader",
+            "to": "reader",
+            "label": "Read P again: A",
+            "kind": "control",
+            "body": "The existing transaction continues using frame 6; later committed B is outside its snapshot.",
+            "claims": [
+              "snapshot",
+              "illustration"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 0. P = A at frame 6; P = B at frame 10."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Baseline pages; no new checkpoint yet."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "No checkpoint request yet."
+              }
+            ]
+          },
+          {
+            "id": "full-request",
+            "from": "caller",
+            "to": "checkpointer",
+            "label": "FULL(main)",
+            "kind": "request",
+            "body": "The writer has finished. FULL acquires the writer lock but the older WAL reader is still active.",
+            "claims": [
+              "api-path",
+              "full-busy",
+              "checkpoint-lock"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 0. Old WAL reader still holds 6."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Baseline pages; no new checkpoint yet."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "FULL acquired checkpoint and writer locks; waiting on reader."
+              }
+            ]
+          },
+          {
+            "id": "decline-wait",
+            "from": "checkpointer",
+            "to": "checkpointer",
+            "label": "Busy handler declines",
+            "kind": "control",
+            "body": "One local waiting decision is shown; any previous retries are condensed. FULL cannot upgrade or end the reader’s transaction. New writer attempts are blocked while this FULL operation owns the writer lock.",
+            "claims": [
+              "full-busy",
+              "snapshot"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 0. Old WAL reader still holds 6."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Baseline pages; no new checkpoint yet."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "Further waiting declined; safe partial work pending."
+              }
+            ]
+          },
+          {
+            "id": "partial-copy",
+            "from": "checkpointer",
+            "to": "db",
+            "label": "Write safe WAL pages; C = 6",
+            "kind": "data",
+            "body": "After waiting is declined, safe work can still advance C to 6, without passing the reader. The unchanged old reader prevents full completion.",
+            "claims": [
+              "full-busy",
+              "readmark",
+              "illustration"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 6. Old reader remains."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Safe partial page writes; latest backfill incomplete."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "FULL busy handler declined further waiting; returning BUSY."
+              }
+            ]
+          },
+          {
+            "id": "busy-result",
+            "from": "checkpointer",
+            "to": "caller",
+            "label": "BUSY; L = 10, C = 6",
+            "kind": "return",
+            "body": "FULL did not achieve its requested completion. The API returns and releases its locks. The old reader still sees A. The application must decide when to end that reader and whether to retry.",
+            "claims": [
+              "full-busy",
+              "count-meaning",
+              "release-retry"
+            ],
+            "state": [
+              {
+                "owner": "Reader",
+                "detail": "R = 6 held; page P reads A."
+              },
+              {
+                "owner": "Writer",
+                "detail": "Commit through frame 10 returned OK."
+              },
+              {
+                "owner": "WAL + wal-index",
+                "detail": "L = 10; C = 6. Old reader remains."
+              },
+              {
+                "owner": "Main database",
+                "detail": "Safe partial page writes; latest backfill incomplete."
+              },
+              {
+                "owner": "Checkpoint caller",
+                "detail": "FULL returned SQLITE_BUSY, L = 10, C = 6; no retry pending."
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

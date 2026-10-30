@@ -1,11 +1,11 @@
 {
   "name": "evan-skills",
   "description": "Cross-harness skills for research, development, and content creation",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": {
     "name": "Evan Oman"
   },
-  "repository": "https://github.com/EvanOman/claude-skills",
+  "repository": "https://github.com/EvanOman/claude-skills-public",
   "keywords": [
     "research",
     "slides",

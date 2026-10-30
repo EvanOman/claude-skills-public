@@ -1,0 +1,604 @@
+<!doctype html>
+<!-- System Walkthrough runtime and newly authored content. Third-party sources retain their own terms.
+MIT License
+
+Copyright (c) 2026 Evan Oman
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="SQLite WAL: follow one held snapshot, a successful writer commit, and a checkpoint that cannot yet finish."><meta name="color-scheme" content="dark light"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:"><title>A reader can outlive a WAL commit · System Walkthroughs</title><script>/* Apply the preference before first paint; blocked storage must not block reading. */
+(function () {
+  try {
+    var theme = localStorage.getItem('system-walkthrough-theme');
+    if (theme === 'light') document.documentElement.dataset.swTheme = 'light';
+  } catch (_) { /* The default remains dark. */ }
+})();
+</script><style>html{background:var(--sw-bg,#101719);color:var(--sw-ink,#eaf0ec)}body{margin:0}/* System Walkthrough — all component selectors are scoped to .sw. */
+:root {
+  color-scheme: dark;
+  --sw-bg:#10171b; --sw-panel:#182226; --sw-panel-alt:#1b292e;
+  --sw-ink:#edf2ef; --sw-muted:#b0c2c8; --sw-border:#43565e;
+  --sw-teal:#7bddc8; --sw-blue:#8dbaff; --sw-amber:#edc47c;
+  --sw-violet:#c6a8ff; --sw-rose:#f4a4aa; --sw-slate:#b7c9d0;
+  --sw-shadow:0 18px 42px #0002;
+}
+:root[data-sw-theme="light"] {
+  color-scheme:light;
+  --sw-bg:#f6f5ef; --sw-panel:#fffefa; --sw-panel-alt:#ecefe9;
+  --sw-ink:#152c32; --sw-muted:#435d66; --sw-border:#a0b2b6;
+  --sw-teal:#146958; --sw-blue:#275eae; --sw-amber:#805209;
+  --sw-violet:#6e42a5; --sw-rose:#a43e4c; --sw-slate:#48636c;
+  --sw-shadow:0 18px 42px #213c3210;
+}
+.sw { max-width:1480px; margin:0 auto; padding:42px clamp(18px,3.5vw,54px) 30px; color:var(--sw-ink); font:16px/1.65 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; overflow-wrap:anywhere; }
+.sw-site-nav { max-width:1480px; margin:0 auto; padding:18px clamp(18px,3.5vw,54px) 0; display:flex; flex-wrap:wrap; gap:18px; font:12px/1.6 system-ui,sans-serif; }
+.sw-site-nav a { color:var(--sw-muted); text-underline-offset:4px; }
+.sw-site-nav a:focus-visible { outline:3px solid var(--sw-amber); outline-offset:4px; }
+.sw *, .sw *::before, .sw *::after { box-sizing:border-box; }
+.sw h1,.sw h2,.sw h3,.sw h4,.sw p { margin-top:0; }
+.sw h1,.sw h2 { font-family:Georgia,"Times New Roman",serif; font-weight:600; letter-spacing:-.025em; line-height:1.12; text-wrap:balance; }
+.sw h1 { font-size:clamp(44px,6vw,82px); max-width:1100px; margin:30px 0 22px; }
+.sw h2 { font-size:clamp(30px,3.4vw,48px); margin-bottom:18px; }
+.sw h3 { font-size:22px; line-height:1.35; margin-bottom:14px; }
+.sw h4 { font-size:14px; letter-spacing:.035em; line-height:1.5; margin:22px 0 7px; }
+.sw p { margin-bottom:16px; }
+.sw a { color:var(--sw-teal); text-underline-offset:4px; text-decoration-thickness:1px; }
+.sw a:hover { text-decoration-thickness:2px; }
+.sw button { min-height:43px; border:1px solid var(--sw-border); border-radius:7px; padding:9px 14px; background:var(--sw-panel); color:var(--sw-ink); font:inherit; font-size:14px; line-height:1.4; cursor:pointer; text-align:left; }
+.sw button:hover { background:var(--sw-panel-alt); border-color:var(--sw-teal); }
+.sw button[aria-pressed="true"],.sw button[aria-current="step"] { border-color:var(--sw-teal); background:color-mix(in srgb,var(--sw-teal) 12%,var(--sw-panel)); box-shadow:inset 3px 0 0 var(--sw-teal); }
+.sw button:disabled { opacity:.5; cursor:default; }
+.sw :focus-visible { outline:3px solid var(--sw-amber); outline-offset:4px; }
+.sw code { font:13px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; color:var(--sw-muted); }
+.sw .sw-kicker { font:600 11px/1.5 system-ui,sans-serif; letter-spacing:.16em; color:var(--sw-muted); margin-bottom:12px; }
+.sw-topline { display:flex; align-items:center; justify-content:space-between; gap:18px; }
+.sw-topline .sw-kicker { margin-bottom:0; }
+.sw .sw-theme { flex-shrink:0; min-height:38px; border-radius:25px; font-size:12px; }
+.sw .sw-subtitle { font:24px/1.5 Georgia,serif; max-width:940px; color:var(--sw-muted); }
+.sw .sw-question { max-width:900px; margin:30px 0 22px; font-size:18px; color:var(--sw-ink); }
+.sw-snapshot { display:flex; align-items:center; gap:14px; flex-wrap:wrap; font-size:12px; }
+.sw .sw-scope { max-width:990px; color:var(--sw-muted); font-size:14px; border-left:2px solid var(--sw-border); padding-left:18px; margin:22px 0 28px; }
+.sw-nav { display:flex; flex-wrap:wrap; gap:12px 25px; padding:18px 0; border-top:1px solid var(--sw-border); border-bottom:1px solid var(--sw-border); font-size:13px; }
+.sw-takeaways { list-style:none; padding:0; display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr)); gap:24px; counter-reset:takeaways; margin:38px 0 0; }
+.sw-takeaways>li { border-top:2px solid var(--sw-teal); padding:18px 0 0; counter-increment:takeaways; }
+.sw-takeaways>li::before { content:"0" counter(takeaways); display:block; color:var(--sw-teal); font:26px/1 Georgia,serif; margin-bottom:15px; }
+.sw-takeaways p { font-size:16px; }
+.sw-section { margin-top:80px; padding-top:32px; border-top:1px solid var(--sw-border); scroll-margin-top:25px; min-width:0; }
+.sw-section-heading { max-width:990px; margin-bottom:28px; }
+.sw .sw-section-intro { color:var(--sw-muted); font-size:17px; }
+.sw-controls { display:flex; flex-wrap:wrap; gap:8px; margin:0 0 15px; min-width:0; }
+.sw-controls button { font-size:13px; }
+.sw-intents { align-items:center; padding:10px 0 6px; }
+.sw-control-label { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--sw-muted); margin-right:8px; }
+.sw-legend { padding:0; margin:18px 0 20px; display:flex; gap:12px 24px; flex-wrap:wrap; list-style:none; color:var(--sw-muted); font-size:12px; }
+.sw-legend li { display:flex; align-items:center; gap:7px; }
+.sw [data-color="teal"] { --sw-role:var(--sw-teal); }
+.sw [data-color="blue"] { --sw-role:var(--sw-blue); }
+.sw [data-color="amber"] { --sw-role:var(--sw-amber); }
+.sw [data-color="violet"] { --sw-role:var(--sw-violet); }
+.sw [data-color="rose"] { --sw-role:var(--sw-rose); }
+.sw [data-color="slate"] { --sw-role:var(--sw-slate); }
+.sw-dot { width:8px; height:8px; border-radius:50%; background:var(--sw-role); flex-shrink:0; }
+.sw-map-layout { display:flex; flex-wrap:wrap; gap:22px; }
+.sw-map-layout>.sw-diagram-shell { flex:10 1 var(--sw-map-width); }
+.sw-map-layout>.sw-inspector-host { flex:1 1 300px; }
+.sw-diagram-shell { border:1px solid var(--sw-border); border-radius:11px; background:var(--sw-panel); min-width:0; overflow:hidden; box-shadow:var(--sw-shadow); align-self:start; }
+.sw .sw-scroll-hint { padding:10px 15px; background:var(--sw-panel-alt); margin:0; font-size:11px; color:var(--sw-muted); border-bottom:1px solid var(--sw-border); }
+.sw-viewport { max-width:100%; overflow:auto; overscroll-behavior-inline:contain; scrollbar-color:var(--sw-border) var(--sw-panel); }
+.sw-diagram { display:block; width:100%; min-width:var(--sw-diagram-width); height:auto; }
+.sw-diagram text { font-family:system-ui,sans-serif; fill:var(--sw-ink); }
+.sw-map-node rect { fill:var(--sw-panel); stroke:var(--sw-role); stroke-width:1.25; }
+.sw-map-node[data-active="true"] rect { fill:color-mix(in srgb,var(--sw-role) 12%,var(--sw-panel)); stroke-width:2.5; }
+.sw-map-node[data-active="false"] rect { stroke-opacity:.45; }
+.sw-map-node[data-active="false"] .sw-node-label { fill:var(--sw-muted); }
+.sw-node-label { font-size:16px; font-weight:600; }
+.sw-node-detail { font-size:14px; fill:var(--sw-muted)!important; }
+.sw-map-edge polyline { fill:none; stroke:var(--sw-role); stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+.sw-map-edge[data-active="false"] polyline { opacity:.42; }
+.sw-map-edge[data-active="false"] .sw-edge-label { fill:var(--sw-muted); }
+.sw-map-edge[data-active="true"] polyline { stroke-width:3; }
+.sw [data-kind="return"] polyline,.sw [data-kind="return"] .sw-message { stroke-dasharray:7 5; }
+.sw [data-kind="control"] polyline,.sw [data-kind="control"] .sw-message { stroke-dasharray:3 4; }
+.sw-edge-label { font-size:14px; font-weight:500; paint-order:stroke; stroke:var(--sw-panel); stroke-width:5px; stroke-linejoin:round; }
+.sw-inspector-host { min-width:0; }
+.sw-inspector { border:1px solid var(--sw-border); border-radius:11px; background:var(--sw-panel); padding:25px; min-width:0; }
+.sw-inspector p { color:var(--sw-muted); font-size:15px; }
+.sw-inspector .sw-kicker { color:var(--sw-teal); font-size:10px; }
+.sw .sw-boundary { border-top:1px solid var(--sw-border); border-bottom:1px solid var(--sw-border); padding:12px 0; font-size:13px; }
+.sw-boundary strong { color:var(--sw-ink); }
+.sw-state { margin:0; }
+.sw-state>div { padding:10px 0; border-bottom:1px solid var(--sw-border); }
+.sw-state>div:last-child { border-bottom:0; }
+.sw-state dt { color:var(--sw-amber); font:600 12px/1.5 system-ui,sans-serif; }
+.sw-state dd { margin:5px 0 0; font-size:13px; line-height:1.6; color:var(--sw-muted); }
+.sw-state-panel { margin-top:18px; }
+.sw-state-panel h4 { margin-top:10px; }
+.sw-step-navigation { display:flex; align-items:center; justify-content:space-between; gap:16px; max-width:520px; margin:24px auto; }
+.sw-position { color:var(--sw-muted); font:13px/1.5 ui-monospace,monospace; white-space:nowrap; }
+.sw-walk-layout { display:grid; grid-template-columns:280px minmax(0,1fr); gap:22px; align-items:start; }
+.sw-step-list { padding:0; margin:0; list-style:none; display:grid; gap:7px; }
+.sw-step-list button { width:100%; font-size:13px; min-height:45px; }
+.sw-evidence { font-size:12px; margin-top:16px; }
+.sw summary { cursor:pointer; color:var(--sw-teal); }
+.sw-evidence-list { padding-left:18px; margin-top:16px; }
+.sw-evidence-list li { margin:0 0 18px; }
+.sw-evidence-list p { font-size:12px; margin:4px 0 6px; }
+.sw-claim-kind { display:inline-block; font-size:10px; text-transform:uppercase; letter-spacing:.06em; color:var(--sw-amber); }
+.sw-source-links { display:flex; flex-wrap:wrap; gap:7px 14px; font-size:12px; }
+.sw-source-links a { max-width:100%; }
+.sw-text-alternative { margin-top:24px; border-top:1px solid var(--sw-border); border-bottom:1px solid var(--sw-border); padding:15px 0; font-size:13px; }
+.sw-text-body { max-width:960px; padding:20px 0 8px; }
+.sw-text-body article { border-top:1px solid var(--sw-border); padding-top:18px; margin-top:25px; }
+.sw-text-body h3 { font-size:19px; }
+.sw-text-body p { font-size:14px; }
+.sw-scenario-summary { background:var(--sw-panel); border-left:3px solid var(--sw-teal); padding:20px 24px; margin:20px 0; }
+.sw-scenario-summary p { margin-bottom:10px; font-size:15px; }
+.sw-assumptions { padding-left:18px; margin:12px 0 0; color:var(--sw-muted); font-size:12px; }
+.sw-sequence-viewport { max-height:575px; }
+.sw-sequence-sticky { position:sticky; top:0; height:0; z-index:2; pointer-events:none; }
+.sw [data-sequence-header] { background:var(--sw-panel); box-shadow:0 1px 0 var(--sw-border); }
+.sw-lifeline { stroke:var(--sw-border); stroke-width:1.25; stroke-dasharray:4 5; }
+.sw-lane-box { fill:var(--sw-panel-alt); stroke:var(--sw-role); stroke-width:1.25; }
+.sw-lane-label { font-size:14px; font-weight:600; }
+.sw-sequence-row { fill:transparent; }
+.sw-sequence-event[data-active="true"] .sw-sequence-row { fill:color-mix(in srgb,var(--sw-role) 8%,transparent); stroke:var(--sw-role); stroke-width:.7; }
+.sw-message { stroke:var(--sw-role); stroke-width:2; fill:none; }
+.sw-sequence-event[data-active="true"] .sw-message { stroke-width:3; }
+.sw-sequence-event[data-active="false"] .sw-message { opacity:.48; }
+.sw-sequence-event[data-active="false"] .sw-edge-label { fill:var(--sw-muted); }
+.sw-row-number { font-size:12px; fill:var(--sw-muted)!important; }
+.sw-source-catalog { padding-left:22px; max-width:1000px; }
+.sw-source-catalog li { padding-left:5px; margin-bottom:16px; font-size:14px; }
+.sw-source-catalog p { color:var(--sw-muted); font-size:12px; margin-top:6px; }
+.sw-footer { margin-top:65px; border-top:1px solid var(--sw-border); padding-top:22px; color:var(--sw-muted); font-size:12px; }
+.sw-footer p { max-width:850px; }
+@media(max-width:760px) {
+  .sw { padding-top:24px; }
+  .sw h1 { margin-top:24px; }
+  .sw .sw-subtitle { font-size:21px; }
+  .sw .sw-question { font-size:16px; }
+  .sw-topline { align-items:flex-start; }
+  .sw .sw-kicker { font-size:10px; }
+  .sw-section { margin-top:52px; padding-top:26px; }
+  .sw-walk-layout { grid-template-columns:minmax(0,1fr); }
+  .sw-step-list { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .sw-step-list button { height:100%; font-size:12px; }
+  .sw-inspector { padding:20px; }
+  .sw-inspector h3 { font-size:21px; }
+  .sw-scenario-summary { padding:18px; }
+  .sw .sw-scroll-hint { font-size:10px; }
+  .sw-sequence-viewport { max-height:445px; }
+}
+@media(prefers-reduced-motion:reduce) { .sw *, .sw *::before, .sw *::after { scroll-behavior:auto!important; animation:none!important; transition:none!important; } }
+@media print {
+  :root { --sw-bg:#fff; --sw-panel:#fff; --sw-panel-alt:#f5f5f5; --sw-ink:#142b30; --sw-muted:#374e56; --sw-border:#a0b2b6; --sw-teal:#146958; --sw-blue:#275eae; --sw-amber:#805209; --sw-violet:#6e42a5; --sw-rose:#a43e4c; --sw-slate:#48636c; }
+  .sw { max-width:none; padding:0; font-size:11pt; }
+  .sw h1 { font-size:36pt; }
+  .sw h2 { font-size:24pt; }
+  .sw-section { margin-top:35pt; }
+  .sw button,.sw-controls,.sw-step-navigation,.sw-nav,.sw-step-list,.sw-scroll-hint { display:none; }
+  .sw-map-layout,.sw-walk-layout { display:block; }
+  .sw-viewport { overflow:visible; max-height:none; }
+  .sw-sequence-sticky { position:static; }
+  .sw-diagram { min-width:0; width:100%; }
+  .sw-map-node,.sw-map-edge,.sw-sequence-event { opacity:1!important; }
+  .sw-text-alternative::details-content,.sw-evidence::details-content { display:block!important; content-visibility:visible!important; }
+  .sw-inspector { box-shadow:none; margin-top:15pt; }
+  .sw-diagram-shell { box-shadow:none; }
+  .sw a { color:inherit; }
+}
+</style></head>
+<body><nav class="sw-site-nav" aria-label="Site"><a href="../">← System Walkthroughs</a><a href="https://evanoman.com/">evanoman.com</a></nav><main id="walkthrough"></main><noscript><article class="sw"><h1>A reader can outlive a WAL commit</h1><p>SQLite WAL: follow one held snapshot, a successful writer commit, and a checkpoint that cannot yet finish.</p><p>Why can the writer commit while an old reader keeps checkpointing from reaching the end?</p><p>R = reader snapshot end; L = committed WAL end; C = cumulative backfill progress. For readers who know transactions. SQLite 3.54.1, journal_mode=WAL, separate connections on one host, shared-cache disabled, with ordinary shared wal-index coordination. One active WAL-reading transaction holds read mark 6; a writer later commits through 10. Checkpoint calls name main and have no active transaction on their own connection. Automatic checkpoints, crashes, unusual VFS modes, network filesystems and power-loss guarantees are outside this trace.</p><h2>Two files, independent transaction lifetimes</h2><p>Connections and their local operations sit beside storage. WAL + wal-index groups the append-only page frames with shared coordination metadata. File arrows are logical I/O, not network messages. The database can lag the latest committed WAL.</p><ul><li>Reader connection: Owns snapshot end R</li><li>Writer connection: Publishes committed end L</li><li>WAL + wal-index: Frames; read marks; progress C</li><li>Main database file: Receives safe page versions</li><li>Checkpoint operation: In-process SQLite work</li><li>Checkpoint caller: Another SQLite connection</li></ul><ul><li>reader → wal: Read at R (request)</li><li>wal → reader: Snapshot page (return)</li><li>writer → wal: Append + publish commit (data)</li><li>caller → checkpointer: Checkpoint call (request)</li><li>checkpointer → caller: Return rc, L, C (return)</li><li>checkpointer → wal: Inspect read marks (control)</li><li>checkpointer → db: Write safe WAL pages (data)</li></ul><h3>One reader owns an old snapshot</h3><p>The reader uses R = 6 even when L has advanced to 10. A page absent from its WAL view is read from the main database file; this simplified map highlights the WAL hit for P = A.</p><h3>A commit publishes a newer end</h3><p>The writer appends and commits, publishing L = 10. The old reader continues using R = 6; no snapshot update arrow goes to it.</p><h3>The caller receives progress, not an empty-file promise</h3><p>The local checkpoint operation inspects read marks, makes safe file writes, and returns rc plus frame counts L and C. PASSIVE can stop short.</p><h3>Recognize an unfinished PASSIVE checkpoint</h3><p>Under the chosen interleaving, OK with L = 10 and C = 6 means safe progress was made while the held old read mark stopped completion. Other readers or writers can also affect a real checkpoint.</p><h3>Release the transaction, then call again</h3><p>Ending the old reader removes its lock. It does not issue a checkpoint; the application explicitly requests the retry shown here. Even C = L does not promise a zero-byte WAL.</p><h2>One old reader, one commit, two checkpoint calls</h2><ol><li><h3>Pin an old WAL snapshot</h3><p>The reader starts a real read transaction after committed frame 6 and uses a WAL read slot with read mark 6. Page P has value A at frame 6. An open connection alone is insufficient.</p><p>The held read lock protects the snapshot throughout the transaction.</p><p>Local connection state and shared wal-index coordination; no network hop.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 6 already complete.</li><li>WAL + wal-index: L = 6; C = 0; P = A at frame 6.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: No checkpoint request yet.</li></ul></li><li><h3>Commit newer frames</h3><p>A separate writer appends frames through a commit at frame 10, where P becomes B. Its commit succeeds. The old reader still reads A from its R = 6 snapshot.</p><p>Publishing L = 10 permits a new snapshot to include B; it does not advance this reader.</p><p>Writer to WAL storage, then local commit result; no checkpoint promise.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 0. P = A at frame 6; P = B at frame 10.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: No checkpoint request yet.</li></ul></li><li><h3>Ask for PASSIVE</h3><p>A different connection calls sqlite3_wal_checkpoint_v2(db, &quot;main&quot;, PASSIVE, &amp;L, &amp;C). The API passes through B-tree and pager layers to WAL checkpointing.</p><p>The caller asks for safe progress without waiting for transactions to finish.</p><p>In-process API dispatch; the checkpoint operation is not an automatic daemon.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 0. Active old read mark = 6.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: PASSIVE in progress; checkpoint lock acquired.</li></ul></li><li><h3>Return OK with work remaining</h3><p>The held read mark limits safe checkpoint progress to 6. In this schedule, safe page writes advance C to 6; the API returns SQLITE_OK with L = 10 and C = 6.</p><p>Advancing beyond the old read mark could overwrite database pages still needed by the old snapshot. OK reports this PASSIVE attempt succeeded, not that the WAL is empty.</p><p>WAL page content to the main file, then an API return to the checkpoint caller.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 6. WAL frames remain available.</li><li>Main database: Safe page writes made; not the whole latest snapshot.</li><li>Checkpoint caller: PASSIVE returned SQLITE_OK, L = 10, C = 6.</li></ul></li><li><h3>End the old reader</h3><p>The application ends that read transaction, releasing its WAL read lock. This action does not automatically retry the completed checkpoint call.</p><p>The barrier is gone because its owner released it; SQLite did not force the old snapshot forward.</p><p>Local transaction lifetime and shared lock release.</p><ul><li>Reader: Old read transaction ended; its read lock released.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 6. No WAL reader remains.</li><li>Main database: Safe earlier progress; latest backfill incomplete.</li><li>Checkpoint caller: Previous PASSIVE returned OK with C &lt; L; no retry yet.</li></ul></li><li><h3>Explicitly retry and finish</h3><p>With no other active transactions or errors, the caller requests PASSIVE again. Progress can reach C = L = 10. The returned counts include earlier checkpoint work.</p><p>The main file now has required latest pages, while PASSIVE still does not promise a zero-byte WAL. Restart and truncation have separate conditions.</p><p>A second API request, safe file writes, and its return.</p><ul><li>Reader: Old read transaction ended; no reader remains.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 10. WAL not truncated by PASSIVE.</li><li>Main database: All required latest page versions backfilled.</li><li>Checkpoint caller: Second PASSIVE returned SQLITE_OK, L = 10, C = 10.</li></ul></li></ol><h2>Change the checkpoint mode, keep the old snapshot</h2><h3>PASSIVE → release → retry</h3><p>The writer commits, an old reader limits the first PASSIVE call, then the application ends the reader and explicitly retries successfully.</p><p>Source-derived illustration; R = read mark = 6, initial C = 0, and newer committed L = 10. Page P changes from A to B; another page Q has its latest frame at 5 and can be copied safely.</p><p>No concurrent checkpoint, new transaction, I/O failure or automatic checkpoint intervenes. The old reader ends only at the shown release event.</p><p>Checkpoint callers name main, provide both counts, and hold no active transaction of their own. The shown calls and replies are local C API boundaries.</p><ol><li>reader → reader: Start read: R = 6<p>Source-derived illustration. The reader selects and holds WAL read mark 6. It can read P = A.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 6 already complete.</li><li>WAL + wal-index: L = 6; C = 0; P = A at frame 6.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: No checkpoint request yet.</li></ul></li><li>writer → wal: Commit through frame 10<p>Condensed WAL writes include a commit marker and publication of L = 10; P now has B at frame 10. The reader’s R remains 6.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Committed through frame 10; local result pending.</li><li>WAL + wal-index: L = 10; C = 0. P = A at frame 6; P = B at frame 10.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: No checkpoint request yet.</li></ul></li><li>writer → writer: COMMIT returns OK to app<p>Local control event: the writer connection returns a successful COMMIT result to its application; the application has no separate lane here. Power-loss durability settings are outside this illustration.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 0. P = A at frame 6; P = B at frame 10.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: No checkpoint request yet.</li></ul></li><li>reader → reader: Read P again: A<p>The existing transaction continues using frame 6; later committed B is outside its snapshot.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 0. P = A at frame 6; P = B at frame 10.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: No checkpoint request yet.</li></ul></li><li>caller → checkpointer: PASSIVE(main)<p>The separate checkpoint caller requests progress without waiting. API layers are condensed into the checkpoint lane.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 0. Active old read mark = 6.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: PASSIVE in progress; checkpoint lock acquired.</li></ul></li><li>checkpointer → checkpointer: Safe bound = 6<p>Local wal-index inspection finds the held old read mark; it cannot safely pass that mark.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 0. Active old read mark = 6.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: PASSIVE in progress; checkpoint lock acquired.</li></ul></li><li>checkpointer → db: Write safe WAL pages; C = 6<p>The checkpoint operation reads page versions from the WAL and writes safe versions to the main file. C is a progress horizon, not a promise that every earlier frame was copied as a separate page write. Duplicate page versions can be skipped.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 6. Old read mark remains 6.</li><li>Main database: Safe required page versions written; latest snapshot incomplete.</li><li>Checkpoint caller: PASSIVE preparing its return.</li></ul></li><li>checkpointer → caller: OK; L = 10, C = 6<p>The result returns to the invoking connection. Check C &lt; L: the reader is still open and the checkpoint is incomplete.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 6. WAL frames remain available.</li><li>Main database: Safe page writes made; not the whole latest snapshot.</li><li>Checkpoint caller: PASSIVE returned SQLITE_OK, L = 10, C = 6.</li></ul></li><li>reader → reader: End read transaction<p>The application releases the old read lock. No automatic retry is implied.</p><ul><li>Reader: Old read transaction ended; its read lock released.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 6. No WAL reader remains.</li><li>Main database: Safe earlier progress; latest backfill incomplete.</li><li>Checkpoint caller: Previous PASSIVE returned OK with C &lt; L; no retry yet.</li></ul></li><li>caller → checkpointer: PASSIVE(main) again<p>A second explicit call occurs after release. No other reader, writer or checkpoint intervenes in this chosen schedule.</p><ul><li>Reader: Old read transaction ended; no reader remains.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 6. No WAL reader remains.</li><li>Main database: Safe earlier progress; latest backfill incomplete.</li><li>Checkpoint caller: Second PASSIVE request in progress.</li></ul></li><li>checkpointer → db: Write remaining WAL pages<p>Without the old barrier, checkpointing can reach the latest committed end.</p><ul><li>Reader: No old reader remains.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 10; WAL retained.</li><li>Main database: Latest required page versions backfilled.</li><li>Checkpoint caller: Second PASSIVE preparing its return.</li></ul></li><li>checkpointer → caller: OK; L = 10, C = 10<p>Backfill is complete for this log. The physical WAL file need not shrink; PASSIVE is not TRUNCATE.</p><ul><li>Reader: Old read transaction ended; no reader remains.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 10. WAL not truncated by PASSIVE.</li><li>Main database: All required latest page versions backfilled.</li><li>Checkpoint caller: Second PASSIVE returned SQLITE_OK, L = 10, C = 10.</li></ul></li></ol><h3>FULL → waiting declined → BUSY</h3><p>With the same old reader, FULL attempts to wait. The busy handler declines further waiting, so safe partial progress is followed by SQLITE_BUSY. The reader stays old.</p><p>Source-derived alternative schedule starting from the same R = 6 and L = 10 state; no retry from the PASSIVE scenario carries over. Another page Q has its latest frame at 5 and can be copied safely.</p><p>The writer has released its write lock. FULL acquires checkpoint and writer locks, then encounters the old WAL reader.</p><p>A configured busy handler eventually returns 0; any earlier waiting attempts are condensed. No automatic cancellation of the old reader is invented.</p><ol><li>reader → reader: Start read: R = 6<p>Source-derived illustration. The reader selects and holds WAL read mark 6. It can read P = A.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 6 already complete.</li><li>WAL + wal-index: L = 6; C = 0; P = A at frame 6.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: No checkpoint request yet.</li></ul></li><li>writer → wal: Commit through frame 10<p>Condensed WAL writes include a commit marker and publication of L = 10; P now has B at frame 10. The reader’s R remains 6.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Committed through frame 10; local result pending.</li><li>WAL + wal-index: L = 10; C = 0. P = A at frame 6; P = B at frame 10.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: No checkpoint request yet.</li></ul></li><li>writer → writer: COMMIT returns OK to app<p>Local control event: the writer connection returns a successful COMMIT result to its application; the application has no separate lane here. Power-loss durability settings are outside this illustration.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 0. P = A at frame 6; P = B at frame 10.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: No checkpoint request yet.</li></ul></li><li>reader → reader: Read P again: A<p>The existing transaction continues using frame 6; later committed B is outside its snapshot.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 0. P = A at frame 6; P = B at frame 10.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: No checkpoint request yet.</li></ul></li><li>caller → checkpointer: FULL(main)<p>The writer has finished. FULL acquires the writer lock but the older WAL reader is still active.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 0. Old WAL reader still holds 6.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: FULL acquired checkpoint and writer locks; waiting on reader.</li></ul></li><li>checkpointer → checkpointer: Busy handler declines<p>One local waiting decision is shown; any previous retries are condensed. FULL cannot upgrade or end the reader’s transaction. New writer attempts are blocked while this FULL operation owns the writer lock.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 0. Old WAL reader still holds 6.</li><li>Main database: Baseline pages; no new checkpoint yet.</li><li>Checkpoint caller: Further waiting declined; safe partial work pending.</li></ul></li><li>checkpointer → db: Write safe WAL pages; C = 6<p>After waiting is declined, safe work can still advance C to 6, without passing the reader. The unchanged old reader prevents full completion.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 6. Old reader remains.</li><li>Main database: Safe partial page writes; latest backfill incomplete.</li><li>Checkpoint caller: FULL busy handler declined further waiting; returning BUSY.</li></ul></li><li>checkpointer → caller: BUSY; L = 10, C = 6<p>FULL did not achieve its requested completion. The API returns and releases its locks. The old reader still sees A. The application must decide when to end that reader and whether to retry.</p><ul><li>Reader: R = 6 held; page P reads A.</li><li>Writer: Commit through frame 10 returned OK.</li><li>WAL + wal-index: L = 10; C = 6. Old reader remains.</li><li>Main database: Safe partial page writes; latest backfill incomplete.</li><li>Checkpoint caller: FULL returned SQLITE_BUSY, L = 10, C = 6; no retry pending.</li></ul></li></ol><h2>Claims and sources</h2><p>A read transaction keeps its starting mxFrame and ignores later appended frames. It searches the WAL at that snapshot, with the database file as fallback. (source) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L101-L117">wal.c · reader algorithm</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L3561-L3602">sqlite3WalEndReadTransaction · release read lock</a></p><p>WAL changes commit with a commit-marked frame. On successful commit, the writer publishes mxFrame in the wal-index; this does not rewrite existing readers’ private snapshots. (source) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L101-L117">wal.c · reader algorithm</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4320-L4351">wal.c · publish a successful commit</a></p><p>An active WAL reader holds a shared read lock. Its read mark cannot change while held; checkpointing cannot pass any active WAL read mark. (source) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L335-L388">wal.c · read marks, backfill and WAL reuse</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2310-L2332">walCheckpoint · compute safe progress</a></p><p>PASSIVE makes progress without waiting for readers or writers and never calls the busy handler. Reader contention can leave it incomplete with SQLITE_OK. (source) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/sqlite.h.in#L10155-L10189">Checkpoint API · PASSIVE, FULL, RESTART, TRUNCATE</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2384-L2432">walCheckpoint · page writes and progress</a></p><p>The checkpoint iterator selects the latest frame for each page, then skips frames outside the safe bound or already covered by prior progress. Advancing C does not mean copying each frame as a separate page write. (source) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L1786-L1799">walIteratorNext · latest frame per page</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2384-L2432">walCheckpoint · page writes and progress</a></p><p>pnLog reports WAL frames and pnCkpt reports cumulative checkpointed progress, including earlier calls. These are frame counts, not bytes or this call’s copied-page count. (source) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/sqlite.h.in#L10197-L10221">Checkpoint API · cumulative counts and busy fallback</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4475-L4517">sqlite3WalCheckpoint · output frame counts</a></p><p>For a named database, sqlite3_wal_checkpoint_v2 dispatches through sqlite3Checkpoint, sqlite3BtreeCheckpoint and sqlite3PagerCheckpoint to sqlite3WalCheckpoint, then returns the result to its caller. (source) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/main.c#L2582-L2642">sqlite3_wal_checkpoint_v2 · entry and result</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/main.c#L2679-L2702">sqlite3Checkpoint · database dispatch</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/btree.c#L11403-L11421">sqlite3BtreeCheckpoint · pager dispatch</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/pager.c#L7580-L7614">sqlite3PagerCheckpoint · WAL dispatch</a></p><p>FULL waits via the busy handler for the writer and older readers; it blocks new writers while pending. If further waiting is declined, it makes passive-style progress and returns SQLITE_BUSY. (source) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/sqlite.h.in#L10155-L10189">Checkpoint API · PASSIVE, FULL, RESTART, TRUNCATE</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/sqlite.h.in#L10197-L10221">Checkpoint API · cumulative counts and busy fallback</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2310-L2332">walCheckpoint · compute safe progress</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2384-L2432">walCheckpoint · page writes and progress</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2440-L2444">walCheckpoint · incomplete FULL returns BUSY</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4444-L4451">sqlite3WalCheckpoint · writer-lock fallback</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4484-L4488">sqlite3WalCheckpoint · counts on OK or BUSY</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4513-L4517">sqlite3WalCheckpoint · mode fallback returns BUSY</a></p><p>In this chosen schedule, ending the only old WAL reader releases its read lock. A later checkpoint can reach the latest committed frame if no other reader, writer, checkpoint or I/O error intervenes. Ending the reader does not itself issue that checkpoint. (inference) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L3561-L3602">sqlite3WalEndReadTransaction · release read lock</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2310-L2332">walCheckpoint · compute safe progress</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2384-L2432">walCheckpoint · page writes and progress</a></p><p>Completed backfill is distinct from WAL restart and truncation. WAL reuse requires all content backfilled and no WAL readers. RESTART additionally waits for WAL readers; TRUNCATE shrinks the WAL on success. (source) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L335-L388">wal.c · read marks, backfill and WAL reuse</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/sqlite.h.in#L10155-L10189">Checkpoint API · PASSIVE, FULL, RESTART, TRUNCATE</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2435-L2455">walCheckpoint · completion versus restart</a></p><p>The illustrative WAL begins at committed end 6, then grows to committed end 10; the sole old reader uses read mark 6. With checkpoint access otherwise available and no errors, progress can stop at 6 and later reach 10. Another page Q has its latest version at frame 5 and is eligible for a safe page write. Numbers are chosen frame indices, not measured SQL output. (inference) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2310-L2332">walCheckpoint · compute safe progress</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2384-L2432">walCheckpoint · page writes and progress</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4475-L4517">sqlite3WalCheckpoint · output frame counts</a></p><p>A connection without an active read transaction holds none of these reader locks. A slot 0 read transaction reads only the database file and can block all backfill while its shared slot 0 lock is held. This guide traces a nonzero-slot reader whose read mark bounds safe progress. (source) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L335-L388">wal.c · read marks, backfill and WAL reuse</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2340-L2345">walCheckpoint · slot 0 lock before backfill</a> · <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L3216-L3243">walTryBeginRead · database-only reader blocks backfill</a></p><p>PASSIVE can return SQLITE_BUSY if another checkpoint already owns the checkpoint lock. That lock failure does not call the busy handler. (source) <a href="https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/sqlite.h.in#L10197-L10221">Checkpoint API · cumulative counts and busy fallback</a></p><h2>Limits</h2><p>AI-authored explanation from public primary sources. SQLite’s source is public domain. Renderer licensing remains with the bundled skill.</p><p>Frame indices 6 and 10, a safely copyable page Q at frame 5, page values A and B, and event ordering are source-derived illustrations, not observed runtime measurements. All repetitive frame writes and API layers are condensed.</p><p>R is the existing reader’s snapshot end, L is the committed log end, and C is cumulative backfill progress. The chosen read mark equals R; actual read-slot selection and WAL resets may produce other values.</p><p>C = 6 is a safe progress horizon, not six physical page writes. The checkpoint iterator can skip older versions of pages. This guide does not model file bytes, page caches or each lock transition.</p><p>The checkpoint operation is local SQLite code invoked by a connection. It is not a separate server or automatic worker; arrows to files describe logical I/O.</p><p>This trace assumes checkpoint lock acquisition succeeds and no I/O error occurs. Another checkpoint can instead cause immediate SQLITE_BUSY, even for PASSIVE.</p><p>No SQLite binary was built or executed for this guide. The pinned implementation and API contract establish the behavior; browser tests verify only the interactive explanation.</p></article></noscript><script id="walkthrough-model" type="application/json">{"version":1,"title":"A reader can outlive a WAL commit","subtitle":"SQLite WAL: follow one held snapshot, a successful writer commit, and a checkpoint that cannot yet finish.","question":"Why can the writer commit while an old reader keeps checkpointing from reaching the end?","scope":"R = reader snapshot end; L = committed WAL end; C = cumulative backfill progress. For readers who know transactions. SQLite 3.54.1, journal_mode=WAL, separate connections on one host, shared-cache disabled, with ordinary shared wal-index coordination. One active WAL-reading transaction holds read mark 6; a writer later commits through 10. Checkpoint calls name main and have no active transaction on their own connection. Automatic checkpoints, crashes, unusual VFS modes, network filesystems and power-loss guarantees are outside this trace.","navigation":[{"label":"← System Walkthroughs","url":"../"},{"label":"evanoman.com","url":"https://evanoman.com/"}],"project":{"name":"SQLite","repository":"https://github.com/sqlite/sqlite","revision":"57520227c95396ce39ba6ecaac8d475b78dd3964","version":"3.54.1 · version-3.54.1","license":"SQLite source is public domain. This is an AI-authored source paraphrase; no upstream text or diagrams are reproduced."},"sources":[{"id":"reader","label":"wal.c · reader algorithm","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L101-L117"},{"id":"marks","label":"wal.c · read marks, backfill and WAL reuse","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L335-L388"},{"id":"commit","label":"wal.c · publish a successful commit","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4320-L4351"},{"id":"bound","label":"walCheckpoint · compute safe progress","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2310-L2332"},{"id":"iterator","label":"walIteratorNext · latest frame per page","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L1786-L1799"},{"id":"copy","label":"walCheckpoint · page writes and progress","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2384-L2432"},{"id":"release","label":"sqlite3WalEndReadTransaction · release read lock","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L3561-L3602"},{"id":"api-entry","label":"sqlite3_wal_checkpoint_v2 · entry and result","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/main.c#L2582-L2642"},{"id":"api-route","label":"sqlite3Checkpoint · database dispatch","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/main.c#L2679-L2702"},{"id":"btree-route","label":"sqlite3BtreeCheckpoint · pager dispatch","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/btree.c#L11403-L11421"},{"id":"pager-route","label":"sqlite3PagerCheckpoint · WAL dispatch","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/pager.c#L7580-L7614"},{"id":"modes","label":"Checkpoint API · PASSIVE, FULL, RESTART, TRUNCATE","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/sqlite.h.in#L10155-L10189"},{"id":"counts","label":"Checkpoint API · cumulative counts and busy fallback","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/sqlite.h.in#L10197-L10221"},{"id":"output","label":"sqlite3WalCheckpoint · output frame counts","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4475-L4517"},{"id":"restart","label":"walCheckpoint · completion versus restart","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2435-L2455"},{"id":"wal-doc","label":"Official WAL overview · concurrency","url":"https://sqlite.org/wal.html#concurrency","note":"Live official documentation snapshot acquired 2026-10-30; not pinned to this Git revision. Core claims above are reconciled with pinned source."},{"id":"slot-zero-copy","label":"walCheckpoint · slot 0 lock before backfill","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2340-L2345"},{"id":"slot-zero-reader","label":"walTryBeginRead · database-only reader blocks backfill","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L3216-L3243"},{"id":"full-incomplete","label":"walCheckpoint · incomplete FULL returns BUSY","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2440-L2444"},{"id":"full-writer-fallback","label":"sqlite3WalCheckpoint · writer-lock fallback","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4444-L4451"},{"id":"checkpoint-count-results","label":"sqlite3WalCheckpoint · counts on OK or BUSY","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4484-L4488"},{"id":"full-mode-return","label":"sqlite3WalCheckpoint · mode fallback returns BUSY","url":"https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4513-L4517"}],"claims":[{"id":"snapshot","kind":"source","text":"A read transaction keeps its starting mxFrame and ignores later appended frames. It searches the WAL at that snapshot, with the database file as fallback.","sources":["reader","release"]},{"id":"commit-publish","kind":"source","text":"WAL changes commit with a commit-marked frame. On successful commit, the writer publishes mxFrame in the wal-index; this does not rewrite existing readers’ private snapshots.","sources":["reader","commit"]},{"id":"readmark","kind":"source","text":"An active WAL reader holds a shared read lock. Its read mark cannot change while held; checkpointing cannot pass any active WAL read mark.","sources":["marks","bound"]},{"id":"passive","kind":"source","text":"PASSIVE makes progress without waiting for readers or writers and never calls the busy handler. Reader contention can leave it incomplete with SQLITE_OK.","sources":["modes","copy"]},{"id":"backfill-horizon","kind":"source","text":"The checkpoint iterator selects the latest frame for each page, then skips frames outside the safe bound or already covered by prior progress. Advancing C does not mean copying each frame as a separate page write.","sources":["iterator","copy"]},{"id":"count-meaning","kind":"source","text":"pnLog reports WAL frames and pnCkpt reports cumulative checkpointed progress, including earlier calls. These are frame counts, not bytes or this call’s copied-page count.","sources":["counts","output"]},{"id":"api-path","kind":"source","text":"For a named database, sqlite3_wal_checkpoint_v2 dispatches through sqlite3Checkpoint, sqlite3BtreeCheckpoint and sqlite3PagerCheckpoint to sqlite3WalCheckpoint, then returns the result to its caller.","sources":["api-entry","api-route","btree-route","pager-route"]},{"id":"full-busy","kind":"source","text":"FULL waits via the busy handler for the writer and older readers; it blocks new writers while pending. If further waiting is declined, it makes passive-style progress and returns SQLITE_BUSY.","sources":["modes","counts","bound","copy","full-incomplete","full-writer-fallback","checkpoint-count-results","full-mode-return"]},{"id":"release-retry","kind":"inference","text":"In this chosen schedule, ending the only old WAL reader releases its read lock. A later checkpoint can reach the latest committed frame if no other reader, writer, checkpoint or I/O error intervenes. Ending the reader does not itself issue that checkpoint.","sources":["release","bound","copy"]},{"id":"file-not-empty","kind":"source","text":"Completed backfill is distinct from WAL restart and truncation. WAL reuse requires all content backfilled and no WAL readers. RESTART additionally waits for WAL readers; TRUNCATE shrinks the WAL on success.","sources":["marks","modes","restart"]},{"id":"illustration","kind":"inference","text":"The illustrative WAL begins at committed end 6, then grows to committed end 10; the sole old reader uses read mark 6. With checkpoint access otherwise available and no errors, progress can stop at 6 and later reach 10. Another page Q has its latest version at frame 5 and is eligible for a safe page write. Numbers are chosen frame indices, not measured SQL output.","sources":["bound","copy","output"]},{"id":"not-all-readers","kind":"source","text":"A connection without an active read transaction holds none of these reader locks. A slot 0 read transaction reads only the database file and can block all backfill while its shared slot 0 lock is held. This guide traces a nonzero-slot reader whose read mark bounds safe progress.","sources":["marks","slot-zero-copy","slot-zero-reader"]},{"id":"checkpoint-lock","kind":"source","text":"PASSIVE can return SQLITE_BUSY if another checkpoint already owns the checkpoint lock. That lock failure does not call the busy handler.","sources":["counts"]}],"roles":[{"id":"reader","label":"Snapshot owner","color":"blue"},{"id":"writer","label":"Commit operation","color":"violet"},{"id":"control","label":"Checkpoint operation","color":"amber"},{"id":"wal","label":"WAL + coordination","color":"teal"},{"id":"db","label":"Database file","color":"slate"}],"takeaways":[{"text":"The old reader keeps A after the writer has committed B. An open connection without an active read transaction creates no reader-lock barrier.","claims":["snapshot","not-all-readers"]},{"text":"PASSIVE may return OK with C \u003c L. Compare cumulative checkpoint progress with committed WAL frames.","claims":["passive","count-meaning"]},{"text":"End the old transaction, then retry checkpointing. FULL may wait and return BUSY; completed backfill still differs from truncation.","claims":["release-retry","full-busy","file-not-empty"]}],"limits":["AI-authored explanation from public primary sources. SQLite’s source is public domain. Renderer licensing remains with the bundled skill.","Frame indices 6 and 10, a safely copyable page Q at frame 5, page values A and B, and event ordering are source-derived illustrations, not observed runtime measurements. All repetitive frame writes and API layers are condensed.","R is the existing reader’s snapshot end, L is the committed log end, and C is cumulative backfill progress. The chosen read mark equals R; actual read-slot selection and WAL resets may produce other values.","C = 6 is a safe progress horizon, not six physical page writes. The checkpoint iterator can skip older versions of pages. This guide does not model file bytes, page caches or each lock transition.","The checkpoint operation is local SQLite code invoked by a connection. It is not a separate server or automatic worker; arrows to files describe logical I/O.","This trace assumes checkpoint lock acquisition succeeds and no I/O error occurs. Another checkpoint can instead cause immediate SQLITE_BUSY, even for PASSIVE.","No SQLite binary was built or executed for this guide. The pinned implementation and API contract establish the behavior; browser tests verify only the interactive explanation."],"map":{"title":"Two files, independent transaction lifetimes","description":"Connections and their local operations sit beside storage. WAL + wal-index groups the append-only page frames with shared coordination metadata. File arrows are logical I/O, not network messages. The database can lag the latest committed WAL.","width":1000,"height":700,"nodes":[{"id":"reader","label":"Reader connection","detail":"Owns snapshot end R","role":"reader","x":40,"y":40,"w":210,"h":90},{"id":"writer","label":"Writer connection","detail":"Publishes committed end L","role":"writer","x":40,"y":300,"w":210,"h":90},{"id":"wal","label":"WAL + wal-index","detail":"Frames; read marks; progress C","role":"wal","x":390,"y":170,"w":210,"h":90},{"id":"db","label":"Main database file","detail":"Receives safe page versions","role":"db","x":760,"y":170,"w":210,"h":90},{"id":"checkpointer","label":"Checkpoint operation","detail":"In-process SQLite work","role":"control","x":390,"y":460,"w":210,"h":90},{"id":"caller","label":"Checkpoint caller","detail":"Another SQLite connection","role":"control","x":760,"y":460,"w":210,"h":90}],"edges":[{"id":"read","from":"reader","to":"wal","label":"Read at R","kind":"request","via":[{"x":350,"y":85},{"x":350,"y":310}]},{"id":"read-return","from":"wal","to":"reader","label":"Snapshot page","kind":"return","via":[{"x":370,"y":170},{"x":145,"y":170}]},{"id":"append","from":"writer","to":"wal","label":"Append + publish commit","kind":"data"},{"id":"checkpoint","from":"caller","to":"checkpointer","label":"Checkpoint call","kind":"request"},{"id":"checkpoint-return","from":"checkpointer","to":"caller","label":"Return rc, L, C","kind":"return","via":[{"x":495,"y":630},{"x":865,"y":630}]},{"id":"bound","from":"checkpointer","to":"wal","label":"Inspect read marks","kind":"control"},{"id":"backfill","from":"checkpointer","to":"db","label":"Write safe WAL pages","kind":"data"}],"lenses":[{"id":"snapshot","label":"Reader’s view","title":"One reader owns an old snapshot","body":"The reader uses R = 6 even when L has advanced to 10. A page absent from its WAL view is read from the main database file; this simplified map highlights the WAL hit for P = A.","nodes":["reader","wal","db"],"edges":["read","read-return"],"claims":["snapshot","illustration"]},{"id":"commit","label":"Commit path","title":"A commit publishes a newer end","body":"The writer appends and commits, publishing L = 10. The old reader continues using R = 6; no snapshot update arrow goes to it.","nodes":["writer","wal","reader"],"edges":["append"],"claims":["commit-publish","snapshot"]},{"id":"checkpoint","label":"Checkpoint path","title":"The caller receives progress, not an empty-file promise","body":"The local checkpoint operation inspects read marks, makes safe file writes, and returns rc plus frame counts L and C. PASSIVE can stop short.","nodes":["caller","checkpointer","wal","db"],"edges":["checkpoint","bound","backfill","checkpoint-return"],"claims":["api-path","readmark","passive","count-meaning"]}],"intents":[{"id":"diagnose","label":"Interpret OK + C \u003c L","title":"Recognize an unfinished PASSIVE checkpoint","body":"Under the chosen interleaving, OK with L = 10 and C = 6 means safe progress was made while the held old read mark stopped completion. Other readers or writers can also affect a real checkpoint.","nodes":["reader","caller","checkpointer","wal","db"],"edges":["bound","backfill","checkpoint-return"],"claims":["passive","count-meaning","illustration"]},{"id":"finish","label":"Finish after release","title":"Release the transaction, then call again","body":"Ending the old reader removes its lock. It does not issue a checkpoint; the application explicitly requests the retry shown here. Even C = L does not promise a zero-byte WAL.","nodes":["reader","caller","checkpointer","wal","db"],"edges":["checkpoint","backfill","checkpoint-return"],"claims":["release-retry","file-not-empty"]}]},"walkthrough":{"title":"One old reader, one commit, two checkpoint calls","intro":"A source-derived schedule with chosen frame indices. Each selectable step includes a complete post-step state so it can be read in any order. The reader’s WAL hit for P stays A until that transaction ends.","steps":[{"id":"pin","title":"Pin an old WAL snapshot","body":"The reader starts a real read transaction after committed frame 6 and uses a WAL read slot with read mark 6. Page P has value A at frame 6. An open connection alone is insufficient.","why":"The held read lock protects the snapshot throughout the transaction.","boundary":"Local connection state and shared wal-index coordination; no network hop.","nodes":["reader","wal"],"edges":["read","read-return"],"claims":["snapshot","readmark","not-all-readers","illustration"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 6 already complete."},{"owner":"WAL + wal-index","detail":"L = 6; C = 0; P = A at frame 6."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"No checkpoint request yet."}]},{"id":"commit","title":"Commit newer frames","body":"A separate writer appends frames through a commit at frame 10, where P becomes B. Its commit succeeds. The old reader still reads A from its R = 6 snapshot.","why":"Publishing L = 10 permits a new snapshot to include B; it does not advance this reader.","boundary":"Writer to WAL storage, then local commit result; no checkpoint promise.","nodes":["writer","reader","wal"],"edges":["append","read-return"],"claims":["snapshot","commit-publish","illustration"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 0. P = A at frame 6; P = B at frame 10."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"No checkpoint request yet."}]},{"id":"request","title":"Ask for PASSIVE","body":"A different connection calls sqlite3_wal_checkpoint_v2(db, \"main\", PASSIVE, &L, &C). The API passes through B-tree and pager layers to WAL checkpointing.","why":"The caller asks for safe progress without waiting for transactions to finish.","boundary":"In-process API dispatch; the checkpoint operation is not an automatic daemon.","nodes":["caller","checkpointer","wal"],"edges":["checkpoint","bound"],"claims":["api-path","passive","checkpoint-lock"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 0. Active old read mark = 6."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"PASSIVE in progress; checkpoint lock acquired."}]},{"id":"partial","title":"Return OK with work remaining","body":"The held read mark limits safe checkpoint progress to 6. In this schedule, safe page writes advance C to 6; the API returns SQLITE_OK with L = 10 and C = 6.","why":"Advancing beyond the old read mark could overwrite database pages still needed by the old snapshot. OK reports this PASSIVE attempt succeeded, not that the WAL is empty.","boundary":"WAL page content to the main file, then an API return to the checkpoint caller.","nodes":["reader","wal","db","checkpointer","caller"],"edges":["bound","backfill","checkpoint-return"],"claims":["readmark","passive","count-meaning","illustration","file-not-empty"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 6. WAL frames remain available."},{"owner":"Main database","detail":"Safe page writes made; not the whole latest snapshot."},{"owner":"Checkpoint caller","detail":"PASSIVE returned SQLITE_OK, L = 10, C = 6."}]},{"id":"release","title":"End the old reader","body":"The application ends that read transaction, releasing its WAL read lock. This action does not automatically retry the completed checkpoint call.","why":"The barrier is gone because its owner released it; SQLite did not force the old snapshot forward.","boundary":"Local transaction lifetime and shared lock release.","nodes":["reader","wal"],"edges":[],"claims":["release-retry"],"state":[{"owner":"Reader","detail":"Old read transaction ended; its read lock released."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 6. No WAL reader remains."},{"owner":"Main database","detail":"Safe earlier progress; latest backfill incomplete."},{"owner":"Checkpoint caller","detail":"Previous PASSIVE returned OK with C \u003c L; no retry yet."}]},{"id":"retry","title":"Explicitly retry and finish","body":"With no other active transactions or errors, the caller requests PASSIVE again. Progress can reach C = L = 10. The returned counts include earlier checkpoint work.","why":"The main file now has required latest pages, while PASSIVE still does not promise a zero-byte WAL. Restart and truncation have separate conditions.","boundary":"A second API request, safe file writes, and its return.","nodes":["caller","checkpointer","wal","db"],"edges":["checkpoint","bound","backfill","checkpoint-return"],"claims":["release-retry","count-meaning","file-not-empty","illustration"],"state":[{"owner":"Reader","detail":"Old read transaction ended; no reader remains."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 10. WAL not truncated by PASSIVE."},{"owner":"Main database","detail":"All required latest page versions backfilled."},{"owner":"Checkpoint caller","detail":"Second PASSIVE returned SQLITE_OK, L = 10, C = 10."}]}]},"sequence":{"title":"Change the checkpoint mode, keep the old snapshot","intro":"Choose a source-derived interleaving. Lanes represent connections, a local checkpoint operation, and files—not separate network services. Repetitive writes and internal API calls are condensed; vertical order is illustrative rather than elapsed time.","lanes":[{"id":"reader","label":"Reader","role":"reader"},{"id":"writer","label":"Writer","role":"writer"},{"id":"caller","label":"Caller","role":"control"},{"id":"checkpointer","label":"Checkpoint","role":"control"},{"id":"wal","label":"WAL + index","role":"wal"},{"id":"db","label":"Main file","role":"db"}],"scenarios":[{"id":"passive-retry","label":"PASSIVE → release → retry","summary":"The writer commits, an old reader limits the first PASSIVE call, then the application ends the reader and explicitly retries successfully.","assumptions":["Source-derived illustration; R = read mark = 6, initial C = 0, and newer committed L = 10. Page P changes from A to B; another page Q has its latest frame at 5 and can be copied safely.","No concurrent checkpoint, new transaction, I/O failure or automatic checkpoint intervenes. The old reader ends only at the shown release event.","Checkpoint callers name main, provide both counts, and hold no active transaction of their own. The shown calls and replies are local C API boundaries."],"events":[{"id":"read-start","from":"reader","to":"reader","label":"Start read: R = 6","kind":"control","body":"Source-derived illustration. The reader selects and holds WAL read mark 6. It can read P = A.","claims":["snapshot","readmark","illustration"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 6 already complete."},{"owner":"WAL + wal-index","detail":"L = 6; C = 0; P = A at frame 6."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"No checkpoint request yet."}]},{"id":"commit-frames","from":"writer","to":"wal","label":"Commit through frame 10","kind":"data","body":"Condensed WAL writes include a commit marker and publication of L = 10; P now has B at frame 10. The reader’s R remains 6.","claims":["commit-publish","snapshot","illustration"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Committed through frame 10; local result pending."},{"owner":"WAL + wal-index","detail":"L = 10; C = 0. P = A at frame 6; P = B at frame 10."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"No checkpoint request yet."}]},{"id":"commit-result","from":"writer","to":"writer","label":"COMMIT returns OK to app","kind":"control","body":"Local control event: the writer connection returns a successful COMMIT result to its application; the application has no separate lane here. Power-loss durability settings are outside this illustration.","claims":["commit-publish"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 0. P = A at frame 6; P = B at frame 10."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"No checkpoint request yet."}]},{"id":"old-read","from":"reader","to":"reader","label":"Read P again: A","kind":"control","body":"The existing transaction continues using frame 6; later committed B is outside its snapshot.","claims":["snapshot","illustration"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 0. P = A at frame 6; P = B at frame 10."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"No checkpoint request yet."}]},{"id":"request","from":"caller","to":"checkpointer","label":"PASSIVE(main)","kind":"request","body":"The separate checkpoint caller requests progress without waiting. API layers are condensed into the checkpoint lane.","claims":["api-path","passive","checkpoint-lock"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 0. Active old read mark = 6."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"PASSIVE in progress; checkpoint lock acquired."}]},{"id":"safe-limit","from":"checkpointer","to":"checkpointer","label":"Safe bound = 6","kind":"control","body":"Local wal-index inspection finds the held old read mark; it cannot safely pass that mark.","claims":["readmark","illustration"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 0. Active old read mark = 6."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"PASSIVE in progress; checkpoint lock acquired."}]},{"id":"copy-safe","from":"checkpointer","to":"db","label":"Write safe WAL pages; C = 6","kind":"data","body":"The checkpoint operation reads page versions from the WAL and writes safe versions to the main file. C is a progress horizon, not a promise that every earlier frame was copied as a separate page write. Duplicate page versions can be skipped.","claims":["readmark","count-meaning","backfill-horizon","illustration"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 6. Old read mark remains 6."},{"owner":"Main database","detail":"Safe required page versions written; latest snapshot incomplete."},{"owner":"Checkpoint caller","detail":"PASSIVE preparing its return."}]},{"id":"partial-result","from":"checkpointer","to":"caller","label":"OK; L = 10, C = 6","kind":"return","body":"The result returns to the invoking connection. Check C \u003c L: the reader is still open and the checkpoint is incomplete.","claims":["passive","count-meaning","illustration"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 6. WAL frames remain available."},{"owner":"Main database","detail":"Safe page writes made; not the whole latest snapshot."},{"owner":"Checkpoint caller","detail":"PASSIVE returned SQLITE_OK, L = 10, C = 6."}]},{"id":"reader-end","from":"reader","to":"reader","label":"End read transaction","kind":"control","body":"The application releases the old read lock. No automatic retry is implied.","claims":["release-retry"],"state":[{"owner":"Reader","detail":"Old read transaction ended; its read lock released."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 6. No WAL reader remains."},{"owner":"Main database","detail":"Safe earlier progress; latest backfill incomplete."},{"owner":"Checkpoint caller","detail":"Previous PASSIVE returned OK with C \u003c L; no retry yet."}]},{"id":"retry","from":"caller","to":"checkpointer","label":"PASSIVE(main) again","kind":"request","body":"A second explicit call occurs after release. No other reader, writer or checkpoint intervenes in this chosen schedule.","claims":["api-path","release-retry","checkpoint-lock"],"state":[{"owner":"Reader","detail":"Old read transaction ended; no reader remains."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 6. No WAL reader remains."},{"owner":"Main database","detail":"Safe earlier progress; latest backfill incomplete."},{"owner":"Checkpoint caller","detail":"Second PASSIVE request in progress."}]},{"id":"finish","from":"checkpointer","to":"db","label":"Write remaining WAL pages","kind":"data","body":"Without the old barrier, checkpointing can reach the latest committed end.","claims":["release-retry","illustration"],"state":[{"owner":"Reader","detail":"No old reader remains."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 10; WAL retained."},{"owner":"Main database","detail":"Latest required page versions backfilled."},{"owner":"Checkpoint caller","detail":"Second PASSIVE preparing its return."}]},{"id":"complete-result","from":"checkpointer","to":"caller","label":"OK; L = 10, C = 10","kind":"return","body":"Backfill is complete for this log. The physical WAL file need not shrink; PASSIVE is not TRUNCATE.","claims":["count-meaning","file-not-empty","illustration"],"state":[{"owner":"Reader","detail":"Old read transaction ended; no reader remains."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 10. WAL not truncated by PASSIVE."},{"owner":"Main database","detail":"All required latest page versions backfilled."},{"owner":"Checkpoint caller","detail":"Second PASSIVE returned SQLITE_OK, L = 10, C = 10."}]}]},{"id":"full-busy","label":"FULL → waiting declined → BUSY","summary":"With the same old reader, FULL attempts to wait. The busy handler declines further waiting, so safe partial progress is followed by SQLITE_BUSY. The reader stays old.","assumptions":["Source-derived alternative schedule starting from the same R = 6 and L = 10 state; no retry from the PASSIVE scenario carries over. Another page Q has its latest frame at 5 and can be copied safely.","The writer has released its write lock. FULL acquires checkpoint and writer locks, then encounters the old WAL reader.","A configured busy handler eventually returns 0; any earlier waiting attempts are condensed. No automatic cancellation of the old reader is invented."],"events":[{"id":"read-start","from":"reader","to":"reader","label":"Start read: R = 6","kind":"control","body":"Source-derived illustration. The reader selects and holds WAL read mark 6. It can read P = A.","claims":["snapshot","readmark","illustration"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 6 already complete."},{"owner":"WAL + wal-index","detail":"L = 6; C = 0; P = A at frame 6."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"No checkpoint request yet."}]},{"id":"commit-frames","from":"writer","to":"wal","label":"Commit through frame 10","kind":"data","body":"Condensed WAL writes include a commit marker and publication of L = 10; P now has B at frame 10. The reader’s R remains 6.","claims":["commit-publish","snapshot","illustration"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Committed through frame 10; local result pending."},{"owner":"WAL + wal-index","detail":"L = 10; C = 0. P = A at frame 6; P = B at frame 10."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"No checkpoint request yet."}]},{"id":"commit-result","from":"writer","to":"writer","label":"COMMIT returns OK to app","kind":"control","body":"Local control event: the writer connection returns a successful COMMIT result to its application; the application has no separate lane here. Power-loss durability settings are outside this illustration.","claims":["commit-publish"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 0. P = A at frame 6; P = B at frame 10."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"No checkpoint request yet."}]},{"id":"old-read","from":"reader","to":"reader","label":"Read P again: A","kind":"control","body":"The existing transaction continues using frame 6; later committed B is outside its snapshot.","claims":["snapshot","illustration"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 0. P = A at frame 6; P = B at frame 10."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"No checkpoint request yet."}]},{"id":"full-request","from":"caller","to":"checkpointer","label":"FULL(main)","kind":"request","body":"The writer has finished. FULL acquires the writer lock but the older WAL reader is still active.","claims":["api-path","full-busy","checkpoint-lock"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 0. Old WAL reader still holds 6."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"FULL acquired checkpoint and writer locks; waiting on reader."}]},{"id":"decline-wait","from":"checkpointer","to":"checkpointer","label":"Busy handler declines","kind":"control","body":"One local waiting decision is shown; any previous retries are condensed. FULL cannot upgrade or end the reader’s transaction. New writer attempts are blocked while this FULL operation owns the writer lock.","claims":["full-busy","snapshot"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 0. Old WAL reader still holds 6."},{"owner":"Main database","detail":"Baseline pages; no new checkpoint yet."},{"owner":"Checkpoint caller","detail":"Further waiting declined; safe partial work pending."}]},{"id":"partial-copy","from":"checkpointer","to":"db","label":"Write safe WAL pages; C = 6","kind":"data","body":"After waiting is declined, safe work can still advance C to 6, without passing the reader. The unchanged old reader prevents full completion.","claims":["full-busy","readmark","illustration"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 6. Old reader remains."},{"owner":"Main database","detail":"Safe partial page writes; latest backfill incomplete."},{"owner":"Checkpoint caller","detail":"FULL busy handler declined further waiting; returning BUSY."}]},{"id":"busy-result","from":"checkpointer","to":"caller","label":"BUSY; L = 10, C = 6","kind":"return","body":"FULL did not achieve its requested completion. The API returns and releases its locks. The old reader still sees A. The application must decide when to end that reader and whether to retry.","claims":["full-busy","count-meaning","release-retry"],"state":[{"owner":"Reader","detail":"R = 6 held; page P reads A."},{"owner":"Writer","detail":"Commit through frame 10 returned OK."},{"owner":"WAL + wal-index","detail":"L = 10; C = 6. Old reader remains."},{"owner":"Main database","detail":"Safe partial page writes; latest backfill incomplete."},{"owner":"Checkpoint caller","detail":"FULL returned SQLITE_BUSY, L = 10, C = 6; no retry pending."}]}]}]}}</script><script>/* System Walkthrough — dependency-free, source-neutral components. MIT licensed. */
+(function (global) {
+  'use strict';
+  const NS = 'http://www.w3.org/2000/svg';
+  let serial = 0;
+  function el(tag, attrs, ...children) {
+    const node = document.createElement(tag);
+    for (const [key, value] of Object.entries(attrs || {})) {
+      if (value !== undefined && value !== null) node.setAttribute(key, String(value));
+    }
+    for (const child of children.flat(Infinity)) {
+      if (child !== undefined && child !== null) node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+    }
+    return node;
+  }
+  function svgEl(tag, attrs, ...children) {
+    const node = document.createElementNS(NS, tag);
+    for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, String(value));
+    for (const child of children.flat(Infinity)) node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+    return node;
+  }
+  const para = (text, className) => el('p', { class: className }, text);
+  const button = (label, attrs) => el('button', { type: 'button', ...attrs }, label);
+  const link = (label, url) => {
+    let allowed = typeof url === 'string' && url.startsWith('#');
+    try {
+      const parsed = new URL(url);
+      allowed ||= parsed.protocol === 'https:' && !parsed.username && !parsed.password;
+    } catch (_) { /* A fragment does not need to be an absolute URL. */ }
+    return allowed ? el('a', { href: url, rel: 'noreferrer' }, label) : el('span', {}, label);
+  };
+  const indexById = items => new Map((items || []).map(item => [item.id, item]));
+
+  function words(text, max) {
+    const lines = [''];
+    for (const word of String(text).split(/\s+/)) {
+      const last = lines.length - 1;
+      if (lines[last] && lines[last].length + word.length + 1 > max) lines.push(word);
+      else lines[last] += (lines[last] ? ' ' : '') + word;
+    }
+    return lines;
+  }
+  function svgText(text, x, y, attrs, max = 24, lineHeight = 18) {
+    const lines = words(text, max);
+    const node = svgEl('text', { x, y, ...attrs });
+    lines.forEach((line, i) => node.append(svgEl('tspan', { x, dy: i ? lineHeight : 0 }, line)));
+    return node;
+  }
+  function arrowDefs(svg, prefix) {
+    const defs = svgEl('defs');
+    for (const color of ['teal', 'blue', 'amber', 'violet', 'rose', 'slate']) {
+      const marker = svgEl('marker', { id: `${prefix}-${color}`, viewBox: '0 0 12 12', refX: 10, refY: 6, markerWidth: 9, markerHeight: 9, orient: 'auto', markerUnits: 'userSpaceOnUse' },
+        svgEl('path', { d: 'M1,1 L11,6 L1,11 Z', fill: `var(--sw-${color})` }));
+      defs.append(marker);
+    }
+    svg.append(defs);
+  }
+  function makeSvg(prefix, title, description, width, height) {
+    if (![width, height].every(value => Number.isFinite(value) && value > 0)) {
+      throw new TypeError('SVG width and height must be finite positive numbers.');
+    }
+    const svg = svgEl('svg', { viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-labelledby': `${prefix}-title ${prefix}-desc`, class: 'sw-diagram' });
+    svg.style.setProperty('--sw-diagram-width', `${width}px`);
+    svg.append(svgEl('title', { id: `${prefix}-title` }, title), svgEl('desc', { id: `${prefix}-desc` }, description));
+    arrowDefs(svg, prefix);
+    return svg;
+  }
+  function viewport(svg, label) {
+    return el('div', { class: 'sw-diagram-shell' },
+      para('Wide diagram · scroll inside this panel on a narrow screen. A full text version follows.', 'sw-scroll-hint'),
+      el('div', { class: 'sw-viewport', tabindex: '0', role: 'region', 'aria-label': label }, svg));
+  }
+  function statePanel(items) {
+    const list = el('dl', { class: 'sw-state' });
+    for (const item of items || []) list.append(el('div', {}, el('dt', {}, item.owner), el('dd', {}, item.detail)));
+    return el('div', { class: 'sw-state-panel' }, el('h4', {}, 'State after this step'), list);
+  }
+  function keyboardGroup(group, buttons, select, wrap = false) {
+    group.addEventListener('keydown', event => {
+      const current = buttons.indexOf(event.target.closest('button'));
+      if (current < 0 || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      let next = current;
+      if (event.key === 'Home') next = 0;
+      else if (event.key === 'End') next = buttons.length - 1;
+      else next += ['ArrowRight', 'ArrowDown'].includes(event.key) ? 1 : -1;
+      next = wrap ? (next + buttons.length) % buttons.length : Math.max(0, Math.min(buttons.length - 1, next));
+      select(next);
+      buttons[next].focus({ preventScroll: true });
+    });
+  }
+  function section(id, number, title, description) {
+    return el('section', { id, class: 'sw-section', 'aria-labelledby': `${id}-heading` },
+      el('div', { class: 'sw-section-heading' }, para(number, 'sw-kicker'), el('h2', { id: `${id}-heading` }, title), para(description, 'sw-section-intro')));
+  }
+  function mount(root, model) {
+    if (!root) throw new Error('SystemWalkthrough.mount needs a root element.');
+    const uid = `sw-${++serial}`;
+    const sources = indexById(model.sources), claims = indexById(model.claims), roles = indexById(model.roles);
+    root.replaceChildren();
+    root.classList.add('sw');
+    root.dataset.version = '1';
+    const sourceLinks = ids => el('span', { class: 'sw-source-links' }, (ids || []).map(id => {
+      const source = sources.get(id);
+      return source ? link(source.label, source.url) : el('span', {}, `Unknown source: ${id}`);
+    }));
+    function evidence(ids) {
+      const list = el('ul', { class: 'sw-evidence-list' });
+      for (const id of ids || []) {
+        const claim = claims.get(id);
+        if (claim) list.append(el('li', {}, el('span', { class: 'sw-claim-kind' }, claim.kind === 'inference' ? 'Inference' : 'Source-backed'), para(claim.text), sourceLinks(claim.sources)));
+      }
+      return el('details', { class: 'sw-evidence' }, el('summary', {}, `Evidence (${(ids || []).length})`), list);
+    }
+    function inspector(item, ordinal) {
+      const box = el('div', { class: 'sw-inspector', 'aria-live': 'polite', 'aria-atomic': 'true' });
+      if (ordinal) box.append(para(ordinal, 'sw-kicker'));
+      box.append(el('h3', {}, item.title || item.label), para(item.body));
+      if (item.why) box.append(el('h4', {}, 'Why it matters'), para(item.why));
+      if (item.boundary) box.append(el('p', { class: 'sw-boundary' }, el('strong', {}, 'Boundary · '), item.boundary));
+      if (item.state) box.append(statePanel(item.state));
+      box.append(evidence(item.claims));
+      return box;
+    }
+    function textAlternative(title, children) {
+      return el('details', { class: 'sw-text-alternative' }, el('summary', {}, title), el('div', { class: 'sw-text-body' }, children));
+    }
+    const theme = button(document.documentElement.dataset.swTheme === 'light' ? 'Dark mode' : 'Light mode', { class: 'sw-theme', 'aria-label': 'Switch color theme' });
+    theme.addEventListener('click', () => {
+      const next = document.documentElement.dataset.swTheme === 'light' ? 'dark' : 'light';
+      document.documentElement.dataset.swTheme = next;
+      try { localStorage.setItem('system-walkthrough-theme', next); } catch (_) { /* Reading remains available. */ }
+      theme.textContent = next === 'light' ? 'Dark mode' : 'Light mode';
+    });
+    const navigation = el('nav', { class: 'sw-nav', 'aria-label': 'Walkthrough sections' });
+    if (model.map) navigation.append(link('System map', `#${uid}-map`));
+    if (model.walkthrough) navigation.append(link('Walkthrough', `#${uid}-walk`));
+    if (model.sequence) navigation.append(link('Scenarios', `#${uid}-sequence`));
+    navigation.append(link('Sources & limits', `#${uid}-sources`));
+    root.append(el('header', { class: 'sw-hero' },
+      el('div', { class: 'sw-topline' }, para('SYSTEM WALKTHROUGH · SOURCE-DERIVED', 'sw-kicker'), theme),
+      el('h1', {}, model.title), para(model.subtitle, 'sw-subtitle'),
+      para(model.question, 'sw-question'),
+      el('div', { class: 'sw-snapshot' }, link(`${model.project.name} · ${model.project.version}`, `${model.project.repository}/tree/${model.project.revision}`), el('code', {}, model.project.revision.slice(0, 12))),
+      el('p', { class: 'sw-scope' }, el('strong', {}, 'Scope · '), model.scope), navigation));
+    if (model.takeaways?.length) {
+      root.append(el('ol', { class: 'sw-takeaways' }, model.takeaways.map(item => el('li', {}, para(item.text), evidence(item.claims)))));
+    }
+    function legend() {
+      return el('ul', { class: 'sw-legend', 'aria-label': 'Semantic roles' }, model.roles.map(role => el('li', { 'data-color': role.color }, el('span', { class: 'sw-dot', 'aria-hidden': 'true' }), role.label)));
+    }
+    function mapDiagram(prefix) {
+      const map = model.map;
+      const nodeIndex = indexById(map.nodes);
+      const svg = makeSvg(prefix, map.title, `${map.description} Arrowheads show the destination. Inactive context remains visible.`, map.width, map.height);
+      const edgeElements = new Map(), nodeElements = new Map();
+      function clip(node, toward) {
+        const cx = node.x + node.w / 2, cy = node.y + node.h / 2;
+        const dx = toward.x - cx, dy = toward.y - cy;
+        const scale = Math.min(dx ? node.w / 2 / Math.abs(dx) : Infinity, dy ? node.h / 2 / Math.abs(dy) : Infinity);
+        return { x: cx + dx * scale, y: cy + dy * scale };
+      }
+      for (const edge of map.edges) {
+        const from = nodeIndex.get(edge.from), to = nodeIndex.get(edge.to);
+        const center = node => ({ x: node.x + node.w / 2, y: node.y + node.h / 2 });
+        const via = edge.via || [];
+        let points;
+        if (from.id === to.id && !via.length) {
+          points = [{ x: from.x + from.w, y: from.y + from.h * .35 }, { x: from.x + from.w + 32, y: from.y + from.h * .35 }, { x: from.x + from.w + 32, y: from.y + from.h * .8 }, { x: from.x + from.w, y: from.y + from.h * .8 }];
+        } else points = [clip(from, via[0] || center(to)), ...via, clip(to, via.at(-1) || center(from))];
+        const color = roles.get(from.role).color;
+        const group = svgEl('g', { class: 'sw-map-edge', 'data-edge': edge.id, 'data-from': edge.from, 'data-to': edge.to, 'data-kind': edge.kind, 'data-color': color });
+        group.append(svgEl('title', {}, `${from.label} → ${to.label}: ${edge.label}`), svgEl('polyline', { points: points.map(p => `${p.x},${p.y}`).join(' '), 'marker-end': `url(#${prefix}-${color})` }));
+        const a = points[Math.floor((points.length - 1) / 2)], b = points[Math.ceil((points.length - 1) / 2)];
+        const edgeLines = words(edge.label, 24).length;
+        group.append(svgText(edge.label, (a.x + b.x) / 2, (a.y + b.y) / 2 - 10 - (edgeLines - 1) * 16, { class: 'sw-edge-label', 'text-anchor': 'middle' }, 24, 16));
+        svg.append(group); edgeElements.set(edge.id, group);
+      }
+      for (const node of map.nodes) {
+        const group = svgEl('g', { class: 'sw-map-node', 'data-node': node.id, 'data-color': roles.get(node.role).color });
+        const labelLines = words(node.label, Math.max(12, Math.floor((node.w - 28) / 8)));
+        group.append(svgEl('title', {}, `${node.label}. ${node.detail}`), svgEl('rect', { x: node.x, y: node.y, width: node.w, height: node.h, rx: 9 }),
+          svgText(node.label, node.x + 16, node.y + 27, { class: 'sw-node-label' }, Math.max(12, Math.floor((node.w - 28) / 8)), 19),
+          svgText(node.detail, node.x + 16, node.y + 28 + labelLines.length * 20, { class: 'sw-node-detail' }, Math.max(12, Math.floor((node.w - 28) / 7)), 17));
+        svg.append(group); nodeElements.set(node.id, group);
+      }
+      function highlight(selection) {
+        const nodes = new Set(selection.nodes || []), edges = new Set(selection.edges || []);
+        for (const edge of map.edges) if (edges.has(edge.id)) { nodes.add(edge.from); nodes.add(edge.to); }
+        for (const [id, node] of nodeElements) node.dataset.active = String(nodes.has(id));
+        for (const [id, edge] of edgeElements) edge.dataset.active = String(edges.has(id));
+      }
+      return { view: viewport(svg, `${map.title}, horizontally scrollable`), highlight };
+    }
+    if (model.map) {
+      const map = model.map;
+      const block = section(`${uid}-map`, '01 · ONE MODEL, SEVERAL QUESTIONS', map.title, map.description);
+      block.dataset.view = 'map';
+      const controls = el('div', { class: 'sw-controls', role: 'group', 'aria-label': 'Map lenses' });
+      const diagram = mapDiagram(`${uid}-map-svg`), host = el('div', { class: 'sw-inspector-host' });
+      const allButtons = [];
+      function select(item, active) {
+        for (const control of allButtons) control.setAttribute('aria-pressed', String(control === active));
+        diagram.highlight(item); host.replaceChildren(inspector(item));
+        block.dataset.selection = item.id;
+      }
+      const lenses = map.lenses.map(item => {
+        const control = button(item.label, { 'data-lens': item.id, 'aria-pressed': 'false' });
+        control.addEventListener('click', () => select(item, control)); controls.append(control); allButtons.push(control); return control;
+      });
+      keyboardGroup(controls, lenses, i => select(map.lenses[i], lenses[i]), true);
+      block.append(controls);
+      if (map.intents?.length) {
+        const intentControls = el('div', { class: 'sw-controls sw-intents', role: 'group', 'aria-label': 'Feature intents' }, el('span', { class: 'sw-control-label' }, 'Follow an action'));
+        const intents = map.intents.map(item => {
+          const control = button(item.label, { 'data-intent': item.id, 'aria-pressed': 'false' });
+          control.addEventListener('click', () => select(item, control)); intentControls.append(control); allButtons.push(control); return control;
+        });
+        keyboardGroup(intentControls, intents, i => select(map.intents[i], intents[i]), true);
+        block.append(intentControls);
+      }
+      const layout = el('div', { class: 'sw-map-layout' }, diagram.view, host);
+      layout.style.setProperty('--sw-map-width', `${map.width + 2}px`);
+      block.append(legend(), layout, textAlternative('Read the map as text', [
+        el('h3', {}, 'Components'), el('dl', { class: 'sw-state' }, map.nodes.map(node => el('div', {}, el('dt', {}, node.label), el('dd', {}, node.detail)))),
+        el('h3', {}, 'Directed relationships'), el('ul', {}, map.edges.map(edge => el('li', {}, `${map.nodes.find(n => n.id === edge.from).label} → ${map.nodes.find(n => n.id === edge.to).label}: ${edge.label} (${edge.kind})`))),
+        ...[...map.lenses, ...(map.intents || [])].map(item => el('article', {}, el('h3', {}, item.title), para(item.body), evidence(item.claims)))
+      ]));
+      root.append(block); select(map.lenses[0], lenses[0]);
+    }
+    if (model.walkthrough) {
+      const walk = model.walkthrough;
+      const block = section(`${uid}-walk`, '02 · FOLLOW ONE CONCRETE PATH', walk.title, walk.intro);
+      block.dataset.view = 'walkthrough';
+      const diagram = mapDiagram(`${uid}-walk-svg`);
+      const list = el('ol', { class: 'sw-step-list', role: 'list', 'aria-label': 'Walkthrough steps' });
+      const host = el('div', { class: 'sw-inspector-host' });
+      const previous = button('← Previous'), next = button('Next →');
+      const position = el('span', { class: 'sw-position', 'aria-live': 'off' });
+      let current = 0;
+      const buttons = walk.steps.map((step, i) => {
+        const control = button([String(i + 1).padStart(2, '0'), ' · ', step.title].join(''), { 'data-step': step.id });
+        control.addEventListener('click', () => select(i)); list.append(el('li', {}, control)); return control;
+      });
+      function select(i) {
+        current = Math.max(0, Math.min(walk.steps.length - 1, i));
+        const step = walk.steps[current];
+        buttons.forEach((control, index) => { control.setAttribute('aria-current', index === current ? 'step' : 'false'); control.dataset.active = String(index === current); });
+        previous.disabled = current === 0; next.disabled = current === walk.steps.length - 1;
+        position.textContent = `${current + 1} / ${walk.steps.length}`;
+        diagram.highlight(step); host.replaceChildren(inspector(step, `STEP ${current + 1}`)); block.dataset.selection = step.id;
+      }
+      previous.addEventListener('click', () => select(current - 1)); next.addEventListener('click', () => select(current + 1));
+      keyboardGroup(list, buttons, select);
+      block.append(legend(), diagram.view, el('div', { class: 'sw-step-navigation', role: 'group', 'aria-label': 'Walkthrough navigation' }, previous, position, next),
+        el('div', { class: 'sw-walk-layout' }, list, host),
+        textAlternative('Read every walkthrough step', walk.steps.map((step, i) => el('article', {}, el('h3', {}, `${i + 1}. ${step.title}`), para(step.body), para(`Why: ${step.why}`), para(`Boundary: ${step.boundary}`), statePanel(step.state), evidence(step.claims)))));
+      root.append(block); select(0);
+    }
+    if (model.sequence) {
+      const sequence = model.sequence;
+      const lanes = indexById(sequence.lanes);
+      const block = section(`${uid}-sequence`, '03 · CHANGE THE CONDITIONS', sequence.title, sequence.intro);
+      block.dataset.view = 'sequence';
+      const scenarioControls = el('div', { class: 'sw-controls', role: 'group', 'aria-label': 'Sequence scenarios' });
+      const summary = el('div', { class: 'sw-scenario-summary' });
+      const diagramHost = el('div');
+      const eventList = el('ol', { class: 'sw-step-list', 'aria-label': 'Sequence events' });
+      const host = el('div', { class: 'sw-inspector-host' });
+      const previous = button('← Previous'), next = button('Next →'), position = el('span', { class: 'sw-position' });
+      let scenarioIndex = 0, eventIndex = 0, eventButtons = [], eventGroups = [], scrollPanel, laneHeader;
+      const scenarioButtons = sequence.scenarios.map((scenario, i) => {
+        const control = button(scenario.label, { 'data-scenario': scenario.id, 'aria-pressed': 'false' });
+        control.addEventListener('click', () => selectScenario(i)); scenarioControls.append(control); return control;
+      });
+      const laneX = new Map(sequence.lanes.map((lane, i) => [lane.id, 125 + i * 195]));
+      function drawScenario(scenario) {
+        const width = Math.max(480, 180 + sequence.lanes.length * 195), height = 105 + scenario.events.length * 86;
+        const prefix = `${uid}-sequence-${scenario.id}`;
+        const svg = makeSvg(prefix, `${sequence.title}: ${scenario.label}`, `${scenario.summary} Time runs downward. Arrowheads point to receivers. Numbered rows correspond to the event controls below.`, width, height);
+        laneHeader = makeSvg(`${prefix}-lanes`, 'Sequence lane owners', 'Lane labels stay aligned with the sequence while its content scrolls.', width, 64);
+        laneHeader.dataset.sequenceHeader = '';
+        sequence.lanes.forEach(lane => {
+          const x = laneX.get(lane.id), color = roles.get(lane.role).color;
+          svg.append(svgEl('line', { x1: x, y1: 64, x2: x, y2: height - 22, class: 'sw-lifeline' }));
+          laneHeader.append(svgEl('g', { 'data-lane': lane.id, 'data-color': color },
+            svgEl('rect', { x: x - 88, y: 9, width: 176, height: 49, rx: 8, class: 'sw-lane-box', 'data-color': color }),
+            svgText(lane.label, x, 30, { class: 'sw-lane-label', 'text-anchor': 'middle' }, 20, 17)));
+        });
+        eventGroups = scenario.events.map((event, i) => {
+          const from = laneX.get(event.from), to = laneX.get(event.to), y = 105 + i * 86;
+          const color = roles.get(lanes.get(event.from).role).color;
+          const group = svgEl('g', { class: 'sw-sequence-event', 'data-event': event.id, 'data-edge': event.id, 'data-from': event.from, 'data-to': event.to, 'data-kind': event.kind, 'data-color': color });
+          group.append(svgEl('title', {}, `${i + 1}. ${lanes.get(event.from).label} → ${lanes.get(event.to).label}: ${event.label}`),
+            svgEl('rect', { class: 'sw-sequence-row', x: 10, y: y - 34, width: width - 20, height: 75, rx: 7 }),
+            svgEl('text', { x: 25, y: y + 5, class: 'sw-row-number' }, String(i + 1).padStart(2, '0')));
+          const path = from === to ? `M${from},${y} h68 v26 h-68` : `M${from},${y} H${to}`;
+          const lineLimit = from === to ? 20 : Math.max(18, Math.floor(Math.abs(to - from) / 8));
+          const labelLines = words(event.label, lineLimit).length;
+          group.append(svgEl('path', { d: path, class: 'sw-message', 'marker-end': `url(#${prefix}-${color})` }),
+            svgText(event.label, from === to ? from + 85 : (from + to) / 2, y - 12 - (labelLines - 1) * 17, { class: 'sw-edge-label', 'text-anchor': from === to ? 'start' : 'middle' }, lineLimit, 17));
+          svg.append(group); return group;
+        });
+        const view = viewport(svg, `${scenario.label} sequence, scrollable`);
+        view.querySelector('.sw-viewport').classList.add('sw-sequence-viewport');
+        scrollPanel = view.querySelector('.sw-viewport');
+        scrollPanel.prepend(el('div', { class: 'sw-sequence-sticky' }, laneHeader));
+        diagramHost.replaceChildren(view);
+      }
+      function selectEvent(i, scroll = false) {
+        const scenario = sequence.scenarios[scenarioIndex];
+        eventIndex = Math.max(0, Math.min(scenario.events.length - 1, i));
+        const event = scenario.events[eventIndex];
+        eventGroups.forEach((group, index) => { group.dataset.active = String(index === eventIndex); group.dataset.past = String(index < eventIndex); });
+        eventButtons.forEach((control, index) => { control.setAttribute('aria-current', index === eventIndex ? 'step' : 'false'); control.dataset.active = String(index === eventIndex); });
+        previous.disabled = eventIndex === 0; next.disabled = eventIndex === scenario.events.length - 1;
+        position.textContent = `${eventIndex + 1} / ${scenario.events.length}`;
+        host.replaceChildren(inspector({ ...event, title: event.label }, `EVENT ${eventIndex + 1} · ${lanes.get(event.from).label} → ${lanes.get(event.to).label}`));
+        block.dataset.selection = event.id;
+        if (scroll) {
+          const row = eventGroups[eventIndex].getBoundingClientRect();
+          const panel = scrollPanel.getBoundingClientRect();
+          const headerHeight = laneHeader.getBoundingClientRect().height;
+          if (row.top < panel.top + headerHeight + 12 || row.bottom > panel.bottom) scrollPanel.scrollTop += row.top - panel.top - headerHeight - 18;
+          const path = eventGroups[eventIndex].querySelector('.sw-message');
+          const message = path.getBoundingClientRect();
+          const label = eventGroups[eventIndex].querySelector('.sw-edge-label').getBoundingClientRect();
+          let left = Math.min(message.left, label.left), right = Math.max(message.right, label.right);
+          const margin = 24, visibleRight = panel.left + scrollPanel.clientWidth;
+          const owners = [...laneHeader.querySelectorAll('[data-lane]')]
+            .filter(lane => lane.dataset.lane === event.from || lane.dataset.lane === event.to)
+            .map(lane => lane.querySelector('text').getBoundingClientRect());
+          const ownerLeft = Math.min(left, ...owners.map(owner => owner.left));
+          const ownerRight = Math.max(right, ...owners.map(owner => owner.right));
+          if (ownerRight - ownerLeft <= scrollPanel.clientWidth - margin * 2) {
+            left = ownerLeft; right = ownerRight;
+          }
+          if (right - left <= scrollPanel.clientWidth - margin * 2) {
+            if (left < panel.left + margin) scrollPanel.scrollLeft += left - panel.left - margin;
+            else if (right > visibleRight - margin) scrollPanel.scrollLeft += right - visibleRight + margin;
+          } else {
+            const end = path.getPointAtLength(path.getTotalLength());
+            const destination = new DOMPoint(end.x, end.y).matrixTransform(path.getScreenCTM());
+            if (destination.x < panel.left + margin) scrollPanel.scrollLeft += destination.x - panel.left - margin;
+            else if (destination.x > visibleRight - margin) scrollPanel.scrollLeft += destination.x - visibleRight + margin;
+          }
+        }
+      }
+      function selectScenario(i) {
+        scenarioIndex = i;
+        const scenario = sequence.scenarios[i];
+        scenarioButtons.forEach((control, index) => control.setAttribute('aria-pressed', String(index === i)));
+        summary.replaceChildren(para('Source-derived illustrative scenario · no measured timing', 'sw-kicker'), para(scenario.summary), el('ul', { class: 'sw-assumptions' }, scenario.assumptions.map(item => el('li', {}, item))));
+        drawScenario(scenario); eventList.replaceChildren();
+        eventButtons = scenario.events.map((event, index) => {
+          const control = button(`${String(index + 1).padStart(2, '0')} · ${event.label}`, { 'data-event-select': event.id });
+          control.addEventListener('click', () => selectEvent(index, true)); eventList.append(el('li', {}, control)); return control;
+        });
+        block.dataset.scenario = scenario.id; selectEvent(0);
+      }
+      previous.addEventListener('click', () => selectEvent(eventIndex - 1, true)); next.addEventListener('click', () => selectEvent(eventIndex + 1, true));
+      eventList.addEventListener('keydown', event => {
+        const current = eventButtons.indexOf(event.target.closest('button'));
+        if (current < 0 || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? eventButtons.length - 1 : Math.max(0, Math.min(eventButtons.length - 1, current + (['ArrowRight', 'ArrowDown'].includes(event.key) ? 1 : -1)));
+        selectEvent(nextIndex, true); eventButtons[nextIndex].focus({ preventScroll: true });
+      });
+      keyboardGroup(scenarioControls, scenarioButtons, selectScenario, true);
+      block.append(scenarioControls, summary, legend(), diagramHost,
+        el('div', { class: 'sw-step-navigation', role: 'group', 'aria-label': 'Sequence navigation' }, previous, position, next),
+        el('div', { class: 'sw-walk-layout' }, eventList, host),
+        textAlternative('Read all scenarios and directed exchanges', sequence.scenarios.map(scenario => el('article', {}, el('h3', {}, scenario.label), para(scenario.summary), el('ul', {}, scenario.assumptions.map(item => el('li', {}, item))), el('ol', {}, scenario.events.map(event => el('li', {}, el('h4', {}, `${lanes.get(event.from).label} → ${lanes.get(event.to).label}: ${event.label}`), para(event.body), statePanel(event.state), evidence(event.claims))))))));
+      root.append(block); selectScenario(0);
+    }
+    const sourceSection = section(`${uid}-sources`, 'EVIDENCE & BOUNDARIES', 'Sources and limits', 'This is a source-derived explanation. Scenarios illustrate supported behavior; they are not recorded execution traces.');
+    sourceSection.append(el('h3', {}, 'Pinned project'), para(`${model.project.name} ${model.project.version} · ${model.project.license}`), link(model.project.revision, `${model.project.repository}/tree/${model.project.revision}`),
+      el('h3', {}, 'Primary evidence'), el('ol', { class: 'sw-source-catalog' }, model.sources.map(source => el('li', { id: `${uid}-source-${source.id}` }, link(source.label, source.url), source.note ? para(source.note) : null))),
+      el('h3', {}, 'What this model leaves out'), el('ul', {}, model.limits.map(item => el('li', {}, item))),
+      textAlternative('Inspect every claim and its evidence', model.claims.map(claim => el('article', {}, el('h4', {}, claim.text), para(claim.kind === 'inference' ? 'Inference from the sources below.' : 'Source-backed assertion.'), sourceLinks(claim.sources)))));
+    root.append(sourceSection, el('footer', { class: 'sw-footer' }, para('Created with AI assistance and checked against the linked primary sources. Interpret the model within its stated scope and assumptions.'), link('System Walkthrough skill & reusable components', 'https://github.com/EvanOman/claude-skills-public/tree/main/skills/system-walkthrough')));
+    let printClosed = [];
+    function beforePrint() {
+      printClosed = [...root.querySelectorAll('details:not([open])')];
+      printClosed.forEach(item => { item.open = true; });
+    }
+    function afterPrint() { printClosed.forEach(item => { item.open = false; }); printClosed = []; }
+    global.addEventListener('beforeprint', beforePrint);
+    global.addEventListener('afterprint', afterPrint);
+    return { destroy() {
+      global.removeEventListener('beforeprint', beforePrint);
+      global.removeEventListener('afterprint', afterPrint);
+      root.replaceChildren(); root.classList.remove('sw');
+    } };
+  }
+  global.SystemWalkthrough = Object.freeze({ mount });
+})(window);
+</script><script>SystemWalkthrough.mount(document.getElementById('walkthrough'),JSON.parse(document.getElementById('walkthrough-model').textContent));</script></body></html>

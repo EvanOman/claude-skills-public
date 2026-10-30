@@ -1,0 +1,388 @@
+{
+  "version": 1,
+  "title": "A fresh HTTP cache hit",
+  "subtitle": "A small authoring example: follow an eligible stored response back to its caller.",
+  "question": "When can a cache answer without contacting the origin?",
+  "scope": "Illustrative GET with a matching, reusable stored response and a clock. Cache directives, authentication and Vary conditions already permit reuse. This is a protocol example, not an implementation trace.",
+  "project": {
+    "name": "HTTP Caching",
+    "repository": "https://github.com/httpwg/http-core",
+    "revision": "bde37f634681bd5462568b73aa722af9c9a3ef5e",
+    "version": "RFC 9111",
+    "license": "IETF Trust; this model paraphrases the specification."
+  },
+  "sources": [
+    {
+      "id": "response",
+      "label": "RFC 9111 · reuse conditions",
+      "url": "https://github.com/httpwg/http-core/blob/bde37f634681bd5462568b73aa722af9c9a3ef5e/rfc9111.xml#L493-L529"
+    },
+    {
+      "id": "freshness",
+      "label": "RFC 9111 · freshness",
+      "url": "https://github.com/httpwg/http-core/blob/bde37f634681bd5462568b73aa722af9c9a3ef5e/rfc9111.xml#L680-L695"
+    }
+  ],
+  "claims": [
+    {
+      "id": "reuse",
+      "kind": "source",
+      "text": "Reuse requires matching and permission conditions as well as freshness. A cache returning a stored response without validation generates an Age header.",
+      "sources": [
+        "response"
+      ]
+    },
+    {
+      "id": "fresh",
+      "kind": "source",
+      "text": "Freshness compares freshness lifetime with current age. An eligible fresh response can be reused without origin validation.",
+      "sources": [
+        "freshness",
+        "response"
+      ]
+    }
+  ],
+  "roles": [
+    {
+      "id": "caller",
+      "label": "Caller",
+      "color": "blue"
+    },
+    {
+      "id": "cache",
+      "label": "Response owner",
+      "color": "teal"
+    },
+    {
+      "id": "origin",
+      "label": "Origin service",
+      "color": "violet"
+    }
+  ],
+  "takeaways": [
+    {
+      "text": "An eligible fresh hit returns the stored response without origin validation.",
+      "claims": [
+        "reuse",
+        "fresh"
+      ]
+    }
+  ],
+  "limits": [
+    "This small example excludes validation, misses, eviction and directive interactions. It contains no runtime observations."
+  ],
+  "map": {
+    "title": "Keep the origin in context",
+    "description": "The hit uses the caller and cache; the origin stays visible without becoming active.",
+    "width": 880,
+    "height": 340,
+    "nodes": [
+      {
+        "id": "client",
+        "label": "Client",
+        "detail": "Sends GET",
+        "role": "caller",
+        "x": 40,
+        "y": 90,
+        "w": 180,
+        "h": 90
+      },
+      {
+        "id": "cache",
+        "label": "Cache",
+        "detail": "Owns stored response",
+        "role": "cache",
+        "x": 350,
+        "y": 90,
+        "w": 190,
+        "h": 90
+      },
+      {
+        "id": "origin",
+        "label": "Origin",
+        "detail": "Outside this hit path",
+        "role": "origin",
+        "x": 660,
+        "y": 90,
+        "w": 180,
+        "h": 90
+      }
+    ],
+    "edges": [
+      {
+        "id": "get",
+        "from": "client",
+        "to": "cache",
+        "label": "GET",
+        "kind": "request"
+      },
+      {
+        "id": "response",
+        "from": "cache",
+        "to": "client",
+        "label": "Stored response + Age",
+        "kind": "return",
+        "via": [
+          {
+            "x": 445,
+            "y": 270
+          },
+          {
+            "x": 130,
+            "y": 270
+          }
+        ]
+      }
+    ],
+    "lenses": [
+      {
+        "id": "owners",
+        "label": "Ownership",
+        "title": "Who owns the response?",
+        "body": "The cache owns a stored response; the origin is a separate actor.",
+        "nodes": [
+          "client",
+          "cache",
+          "origin"
+        ],
+        "edges": [],
+        "claims": [
+          "reuse",
+          "fresh"
+        ]
+      },
+      {
+        "id": "hit",
+        "label": "Hit path",
+        "title": "A fresh hit",
+        "body": "The request goes to the cache and the response returns to the client.",
+        "nodes": [
+          "client",
+          "cache"
+        ],
+        "edges": [
+          "get",
+          "response"
+        ],
+        "claims": [
+          "reuse",
+          "fresh"
+        ]
+      }
+    ],
+    "intents": [
+      {
+        "id": "read",
+        "label": "Read a cached resource",
+        "title": "Follow this GET",
+        "body": "Assume all reuse conditions hold. The cache answers the caller.",
+        "nodes": [
+          "cache"
+        ],
+        "edges": [
+          "get",
+          "response"
+        ],
+        "claims": [
+          "reuse",
+          "fresh"
+        ]
+      }
+    ]
+  },
+  "walkthrough": {
+    "title": "One eligible cache hit",
+    "intro": "Geometry stays fixed as the active path changes.",
+    "steps": [
+      {
+        "id": "request",
+        "title": "Receive GET",
+        "body": "The client sends a request to the cache.",
+        "why": "The cache checks whether its stored response can satisfy the request.",
+        "boundary": "Client to cache.",
+        "nodes": [
+          "client",
+          "cache"
+        ],
+        "edges": [
+          "get"
+        ],
+        "claims": [
+          "reuse",
+          "fresh"
+        ],
+        "state": [
+          {
+            "owner": "Cache",
+            "detail": "Owns an eligible stored response."
+          },
+          {
+            "owner": "Origin",
+            "detail": "No origin request in this cache-hit path."
+          }
+        ]
+      },
+      {
+        "id": "test",
+        "title": "Check freshness",
+        "body": "After reuse restrictions permit this request, compare age with freshness lifetime.",
+        "why": "An eligible fresh response needs no origin validation.",
+        "boundary": "Local cache work.",
+        "nodes": [
+          "cache"
+        ],
+        "edges": [],
+        "claims": [
+          "reuse",
+          "fresh"
+        ],
+        "state": [
+          {
+            "owner": "Cache",
+            "detail": "Owns an eligible stored response."
+          },
+          {
+            "owner": "Origin",
+            "detail": "No origin request in this cache-hit path."
+          }
+        ]
+      },
+      {
+        "id": "return",
+        "title": "Return the stored response",
+        "body": "Return the stored response with the required Age header.",
+        "why": "The client receives a response without an origin exchange on this path.",
+        "boundary": "Cache to client.",
+        "nodes": [
+          "client",
+          "cache"
+        ],
+        "edges": [
+          "response"
+        ],
+        "claims": [
+          "reuse",
+          "fresh"
+        ],
+        "state": [
+          {
+            "owner": "Client",
+            "detail": "Has received the response."
+          },
+          {
+            "owner": "Cache",
+            "detail": "Owns an eligible stored response."
+          },
+          {
+            "owner": "Origin",
+            "detail": "No origin request in this cache-hit path."
+          }
+        ]
+      }
+    ]
+  },
+  "sequence": {
+    "title": "Requests and replies have opposite directions",
+    "intro": "Source-derived illustrative ordering. No durations or automatic animation.",
+    "lanes": [
+      {
+        "id": "client",
+        "label": "Client",
+        "role": "caller"
+      },
+      {
+        "id": "cache",
+        "label": "Cache",
+        "role": "cache"
+      },
+      {
+        "id": "origin",
+        "label": "Origin",
+        "role": "origin"
+      }
+    ],
+    "scenarios": [
+      {
+        "id": "fresh-hit",
+        "label": "Eligible fresh hit",
+        "summary": "The origin takes no part in this path.",
+        "assumptions": [
+          "Stored response matches and reuse restrictions permit the request.",
+          "Response is fresh; no timing or implementation behavior is implied."
+        ],
+        "events": [
+          {
+            "id": "get",
+            "from": "client",
+            "to": "cache",
+            "label": "GET",
+            "kind": "request",
+            "body": "Receive the request.",
+            "claims": [
+              "reuse",
+              "fresh"
+            ],
+            "state": [
+              {
+                "owner": "Cache",
+                "detail": "Owns an eligible stored response."
+              },
+              {
+                "owner": "Origin",
+                "detail": "No origin request in this cache-hit path."
+              }
+            ]
+          },
+          {
+            "id": "fresh",
+            "from": "cache",
+            "to": "cache",
+            "label": "Check freshness",
+            "kind": "control",
+            "body": "Check locally after other reuse conditions hold.",
+            "claims": [
+              "reuse",
+              "fresh"
+            ],
+            "state": [
+              {
+                "owner": "Cache",
+                "detail": "Owns an eligible stored response."
+              },
+              {
+                "owner": "Origin",
+                "detail": "No origin request in this cache-hit path."
+              }
+            ]
+          },
+          {
+            "id": "reply",
+            "from": "cache",
+            "to": "client",
+            "label": "Stored response + Age",
+            "kind": "return",
+            "body": "Return the response to the caller.",
+            "claims": [
+              "reuse",
+              "fresh"
+            ],
+            "state": [
+              {
+                "owner": "Client",
+                "detail": "Has received the response."
+              },
+              {
+                "owner": "Cache",
+                "detail": "Owns an eligible stored response."
+              },
+              {
+                "owner": "Origin",
+                "detail": "No origin request in this cache-hit path."
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

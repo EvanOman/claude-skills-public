@@ -1,0 +1,203 @@
+[
+  {
+    "project": "valkey",
+    "source": "structures",
+    "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/stream.h#L55-L97",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "valkey",
+    "source": "consumer-setup",
+    "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2727-L2730",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "valkey",
+    "source": "consumer-state",
+    "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2530-L2550",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "valkey",
+    "source": "read-path",
+    "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2339-L2400",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "valkey",
+    "source": "deliver",
+    "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L1699-L1789",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "valkey",
+    "source": "nack",
+    "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2454-L2470",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "valkey",
+    "source": "ack",
+    "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2822-L2877",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "valkey",
+    "source": "claim",
+    "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L3405-L3520",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "valkey",
+    "source": "tests",
+    "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/tests/unit/type/stream-cgroups.tcl#L127-L148",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "valkey",
+    "source": "doc-read",
+    "url": "https://valkey.io/commands/xreadgroup/",
+    "http": 200,
+    "liveDocDisclosed": true
+  },
+  {
+    "project": "valkey",
+    "source": "doc-claim",
+    "url": "https://valkey.io/commands/xautoclaim/",
+    "http": 200,
+    "liveDocDisclosed": true
+  },
+  {
+    "project": "sqlite",
+    "source": "reader",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L101-L117",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "marks",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L335-L388",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "commit",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4320-L4351",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "bound",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2310-L2332",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "iterator",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L1786-L1799",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "copy",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2384-L2432",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "release",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L3561-L3602",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "api-entry",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/main.c#L2582-L2642",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "api-route",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/main.c#L2679-L2702",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "btree-route",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/btree.c#L11403-L11421",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "pager-route",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/pager.c#L7580-L7614",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "modes",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/sqlite.h.in#L10155-L10189",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "counts",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/sqlite.h.in#L10197-L10221",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "output",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4475-L4517",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "restart",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2435-L2455",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "wal-doc",
+    "url": "https://sqlite.org/wal.html#concurrency",
+    "http": 200,
+    "liveDocDisclosed": true
+  },
+  {
+    "project": "sqlite",
+    "source": "slot-zero-copy",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2340-L2345",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "slot-zero-reader",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L3216-L3243",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "full-incomplete",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L2440-L2444",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "full-writer-fallback",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4444-L4451",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "checkpoint-count-results",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4484-L4488",
+    "pinnedFileAndBounds": true
+  },
+  {
+    "project": "sqlite",
+    "source": "full-mode-return",
+    "url": "https://github.com/sqlite/sqlite/blob/57520227c95396ce39ba6ecaac8d475b78dd3964/src/wal.c#L4513-L4517",
+    "pinnedFileAndBounds": true
+  }
+]

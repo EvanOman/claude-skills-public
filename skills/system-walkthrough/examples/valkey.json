@@ -1,0 +1,1513 @@
+{
+  "version": 1,
+  "navigation": [
+    {
+      "label": "System Walkthroughs",
+      "url": "../"
+    },
+    {
+      "label": "evanoman.com",
+      "url": "https://evanoman.com/"
+    }
+  ],
+  "title": "An absent consumer leaves pending work",
+  "subtitle": "Valkey Streams: separate delivery, business work and acknowledgement before recovering one entry.",
+  "question": "When Alice disappears, what must Bob do to finish her pending entry—and when can that repeat a business effect?",
+  "scope": "For engineers using one existing stream orders and group workers, created at 0-0. Alice and Bob were already registered with XGROUP CREATECONSUMER and begin with empty consumer PELs. One retained entry 1000-0; no NOACK, JUSTID, trimming, consumer deletion or XGROUP SETID. The Valkey process remains available. The application chooses and runs recovery. Server restart, replication durability and production settings are outside this trace.",
+  "project": {
+    "name": "Valkey",
+    "repository": "https://github.com/valkey-io/valkey",
+    "revision": "29173b67508b2de4c0f0ed551f3b47cf19fc3ca8",
+    "version": "9.1.3",
+    "license": "BSD-3-Clause. Original AI-assisted paraphrase; no upstream code or diagrams copied."
+  },
+  "sources": [
+    {
+      "id": "structures",
+      "label": "stream.h · streamCG / streamConsumer / streamNACK",
+      "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/stream.h#L55-L97"
+    },
+    {
+      "id": "consumer-setup",
+      "label": "t_stream.c · XGROUP CREATECONSUMER",
+      "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2727-L2730"
+    },
+    {
+      "id": "consumer-state",
+      "label": "t_stream.c · streamCreateConsumer",
+      "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2530-L2550"
+    },
+    {
+      "id": "read-path",
+      "label": "t_stream.c · xreadCommand",
+      "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2339-L2400"
+    },
+    {
+      "id": "deliver",
+      "label": "t_stream.c · streamReplyWithRange",
+      "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L1699-L1789"
+    },
+    {
+      "id": "nack",
+      "label": "t_stream.c · streamCreateNACK",
+      "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2454-L2470"
+    },
+    {
+      "id": "ack",
+      "label": "t_stream.c · xackCommand",
+      "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2822-L2877"
+    },
+    {
+      "id": "claim",
+      "label": "t_stream.c · xautoclaimCommand",
+      "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L3405-L3520"
+    },
+    {
+      "id": "tests",
+      "label": "stream-cgroups.tcl · acknowledgement tests",
+      "url": "https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/tests/unit/type/stream-cgroups.tcl#L127-L148"
+    },
+    {
+      "id": "doc-read",
+      "label": "Official XREADGROUP command reference",
+      "url": "https://valkey.io/commands/xreadgroup/",
+      "note": "Live documentation acquired 2026-10-30; reconciled against the pinned 9.1.3 implementation."
+    },
+    {
+      "id": "doc-claim",
+      "label": "Official XAUTOCLAIM command reference",
+      "url": "https://valkey.io/commands/xautoclaim/",
+      "note": "Live documentation acquired 2026-10-30. Its strict greater-than wording differs at equality from pinned code, which skips only idle < min-idle-time. This guide follows pinned code."
+    }
+  ],
+  "claims": [
+    {
+      "id": "ownership",
+      "text": "The group holds a last-delivered cursor and a PEL. Its PEL and each consumer PEL reference the same pending record containing the last owner, delivery time and delivery count. These are logical structures within Valkey, not separate network services. XGROUP CREATECONSUMER can pre-register consumer records with empty PELs; this trace assumes that setup already completed for Alice and Bob.",
+      "kind": "source",
+      "sources": [
+        "structures",
+        "consumer-setup",
+        "consumer-state"
+      ]
+    },
+    {
+      "id": "new-read",
+      "text": "With >, XREADGROUP reads after the group last-delivered ID; a numeric ID instead reads only the named consumer’s pending history. Bob using > does not recover Alice’s already-delivered entry in the stated configuration.",
+      "kind": "source",
+      "sources": [
+        "read-path",
+        "doc-read"
+      ]
+    },
+    {
+      "id": "delivery",
+      "text": "Normal delivery advances the group cursor and creates the pending record in both group and consumer PELs. The record starts with delivery count 1. NOACK skips PEL creation. Delivery is not a business-work receipt.",
+      "kind": "source",
+      "sources": [
+        "deliver",
+        "nack",
+        "structures"
+      ]
+    },
+    {
+      "id": "pending-after-crash",
+      "text": "A client crash can leave entries in its pending history. Another consumer needs explicit claiming to take that history; this trace assumes a surviving Valkey process and an application that invokes recovery.",
+      "kind": "source",
+      "sources": [
+        "doc-read",
+        "doc-claim"
+      ]
+    },
+    {
+      "id": "reclaim",
+      "text": "XAUTOCLAIM scans the group PEL. A retained entry with per-entry idle >= min-idle-time can transfer to Bob: remove the old consumer PEL reference, add Bob’s, reset delivery time and increment delivery count when JUSTID is absent. This does not check whether Alice’s process is dead.",
+      "kind": "source",
+      "sources": [
+        "claim",
+        "structures"
+      ]
+    },
+    {
+      "id": "reply",
+      "text": "XAUTOCLAIM replies with a next cursor, the claimed entries, and IDs cleared because their payloads were deleted. A 0-0 cursor ends this scan; it does not prove all pending work has completed. In this one-entry trace the reply is [0-0, [1000-0 plus payload], []].",
+      "kind": "source",
+      "sources": [
+        "claim",
+        "doc-claim"
+      ]
+    },
+    {
+      "id": "acknowledge",
+      "text": "XACK removes an ID found in the group PEL from both group and current owner PEL, frees its pending record and returns the number removed. It does not delete the stream entry or check external business work; a repeated XACK returns 0 for the already-removed ID.",
+      "kind": "source",
+      "sources": [
+        "ack",
+        "tests"
+      ]
+    },
+    {
+      "id": "duplicates",
+      "text": "If a non-idempotent external effect succeeds before Alice disappears without XACK, Bob can reclaim and repeat it. This is an application-level inference: the server sees the same pending record whether the external effect succeeded or never ran. Idempotency or transactional coordination must address that gap.",
+      "kind": "inference",
+      "sources": [
+        "ack",
+        "claim",
+        "structures"
+      ]
+    }
+  ],
+  "roles": [
+    {
+      "id": "consumer",
+      "label": "Consumer process",
+      "color": "blue"
+    },
+    {
+      "id": "server",
+      "label": "Valkey command handling",
+      "color": "teal"
+    },
+    {
+      "id": "payload",
+      "label": "Retained stream payload",
+      "color": "violet"
+    },
+    {
+      "id": "tracking",
+      "label": "Group delivery bookkeeping",
+      "color": "amber"
+    }
+  ],
+  "takeaways": [
+    {
+      "text": "The group cursor answers “what was delivered?”; the PEL answers “what is still unacknowledged?”",
+      "claims": [
+        "ownership",
+        "delivery"
+      ]
+    },
+    {
+      "text": "A disappearing process does not hand its entries to Bob. Bob must run recovery and receive the claimed payload.",
+      "claims": [
+        "pending-after-crash",
+        "reclaim",
+        "reply"
+      ]
+    },
+    {
+      "text": "XACK clears delivery bookkeeping. A business effect can already have happened before an unacknowledged entry is recovered.",
+      "claims": [
+        "acknowledge",
+        "duplicates"
+      ]
+    }
+  ],
+  "limits": [
+    "This is a source-derived illustration, not a captured Valkey execution. Entry IDs, names and the application’s 60000 ms idle threshold are chosen for the explanation; no measured timings are implied.",
+    "Consumer disappearance means a process stops. It does not mean XGROUP DELCONSUMER, which removes tracking records and has different recovery implications.",
+    "The trace retains the payload. If trimming or XDEL removes it, XAUTOCLAIM clears that PEL record and returns its ID in the third reply element; it cannot recover the missing payload.",
+    "XAUTOCLAIM can return fewer entries than COUNT and requires cursor iteration for a larger PEL. Reaching cursor 0-0 ends a scan; later calls can find entries that have since become idle enough.",
+    "A claim changes a bookkeeping owner, not an execution fence. XACK has no consumer argument or owner check; a resumed old consumer can acknowledge by ID. Concurrent workers and deduplication design are outside this narrow trace.",
+    "No server restart is modeled. The guide makes no promise about AOF configuration, replica acknowledgement, failover or durable retention in a deployment."
+  ],
+  "map": {
+    "title": "Payload and pending delivery are different state",
+    "description": "Alice and Bob are client processes. Command handling, the retained stream entry and the group structures are inside one Valkey process. Arrows to the two stores denote local access, not network messages.",
+    "width": 1100,
+    "height": 500,
+    "nodes": [
+      {
+        "id": "alice",
+        "label": "Alice",
+        "detail": "Original consumer process",
+        "role": "consumer",
+        "x": 30,
+        "y": 70,
+        "w": 200,
+        "h": 86
+      },
+      {
+        "id": "bob",
+        "label": "Bob",
+        "detail": "Recovery consumer process",
+        "role": "consumer",
+        "x": 30,
+        "y": 340,
+        "w": 200,
+        "h": 86
+      },
+      {
+        "id": "server",
+        "label": "Valkey commands",
+        "detail": "One server process",
+        "role": "server",
+        "x": 410,
+        "y": 205,
+        "w": 220,
+        "h": 86
+      },
+      {
+        "id": "stream",
+        "label": "Stream orders",
+        "detail": "1000-0 + retained payload",
+        "role": "payload",
+        "x": 850,
+        "y": 70,
+        "w": 220,
+        "h": 86
+      },
+      {
+        "id": "group",
+        "label": "Group workers",
+        "detail": "Cursor + shared PEL record",
+        "role": "tracking",
+        "x": 850,
+        "y": 340,
+        "w": 220,
+        "h": 86
+      }
+    ],
+    "edges": [
+      {
+        "id": "read",
+        "from": "alice",
+        "to": "server",
+        "label": "XREADGROUP >",
+        "kind": "request",
+        "via": [
+          {
+            "x": 520,
+            "y": 113
+          }
+        ]
+      },
+      {
+        "id": "read-reply",
+        "from": "server",
+        "to": "alice",
+        "label": "Entry + payload",
+        "kind": "return",
+        "via": [
+          {
+            "x": 330,
+            "y": 248
+          },
+          {
+            "x": 330,
+            "y": 180
+          },
+          {
+            "x": 130,
+            "y": 180
+          }
+        ]
+      },
+      {
+        "id": "recover",
+        "from": "bob",
+        "to": "server",
+        "label": "XAUTOCLAIM / XACK",
+        "kind": "request",
+        "via": [
+          {
+            "x": 330,
+            "y": 383
+          },
+          {
+            "x": 330,
+            "y": 300
+          },
+          {
+            "x": 520,
+            "y": 300
+          }
+        ]
+      },
+      {
+        "id": "recover-reply",
+        "from": "server",
+        "to": "bob",
+        "label": "Claim reply / ACK count",
+        "kind": "return",
+        "via": [
+          {
+            "x": 680,
+            "y": 330
+          },
+          {
+            "x": 680,
+            "y": 465
+          },
+          {
+            "x": 400,
+            "y": 465
+          },
+          {
+            "x": 130,
+            "y": 465
+          }
+        ]
+      },
+      {
+        "id": "payload",
+        "from": "stream",
+        "to": "server",
+        "label": "Read payload locally",
+        "kind": "data",
+        "via": [
+          {
+            "x": 740,
+            "y": 113
+          },
+          {
+            "x": 740,
+            "y": 248
+          }
+        ]
+      },
+      {
+        "id": "track",
+        "from": "server",
+        "to": "group",
+        "label": "Mutate PEL locally",
+        "kind": "data",
+        "via": [
+          {
+            "x": 750,
+            "y": 248
+          },
+          {
+            "x": 750,
+            "y": 383
+          }
+        ]
+      }
+    ],
+    "lenses": [
+      {
+        "id": "state",
+        "label": "State owners",
+        "title": "One entry, two kinds of server state",
+        "body": "The stream keeps the payload. The group cursor and shared pending record track delivery. A PEL entry is not a second payload copy.",
+        "nodes": [
+          "server",
+          "stream",
+          "group"
+        ],
+        "edges": [],
+        "claims": [
+          "ownership",
+          "delivery"
+        ]
+      },
+      {
+        "id": "deliver",
+        "label": "Delivery",
+        "title": "Alice receives new work",
+        "body": "A normal > read returns a retained entry and adds pending bookkeeping. The cursor can move forward while this entry remains unacknowledged.",
+        "nodes": [
+          "alice",
+          "server",
+          "stream",
+          "group"
+        ],
+        "edges": [
+          "read",
+          "read-reply",
+          "payload",
+          "track"
+        ],
+        "claims": [
+          "new-read",
+          "delivery"
+        ]
+      },
+      {
+        "id": "recover",
+        "label": "Recovery",
+        "title": "Bob explicitly takes pending work",
+        "body": "An application calls XAUTOCLAIM after the entry is idle enough. Server bookkeeping moves to Bob; its response contains the payload. XACK later removes the pending record.",
+        "nodes": [
+          "bob",
+          "server",
+          "stream",
+          "group"
+        ],
+        "edges": [
+          "recover",
+          "recover-reply",
+          "payload",
+          "track"
+        ],
+        "claims": [
+          "reclaim",
+          "reply",
+          "acknowledge"
+        ]
+      }
+    ],
+    "intents": [
+      {
+        "id": "try-new",
+        "label": "Try Bob’s > read",
+        "title": "New work is not Alice’s pending history",
+        "body": "In this fixed one-entry stream, the group cursor is already 1000-0. Bob requesting > gets no new entry; choosing a different consumer name does not transfer Alice’s PEL.",
+        "nodes": [
+          "bob",
+          "server",
+          "group"
+        ],
+        "edges": [],
+        "claims": [
+          "new-read"
+        ]
+      },
+      {
+        "id": "finish",
+        "label": "Finish recovery",
+        "title": "Work first, then acknowledge",
+        "body": "The claim reply gives Bob the payload. After business work succeeds, XACK orders workers 1000-0 removes the pending record from both PEL indexes, then returns 1. The stream payload remains.",
+        "nodes": [
+          "bob",
+          "server",
+          "stream",
+          "group"
+        ],
+        "edges": [
+          "recover",
+          "recover-reply",
+          "track"
+        ],
+        "claims": [
+          "reply",
+          "acknowledge",
+          "duplicates"
+        ]
+      }
+    ]
+  },
+  "walkthrough": {
+    "title": "Recover 1000-0 after Alice stops",
+    "intro": "One retained entry, one vanished consumer, one explicit recovery. Each selection contains a complete relevant post-step snapshot.",
+    "steps": [
+      {
+        "id": "read",
+        "title": "Alice asks for new work",
+        "body": "XREADGROUP GROUP workers Alice COUNT 1 STREAMS orders >. Start from group last_id=0-0; entry 1000-0 is eligible.",
+        "why": "A consumer group must already exist. The > cursor uses group delivery progress, not acknowledgement progress.",
+        "boundary": "Alice → Valkey request.",
+        "nodes": [
+          "alice",
+          "server",
+          "stream",
+          "group"
+        ],
+        "edges": [
+          "read"
+        ],
+        "claims": [
+          "new-read"
+        ],
+        "state": [
+          {
+            "owner": "Stream orders",
+            "detail": "Entry 1000-0 and its payload remain in the stream."
+          },
+          {
+            "owner": "Group workers (inside Valkey)",
+            "detail": "last_id=0-0; group PEL empty; registered Alice PEL empty; registered Bob PEL empty."
+          },
+          {
+            "owner": "Alice",
+            "detail": "Ready; no local entry."
+          },
+          {
+            "owner": "Bob",
+            "detail": "Ready; no local entry."
+          },
+          {
+            "owner": "External business effect",
+            "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+          }
+        ]
+      },
+      {
+        "id": "delivered",
+        "title": "Valkey returns the pending entry",
+        "body": "Return entry 1000-0 and its payload to Alice. The delivery path advances last_id and creates one shared pending record referenced by group and Alice PELs.",
+        "why": "Receiving a payload is separate from successfully applying its business effect.",
+        "boundary": "Local Valkey bookkeeping, then Valkey → Alice reply.",
+        "nodes": [
+          "alice",
+          "server",
+          "stream",
+          "group"
+        ],
+        "edges": [
+          "read-reply",
+          "payload",
+          "track"
+        ],
+        "claims": [
+          "delivery",
+          "ownership"
+        ],
+        "state": [
+          {
+            "owner": "Stream orders",
+            "detail": "Entry 1000-0 and its payload remain in the stream."
+          },
+          {
+            "owner": "Group workers (inside Valkey)",
+            "detail": "last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1."
+          },
+          {
+            "owner": "Alice",
+            "detail": "Has payload for 1000-0."
+          },
+          {
+            "owner": "Bob",
+            "detail": "Ready; no local entry."
+          },
+          {
+            "owner": "External business effect",
+            "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+          }
+        ]
+      },
+      {
+        "id": "gone",
+        "title": "Alice disappears before work",
+        "body": "Alice stops without doing the business work or issuing XACK. We advance the illustration until this entry’s delivery idle reaches the application’s chosen threshold.",
+        "why": "Valkey still records pending work for Alice. No automatic network failure notification or reassignment is implied.",
+        "boundary": "Local process stop and elapsed time; no network message.",
+        "nodes": [
+          "alice",
+          "group"
+        ],
+        "edges": [],
+        "claims": [
+          "pending-after-crash",
+          "reclaim"
+        ],
+        "state": [
+          {
+            "owner": "Stream orders",
+            "detail": "Entry 1000-0 and its payload remain in the stream."
+          },
+          {
+            "owner": "Group workers (inside Valkey)",
+            "detail": "last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold."
+          },
+          {
+            "owner": "Alice",
+            "detail": "Process gone; its server-side consumer record and PEL remain."
+          },
+          {
+            "owner": "Bob",
+            "detail": "Ready; no local entry."
+          },
+          {
+            "owner": "External business effect",
+            "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+          }
+        ]
+      },
+      {
+        "id": "claim",
+        "title": "Bob claims and receives the entry",
+        "body": "XAUTOCLAIM orders workers Bob 60000 0-0 COUNT 1. With entry idle >= 60000 ms, transfer the pending owner to Bob and return [0-0, [1000-0 plus payload], []].",
+        "why": "The command resets entry idle and increments deliveries to 2. Its cursor ends this one-entry scan, not the business work.",
+        "boundary": "Bob → Valkey command; local transfer; Valkey → Bob reply.",
+        "nodes": [
+          "bob",
+          "server",
+          "stream",
+          "group"
+        ],
+        "edges": [
+          "recover",
+          "recover-reply",
+          "payload",
+          "track"
+        ],
+        "claims": [
+          "reclaim",
+          "reply"
+        ],
+        "state": [
+          {
+            "owner": "Stream orders",
+            "detail": "Entry 1000-0 and its payload remain in the stream."
+          },
+          {
+            "owner": "Group workers (inside Valkey)",
+            "detail": "last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2; entry idle reset."
+          },
+          {
+            "owner": "Alice",
+            "detail": "Process gone."
+          },
+          {
+            "owner": "Bob",
+            "detail": "Has payload for 1000-0; owns its pending delivery."
+          },
+          {
+            "owner": "External business effect",
+            "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+          }
+        ]
+      },
+      {
+        "id": "work",
+        "title": "Bob applies the business effect",
+        "body": "Bob uses the returned payload and completes the application’s external work. The PEL still points to Bob.",
+        "why": "Valkey cannot infer success from the claim reply. The application must decide when work is complete.",
+        "boundary": "Application work outside Valkey; no stream command at this step.",
+        "nodes": [
+          "bob",
+          "group"
+        ],
+        "edges": [],
+        "claims": [
+          "duplicates",
+          "acknowledge"
+        ],
+        "state": [
+          {
+            "owner": "Stream orders",
+            "detail": "Entry 1000-0 and its payload remain in the stream."
+          },
+          {
+            "owner": "Group workers (inside Valkey)",
+            "detail": "last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2."
+          },
+          {
+            "owner": "Alice",
+            "detail": "Process gone."
+          },
+          {
+            "owner": "Bob",
+            "detail": "Business work returned successfully; XACK still needed."
+          },
+          {
+            "owner": "External business effect",
+            "detail": "Applied 1 time. This count is an illustrative application fact, not a Valkey field."
+          }
+        ]
+      },
+      {
+        "id": "ack",
+        "title": "Bob acknowledges; Valkey returns 1",
+        "body": "Bob sends XACK orders workers 1000-0. Valkey deletes both PEL references, frees the pending record and returns integer 1. The retained stream entry is unchanged.",
+        "why": "The integer counts pending records removed. It is not a transaction over Bob’s external business effect.",
+        "boundary": "Bob → Valkey XACK; local removal; Valkey → Bob integer reply.",
+        "nodes": [
+          "bob",
+          "server",
+          "stream",
+          "group"
+        ],
+        "edges": [
+          "recover",
+          "recover-reply",
+          "track"
+        ],
+        "claims": [
+          "acknowledge"
+        ],
+        "state": [
+          {
+            "owner": "Stream orders",
+            "detail": "Entry 1000-0 and its payload remain in the stream."
+          },
+          {
+            "owner": "Group workers (inside Valkey)",
+            "detail": "last_id=1000-0; group PEL empty; Alice PEL empty; Bob PEL empty; pending record freed."
+          },
+          {
+            "owner": "Alice",
+            "detail": "Process gone."
+          },
+          {
+            "owner": "Bob",
+            "detail": "Has received integer 1 from XACK."
+          },
+          {
+            "owner": "External business effect",
+            "detail": "Applied 1 time. This count is an illustrative application fact, not a Valkey field."
+          }
+        ]
+      }
+    ]
+  },
+  "sequence": {
+    "title": "The same pending state can hide different work",
+    "intro": "Source-derived illustrative interleavings. Only Alice, Valkey and Bob are network actors. Self-loops describe local process events; external work is summarized as an application fact.",
+    "lanes": [
+      {
+        "id": "alice",
+        "label": "Alice",
+        "role": "consumer"
+      },
+      {
+        "id": "valkey",
+        "label": "Valkey",
+        "role": "server"
+      },
+      {
+        "id": "bob",
+        "label": "Bob",
+        "role": "consumer"
+      }
+    ],
+    "scenarios": [
+      {
+        "id": "normal-completion",
+        "label": "Normal completion",
+        "summary": "Alice receives the entry, completes its business work and acknowledges it. Bob remains idle; no claim or recovery is needed.",
+        "assumptions": [
+          "Source-derived illustration; a chosen sequential interleaving, not telemetry.",
+          "Alice and Bob were already registered with XGROUP CREATECONSUMER and start with empty consumer PELs.",
+          "Entry 1000-0 remains retained; Valkey and Alice keep running; no competing reads, claims or acknowledgements.",
+          "External work succeeds once as an explicit application fact. Alice then sends XACK and receives its reply; NOACK is absent."
+        ],
+        "events": [
+          {
+            "id": "read",
+            "to": "valkey",
+            "label": "XREADGROUP >",
+            "kind": "request",
+            "body": "Full command: XREADGROUP GROUP workers Alice COUNT 1 STREAMS orders >. It requests the single new entry.",
+            "claims": [
+              "new-read"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=0-0; group PEL empty; registered Alice PEL empty; registered Bob PEL empty."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "alice"
+          },
+          {
+            "id": "delivery",
+            "to": "alice",
+            "label": "1000-0 + payload",
+            "kind": "return",
+            "body": "Advance group last_id; add a pending record owned by Alice with delivery count 1; return the entry ID and fields.",
+            "claims": [
+              "delivery",
+              "ownership"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Has payload for 1000-0."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "valkey"
+          },
+          {
+            "id": "effect",
+            "to": "alice",
+            "label": "Apply external effect",
+            "kind": "control",
+            "body": "Alice processes the returned payload and the business work succeeds once, as assumed. Valkey still holds the pending record; it has not received XACK.",
+            "claims": [
+              "acknowledge"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Business work returned successfully; XACK still needed."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 1 time. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "alice"
+          },
+          {
+            "id": "ack",
+            "to": "valkey",
+            "label": "XACK orders workers 1000-0",
+            "kind": "request",
+            "body": "After the business work succeeds, Alice sends the acknowledgement. Bob remains idle.",
+            "claims": [
+              "acknowledge"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Business work returned successfully; XACK still needed."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 1 time. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "alice"
+          },
+          {
+            "id": "acked",
+            "to": "alice",
+            "label": "Integer 1",
+            "kind": "return",
+            "body": "Remove the group and Alice PEL references and free the pending record. Return integer 1 to Alice. The stream payload remains; no recovery occurred.",
+            "claims": [
+              "acknowledge"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL empty; Alice PEL empty; Bob PEL empty; pending record freed."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Has received integer 1 from XACK."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 1 time. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "valkey"
+          }
+        ]
+      },
+      {
+        "id": "crash-before-work",
+        "label": "Crash before work",
+        "summary": "Alice stops before work. Bob explicitly recovers her retained pending entry, performs the work and acknowledges.",
+        "assumptions": [
+          "Source-derived illustration; a chosen sequential interleaving, not telemetry.",
+          "Alice and Bob were already registered with XGROUP CREATECONSUMER and start with empty consumer PELs.",
+          "Entry 1000-0 remains retained; Valkey keeps running; no competing reads, claims or acknowledgements.",
+          "The application schedules Bob’s claim when this entry’s idle reaches 60000 ms. No JUSTID or NOACK.",
+          "External work is non-idempotent and succeeds whenever shown; there is no atomic transaction joining it with XACK."
+        ],
+        "events": [
+          {
+            "id": "read",
+            "to": "valkey",
+            "label": "XREADGROUP >",
+            "kind": "request",
+            "body": "Full command: XREADGROUP GROUP workers Alice COUNT 1 STREAMS orders >. It requests the single new entry.",
+            "claims": [
+              "new-read"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=0-0; group PEL empty; registered Alice PEL empty; registered Bob PEL empty."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "alice"
+          },
+          {
+            "id": "delivery",
+            "to": "alice",
+            "label": "1000-0 + payload",
+            "kind": "return",
+            "body": "Advance group last_id; add a pending record owned by Alice; return its ID and fields.",
+            "claims": [
+              "delivery",
+              "ownership"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Has payload for 1000-0."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "valkey"
+          },
+          {
+            "id": "stop",
+            "to": "alice",
+            "label": "Stop before work",
+            "kind": "control",
+            "body": "Alice stops before applying the external effect and before XACK. The server-side pending record remains. The illustration continues until the entry is idle enough for the chosen claim threshold.",
+            "claims": [
+              "duplicates",
+              "pending-after-crash"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Process gone; its server-side consumer record and PEL remain."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "alice"
+          },
+          {
+            "id": "claim",
+            "to": "valkey",
+            "label": "XAUTOCLAIM, idle ≥ 60000",
+            "kind": "request",
+            "body": "Application waits until this entry is idle enough and calls XAUTOCLAIM orders workers Bob 60000 0-0 COUNT 1. There is no server-initiated recovery call.",
+            "claims": [
+              "reclaim"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Process gone; its server-side consumer record and PEL remain."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "bob"
+          },
+          {
+            "id": "claimed",
+            "to": "bob",
+            "label": "[0-0, entry, []]",
+            "kind": "return",
+            "body": "Transfer the shared pending record to Bob, reset idle, increment delivery count to 2 and return retained entry 1000-0 plus its payload. The empty third array means no deleted IDs were encountered.",
+            "claims": [
+              "reclaim",
+              "reply"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2; entry idle reset."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Process gone."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Has payload for 1000-0; owns its pending delivery."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "valkey"
+          },
+          {
+            "id": "effect",
+            "to": "bob",
+            "label": "Apply external effect",
+            "kind": "control",
+            "body": "Bob processes the claimed payload. The external effect has now succeeded once; Valkey still has a pending record.",
+            "claims": [
+              "duplicates",
+              "acknowledge"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Process gone."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Business work returned successfully; XACK still needed."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 1 time. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "bob"
+          },
+          {
+            "id": "ack",
+            "to": "valkey",
+            "label": "XACK orders workers 1000-0",
+            "kind": "request",
+            "body": "Bob sends the acknowledgement after its business work succeeds.",
+            "claims": [
+              "acknowledge"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Process gone."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Business work returned successfully; XACK still needed."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 1 time. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "bob"
+          },
+          {
+            "id": "acked",
+            "to": "bob",
+            "label": "Integer 1",
+            "kind": "return",
+            "body": "Remove the group and Bob PEL references and free the pending record. Return the number removed. The stream entry remains; the external effect count is not part of this reply.",
+            "claims": [
+              "acknowledge",
+              "duplicates"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL empty; Alice PEL empty; Bob PEL empty; pending record freed."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Process gone."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Has received integer 1 from XACK."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 1 time. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "valkey"
+          }
+        ]
+      },
+      {
+        "id": "effect-before-ack",
+        "label": "Effect succeeded; ACK absent",
+        "summary": "Alice’s business effect succeeds but her XACK never reaches Valkey. Bob’s normal recovery can repeat the effect.",
+        "assumptions": [
+          "Source-derived illustration; a chosen sequential interleaving, not telemetry.",
+          "Alice and Bob were already registered with XGROUP CREATECONSUMER and start with empty consumer PELs.",
+          "Entry 1000-0 remains retained; Valkey keeps running; no competing reads, claims or acknowledgements.",
+          "The application schedules Bob’s claim when this entry’s idle reaches 60000 ms. No JUSTID or NOACK.",
+          "External work is non-idempotent and succeeds whenever shown; there is no atomic transaction joining it with XACK."
+        ],
+        "events": [
+          {
+            "id": "read",
+            "to": "valkey",
+            "label": "XREADGROUP >",
+            "kind": "request",
+            "body": "Full command: XREADGROUP GROUP workers Alice COUNT 1 STREAMS orders >. It requests the single new entry.",
+            "claims": [
+              "new-read"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=0-0; group PEL empty; registered Alice PEL empty; registered Bob PEL empty."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "alice"
+          },
+          {
+            "id": "delivery",
+            "to": "alice",
+            "label": "1000-0 + payload",
+            "kind": "return",
+            "body": "Advance group last_id; add a pending record owned by Alice; return its ID and fields.",
+            "claims": [
+              "delivery",
+              "ownership"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Has payload for 1000-0."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 0 times. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "valkey"
+          },
+          {
+            "id": "stop",
+            "to": "alice",
+            "label": "Effect succeeds; then stop",
+            "kind": "control",
+            "body": "Alice applies a non-idempotent external effect, then stops before XACK. The external count is an explicit scenario assumption. The illustration continues until the entry is idle enough for the chosen claim threshold.",
+            "claims": [
+              "duplicates",
+              "pending-after-crash"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Process gone; its server-side consumer record and PEL remain."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 1 time. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "alice"
+          },
+          {
+            "id": "claim",
+            "to": "valkey",
+            "label": "XAUTOCLAIM, idle ≥ 60000",
+            "kind": "request",
+            "body": "Application waits until this entry is idle enough and calls XAUTOCLAIM orders workers Bob 60000 0-0 COUNT 1. There is no server-initiated recovery call.",
+            "claims": [
+              "reclaim"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Process gone; its server-side consumer record and PEL remain."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Ready; no local entry."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 1 time. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "bob"
+          },
+          {
+            "id": "claimed",
+            "to": "bob",
+            "label": "[0-0, entry, []]",
+            "kind": "return",
+            "body": "Transfer the shared pending record to Bob, reset idle, increment delivery count to 2 and return retained entry 1000-0 plus its payload. The empty third array means no deleted IDs were encountered.",
+            "claims": [
+              "reclaim",
+              "reply"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2; entry idle reset."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Process gone."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Has payload for 1000-0; owns its pending delivery."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 1 time. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "valkey"
+          },
+          {
+            "id": "effect",
+            "to": "bob",
+            "label": "Apply external effect",
+            "kind": "control",
+            "body": "Bob processes the claimed payload. The non-idempotent effect is now repeated; Valkey could not distinguish the earlier success from no work.",
+            "claims": [
+              "duplicates",
+              "acknowledge"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Process gone."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Business work returned successfully; XACK still needed."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 2 times. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "bob"
+          },
+          {
+            "id": "ack",
+            "to": "valkey",
+            "label": "XACK orders workers 1000-0",
+            "kind": "request",
+            "body": "Bob sends the acknowledgement after its business work succeeds.",
+            "claims": [
+              "acknowledge"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Process gone."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Business work returned successfully; XACK still needed."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 2 times. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "bob"
+          },
+          {
+            "id": "acked",
+            "to": "bob",
+            "label": "Integer 1",
+            "kind": "return",
+            "body": "Remove the group and Bob PEL references and free the pending record. Return the number removed. The stream entry remains; the external effect count is not part of this reply.",
+            "claims": [
+              "acknowledge",
+              "duplicates"
+            ],
+            "state": [
+              {
+                "owner": "Stream orders",
+                "detail": "Entry 1000-0 and its payload remain in the stream."
+              },
+              {
+                "owner": "Group workers (inside Valkey)",
+                "detail": "last_id=1000-0; group PEL empty; Alice PEL empty; Bob PEL empty; pending record freed."
+              },
+              {
+                "owner": "Alice",
+                "detail": "Process gone."
+              },
+              {
+                "owner": "Bob",
+                "detail": "Has received integer 1 from XACK."
+              },
+              {
+                "owner": "External business effect",
+                "detail": "Applied 2 times. This count is an illustrative application fact, not a Valkey field."
+              }
+            ],
+            "from": "valkey"
+          }
+        ]
+      }
+    ]
+  }
+}

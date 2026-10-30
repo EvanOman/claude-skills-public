@@ -1,0 +1,604 @@
+<!doctype html>
+<!-- System Walkthrough runtime and newly authored content. Third-party sources retain their own terms.
+MIT License
+
+Copyright (c) 2026 Evan Oman
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="Valkey Streams: separate delivery, business work and acknowledgement before recovering one entry."><meta name="color-scheme" content="dark light"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:"><title>An absent consumer leaves pending work · System Walkthroughs</title><script>/* Apply the preference before first paint; blocked storage must not block reading. */
+(function () {
+  try {
+    var theme = localStorage.getItem('system-walkthrough-theme');
+    if (theme === 'light') document.documentElement.dataset.swTheme = 'light';
+  } catch (_) { /* The default remains dark. */ }
+})();
+</script><style>html{background:var(--sw-bg,#101719);color:var(--sw-ink,#eaf0ec)}body{margin:0}/* System Walkthrough — all component selectors are scoped to .sw. */
+:root {
+  color-scheme: dark;
+  --sw-bg:#10171b; --sw-panel:#182226; --sw-panel-alt:#1b292e;
+  --sw-ink:#edf2ef; --sw-muted:#b0c2c8; --sw-border:#43565e;
+  --sw-teal:#7bddc8; --sw-blue:#8dbaff; --sw-amber:#edc47c;
+  --sw-violet:#c6a8ff; --sw-rose:#f4a4aa; --sw-slate:#b7c9d0;
+  --sw-shadow:0 18px 42px #0002;
+}
+:root[data-sw-theme="light"] {
+  color-scheme:light;
+  --sw-bg:#f6f5ef; --sw-panel:#fffefa; --sw-panel-alt:#ecefe9;
+  --sw-ink:#152c32; --sw-muted:#435d66; --sw-border:#a0b2b6;
+  --sw-teal:#146958; --sw-blue:#275eae; --sw-amber:#805209;
+  --sw-violet:#6e42a5; --sw-rose:#a43e4c; --sw-slate:#48636c;
+  --sw-shadow:0 18px 42px #213c3210;
+}
+.sw { max-width:1480px; margin:0 auto; padding:42px clamp(18px,3.5vw,54px) 30px; color:var(--sw-ink); font:16px/1.65 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; overflow-wrap:anywhere; }
+.sw-site-nav { max-width:1480px; margin:0 auto; padding:18px clamp(18px,3.5vw,54px) 0; display:flex; flex-wrap:wrap; gap:18px; font:12px/1.6 system-ui,sans-serif; }
+.sw-site-nav a { color:var(--sw-muted); text-underline-offset:4px; }
+.sw-site-nav a:focus-visible { outline:3px solid var(--sw-amber); outline-offset:4px; }
+.sw *, .sw *::before, .sw *::after { box-sizing:border-box; }
+.sw h1,.sw h2,.sw h3,.sw h4,.sw p { margin-top:0; }
+.sw h1,.sw h2 { font-family:Georgia,"Times New Roman",serif; font-weight:600; letter-spacing:-.025em; line-height:1.12; text-wrap:balance; }
+.sw h1 { font-size:clamp(44px,6vw,82px); max-width:1100px; margin:30px 0 22px; }
+.sw h2 { font-size:clamp(30px,3.4vw,48px); margin-bottom:18px; }
+.sw h3 { font-size:22px; line-height:1.35; margin-bottom:14px; }
+.sw h4 { font-size:14px; letter-spacing:.035em; line-height:1.5; margin:22px 0 7px; }
+.sw p { margin-bottom:16px; }
+.sw a { color:var(--sw-teal); text-underline-offset:4px; text-decoration-thickness:1px; }
+.sw a:hover { text-decoration-thickness:2px; }
+.sw button { min-height:43px; border:1px solid var(--sw-border); border-radius:7px; padding:9px 14px; background:var(--sw-panel); color:var(--sw-ink); font:inherit; font-size:14px; line-height:1.4; cursor:pointer; text-align:left; }
+.sw button:hover { background:var(--sw-panel-alt); border-color:var(--sw-teal); }
+.sw button[aria-pressed="true"],.sw button[aria-current="step"] { border-color:var(--sw-teal); background:color-mix(in srgb,var(--sw-teal) 12%,var(--sw-panel)); box-shadow:inset 3px 0 0 var(--sw-teal); }
+.sw button:disabled { opacity:.5; cursor:default; }
+.sw :focus-visible { outline:3px solid var(--sw-amber); outline-offset:4px; }
+.sw code { font:13px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; color:var(--sw-muted); }
+.sw .sw-kicker { font:600 11px/1.5 system-ui,sans-serif; letter-spacing:.16em; color:var(--sw-muted); margin-bottom:12px; }
+.sw-topline { display:flex; align-items:center; justify-content:space-between; gap:18px; }
+.sw-topline .sw-kicker { margin-bottom:0; }
+.sw .sw-theme { flex-shrink:0; min-height:38px; border-radius:25px; font-size:12px; }
+.sw .sw-subtitle { font:24px/1.5 Georgia,serif; max-width:940px; color:var(--sw-muted); }
+.sw .sw-question { max-width:900px; margin:30px 0 22px; font-size:18px; color:var(--sw-ink); }
+.sw-snapshot { display:flex; align-items:center; gap:14px; flex-wrap:wrap; font-size:12px; }
+.sw .sw-scope { max-width:990px; color:var(--sw-muted); font-size:14px; border-left:2px solid var(--sw-border); padding-left:18px; margin:22px 0 28px; }
+.sw-nav { display:flex; flex-wrap:wrap; gap:12px 25px; padding:18px 0; border-top:1px solid var(--sw-border); border-bottom:1px solid var(--sw-border); font-size:13px; }
+.sw-takeaways { list-style:none; padding:0; display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr)); gap:24px; counter-reset:takeaways; margin:38px 0 0; }
+.sw-takeaways>li { border-top:2px solid var(--sw-teal); padding:18px 0 0; counter-increment:takeaways; }
+.sw-takeaways>li::before { content:"0" counter(takeaways); display:block; color:var(--sw-teal); font:26px/1 Georgia,serif; margin-bottom:15px; }
+.sw-takeaways p { font-size:16px; }
+.sw-section { margin-top:80px; padding-top:32px; border-top:1px solid var(--sw-border); scroll-margin-top:25px; min-width:0; }
+.sw-section-heading { max-width:990px; margin-bottom:28px; }
+.sw .sw-section-intro { color:var(--sw-muted); font-size:17px; }
+.sw-controls { display:flex; flex-wrap:wrap; gap:8px; margin:0 0 15px; min-width:0; }
+.sw-controls button { font-size:13px; }
+.sw-intents { align-items:center; padding:10px 0 6px; }
+.sw-control-label { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--sw-muted); margin-right:8px; }
+.sw-legend { padding:0; margin:18px 0 20px; display:flex; gap:12px 24px; flex-wrap:wrap; list-style:none; color:var(--sw-muted); font-size:12px; }
+.sw-legend li { display:flex; align-items:center; gap:7px; }
+.sw [data-color="teal"] { --sw-role:var(--sw-teal); }
+.sw [data-color="blue"] { --sw-role:var(--sw-blue); }
+.sw [data-color="amber"] { --sw-role:var(--sw-amber); }
+.sw [data-color="violet"] { --sw-role:var(--sw-violet); }
+.sw [data-color="rose"] { --sw-role:var(--sw-rose); }
+.sw [data-color="slate"] { --sw-role:var(--sw-slate); }
+.sw-dot { width:8px; height:8px; border-radius:50%; background:var(--sw-role); flex-shrink:0; }
+.sw-map-layout { display:flex; flex-wrap:wrap; gap:22px; }
+.sw-map-layout>.sw-diagram-shell { flex:10 1 var(--sw-map-width); }
+.sw-map-layout>.sw-inspector-host { flex:1 1 300px; }
+.sw-diagram-shell { border:1px solid var(--sw-border); border-radius:11px; background:var(--sw-panel); min-width:0; overflow:hidden; box-shadow:var(--sw-shadow); align-self:start; }
+.sw .sw-scroll-hint { padding:10px 15px; background:var(--sw-panel-alt); margin:0; font-size:11px; color:var(--sw-muted); border-bottom:1px solid var(--sw-border); }
+.sw-viewport { max-width:100%; overflow:auto; overscroll-behavior-inline:contain; scrollbar-color:var(--sw-border) var(--sw-panel); }
+.sw-diagram { display:block; width:100%; min-width:var(--sw-diagram-width); height:auto; }
+.sw-diagram text { font-family:system-ui,sans-serif; fill:var(--sw-ink); }
+.sw-map-node rect { fill:var(--sw-panel); stroke:var(--sw-role); stroke-width:1.25; }
+.sw-map-node[data-active="true"] rect { fill:color-mix(in srgb,var(--sw-role) 12%,var(--sw-panel)); stroke-width:2.5; }
+.sw-map-node[data-active="false"] rect { stroke-opacity:.45; }
+.sw-map-node[data-active="false"] .sw-node-label { fill:var(--sw-muted); }
+.sw-node-label { font-size:16px; font-weight:600; }
+.sw-node-detail { font-size:14px; fill:var(--sw-muted)!important; }
+.sw-map-edge polyline { fill:none; stroke:var(--sw-role); stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+.sw-map-edge[data-active="false"] polyline { opacity:.42; }
+.sw-map-edge[data-active="false"] .sw-edge-label { fill:var(--sw-muted); }
+.sw-map-edge[data-active="true"] polyline { stroke-width:3; }
+.sw [data-kind="return"] polyline,.sw [data-kind="return"] .sw-message { stroke-dasharray:7 5; }
+.sw [data-kind="control"] polyline,.sw [data-kind="control"] .sw-message { stroke-dasharray:3 4; }
+.sw-edge-label { font-size:14px; font-weight:500; paint-order:stroke; stroke:var(--sw-panel); stroke-width:5px; stroke-linejoin:round; }
+.sw-inspector-host { min-width:0; }
+.sw-inspector { border:1px solid var(--sw-border); border-radius:11px; background:var(--sw-panel); padding:25px; min-width:0; }
+.sw-inspector p { color:var(--sw-muted); font-size:15px; }
+.sw-inspector .sw-kicker { color:var(--sw-teal); font-size:10px; }
+.sw .sw-boundary { border-top:1px solid var(--sw-border); border-bottom:1px solid var(--sw-border); padding:12px 0; font-size:13px; }
+.sw-boundary strong { color:var(--sw-ink); }
+.sw-state { margin:0; }
+.sw-state>div { padding:10px 0; border-bottom:1px solid var(--sw-border); }
+.sw-state>div:last-child { border-bottom:0; }
+.sw-state dt { color:var(--sw-amber); font:600 12px/1.5 system-ui,sans-serif; }
+.sw-state dd { margin:5px 0 0; font-size:13px; line-height:1.6; color:var(--sw-muted); }
+.sw-state-panel { margin-top:18px; }
+.sw-state-panel h4 { margin-top:10px; }
+.sw-step-navigation { display:flex; align-items:center; justify-content:space-between; gap:16px; max-width:520px; margin:24px auto; }
+.sw-position { color:var(--sw-muted); font:13px/1.5 ui-monospace,monospace; white-space:nowrap; }
+.sw-walk-layout { display:grid; grid-template-columns:280px minmax(0,1fr); gap:22px; align-items:start; }
+.sw-step-list { padding:0; margin:0; list-style:none; display:grid; gap:7px; }
+.sw-step-list button { width:100%; font-size:13px; min-height:45px; }
+.sw-evidence { font-size:12px; margin-top:16px; }
+.sw summary { cursor:pointer; color:var(--sw-teal); }
+.sw-evidence-list { padding-left:18px; margin-top:16px; }
+.sw-evidence-list li { margin:0 0 18px; }
+.sw-evidence-list p { font-size:12px; margin:4px 0 6px; }
+.sw-claim-kind { display:inline-block; font-size:10px; text-transform:uppercase; letter-spacing:.06em; color:var(--sw-amber); }
+.sw-source-links { display:flex; flex-wrap:wrap; gap:7px 14px; font-size:12px; }
+.sw-source-links a { max-width:100%; }
+.sw-text-alternative { margin-top:24px; border-top:1px solid var(--sw-border); border-bottom:1px solid var(--sw-border); padding:15px 0; font-size:13px; }
+.sw-text-body { max-width:960px; padding:20px 0 8px; }
+.sw-text-body article { border-top:1px solid var(--sw-border); padding-top:18px; margin-top:25px; }
+.sw-text-body h3 { font-size:19px; }
+.sw-text-body p { font-size:14px; }
+.sw-scenario-summary { background:var(--sw-panel); border-left:3px solid var(--sw-teal); padding:20px 24px; margin:20px 0; }
+.sw-scenario-summary p { margin-bottom:10px; font-size:15px; }
+.sw-assumptions { padding-left:18px; margin:12px 0 0; color:var(--sw-muted); font-size:12px; }
+.sw-sequence-viewport { max-height:575px; }
+.sw-sequence-sticky { position:sticky; top:0; height:0; z-index:2; pointer-events:none; }
+.sw [data-sequence-header] { background:var(--sw-panel); box-shadow:0 1px 0 var(--sw-border); }
+.sw-lifeline { stroke:var(--sw-border); stroke-width:1.25; stroke-dasharray:4 5; }
+.sw-lane-box { fill:var(--sw-panel-alt); stroke:var(--sw-role); stroke-width:1.25; }
+.sw-lane-label { font-size:14px; font-weight:600; }
+.sw-sequence-row { fill:transparent; }
+.sw-sequence-event[data-active="true"] .sw-sequence-row { fill:color-mix(in srgb,var(--sw-role) 8%,transparent); stroke:var(--sw-role); stroke-width:.7; }
+.sw-message { stroke:var(--sw-role); stroke-width:2; fill:none; }
+.sw-sequence-event[data-active="true"] .sw-message { stroke-width:3; }
+.sw-sequence-event[data-active="false"] .sw-message { opacity:.48; }
+.sw-sequence-event[data-active="false"] .sw-edge-label { fill:var(--sw-muted); }
+.sw-row-number { font-size:12px; fill:var(--sw-muted)!important; }
+.sw-source-catalog { padding-left:22px; max-width:1000px; }
+.sw-source-catalog li { padding-left:5px; margin-bottom:16px; font-size:14px; }
+.sw-source-catalog p { color:var(--sw-muted); font-size:12px; margin-top:6px; }
+.sw-footer { margin-top:65px; border-top:1px solid var(--sw-border); padding-top:22px; color:var(--sw-muted); font-size:12px; }
+.sw-footer p { max-width:850px; }
+@media(max-width:760px) {
+  .sw { padding-top:24px; }
+  .sw h1 { margin-top:24px; }
+  .sw .sw-subtitle { font-size:21px; }
+  .sw .sw-question { font-size:16px; }
+  .sw-topline { align-items:flex-start; }
+  .sw .sw-kicker { font-size:10px; }
+  .sw-section { margin-top:52px; padding-top:26px; }
+  .sw-walk-layout { grid-template-columns:minmax(0,1fr); }
+  .sw-step-list { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .sw-step-list button { height:100%; font-size:12px; }
+  .sw-inspector { padding:20px; }
+  .sw-inspector h3 { font-size:21px; }
+  .sw-scenario-summary { padding:18px; }
+  .sw .sw-scroll-hint { font-size:10px; }
+  .sw-sequence-viewport { max-height:445px; }
+}
+@media(prefers-reduced-motion:reduce) { .sw *, .sw *::before, .sw *::after { scroll-behavior:auto!important; animation:none!important; transition:none!important; } }
+@media print {
+  :root { --sw-bg:#fff; --sw-panel:#fff; --sw-panel-alt:#f5f5f5; --sw-ink:#142b30; --sw-muted:#374e56; --sw-border:#a0b2b6; --sw-teal:#146958; --sw-blue:#275eae; --sw-amber:#805209; --sw-violet:#6e42a5; --sw-rose:#a43e4c; --sw-slate:#48636c; }
+  .sw { max-width:none; padding:0; font-size:11pt; }
+  .sw h1 { font-size:36pt; }
+  .sw h2 { font-size:24pt; }
+  .sw-section { margin-top:35pt; }
+  .sw button,.sw-controls,.sw-step-navigation,.sw-nav,.sw-step-list,.sw-scroll-hint { display:none; }
+  .sw-map-layout,.sw-walk-layout { display:block; }
+  .sw-viewport { overflow:visible; max-height:none; }
+  .sw-sequence-sticky { position:static; }
+  .sw-diagram { min-width:0; width:100%; }
+  .sw-map-node,.sw-map-edge,.sw-sequence-event { opacity:1!important; }
+  .sw-text-alternative::details-content,.sw-evidence::details-content { display:block!important; content-visibility:visible!important; }
+  .sw-inspector { box-shadow:none; margin-top:15pt; }
+  .sw-diagram-shell { box-shadow:none; }
+  .sw a { color:inherit; }
+}
+</style></head>
+<body><nav class="sw-site-nav" aria-label="Site"><a href="../">System Walkthroughs</a><a href="https://evanoman.com/">evanoman.com</a></nav><main id="walkthrough"></main><noscript><article class="sw"><h1>An absent consumer leaves pending work</h1><p>Valkey Streams: separate delivery, business work and acknowledgement before recovering one entry.</p><p>When Alice disappears, what must Bob do to finish her pending entry—and when can that repeat a business effect?</p><p>For engineers using one existing stream orders and group workers, created at 0-0. Alice and Bob were already registered with XGROUP CREATECONSUMER and begin with empty consumer PELs. One retained entry 1000-0; no NOACK, JUSTID, trimming, consumer deletion or XGROUP SETID. The Valkey process remains available. The application chooses and runs recovery. Server restart, replication durability and production settings are outside this trace.</p><h2>Payload and pending delivery are different state</h2><p>Alice and Bob are client processes. Command handling, the retained stream entry and the group structures are inside one Valkey process. Arrows to the two stores denote local access, not network messages.</p><ul><li>Alice: Original consumer process</li><li>Bob: Recovery consumer process</li><li>Valkey commands: One server process</li><li>Stream orders: 1000-0 + retained payload</li><li>Group workers: Cursor + shared PEL record</li></ul><ul><li>alice → server: XREADGROUP &gt; (request)</li><li>server → alice: Entry + payload (return)</li><li>bob → server: XAUTOCLAIM / XACK (request)</li><li>server → bob: Claim reply / ACK count (return)</li><li>stream → server: Read payload locally (data)</li><li>server → group: Mutate PEL locally (data)</li></ul><h3>One entry, two kinds of server state</h3><p>The stream keeps the payload. The group cursor and shared pending record track delivery. A PEL entry is not a second payload copy.</p><h3>Alice receives new work</h3><p>A normal &gt; read returns a retained entry and adds pending bookkeeping. The cursor can move forward while this entry remains unacknowledged.</p><h3>Bob explicitly takes pending work</h3><p>An application calls XAUTOCLAIM after the entry is idle enough. Server bookkeeping moves to Bob; its response contains the payload. XACK later removes the pending record.</p><h3>New work is not Alice’s pending history</h3><p>In this fixed one-entry stream, the group cursor is already 1000-0. Bob requesting &gt; gets no new entry; choosing a different consumer name does not transfer Alice’s PEL.</p><h3>Work first, then acknowledge</h3><p>The claim reply gives Bob the payload. After business work succeeds, XACK orders workers 1000-0 removes the pending record from both PEL indexes, then returns 1. The stream payload remains.</p><h2>Recover 1000-0 after Alice stops</h2><ol><li><h3>Alice asks for new work</h3><p>XREADGROUP GROUP workers Alice COUNT 1 STREAMS orders &gt;. Start from group last_id=0-0; entry 1000-0 is eligible.</p><p>A consumer group must already exist. The &gt; cursor uses group delivery progress, not acknowledgement progress.</p><p>Alice → Valkey request.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=0-0; group PEL empty; registered Alice PEL empty; registered Bob PEL empty.</li><li>Alice: Ready; no local entry.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li><h3>Valkey returns the pending entry</h3><p>Return entry 1000-0 and its payload to Alice. The delivery path advances last_id and creates one shared pending record referenced by group and Alice PELs.</p><p>Receiving a payload is separate from successfully applying its business effect.</p><p>Local Valkey bookkeeping, then Valkey → Alice reply.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1.</li><li>Alice: Has payload for 1000-0.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li><h3>Alice disappears before work</h3><p>Alice stops without doing the business work or issuing XACK. We advance the illustration until this entry’s delivery idle reaches the application’s chosen threshold.</p><p>Valkey still records pending work for Alice. No automatic network failure notification or reassignment is implied.</p><p>Local process stop and elapsed time; no network message.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold.</li><li>Alice: Process gone; its server-side consumer record and PEL remain.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li><h3>Bob claims and receives the entry</h3><p>XAUTOCLAIM orders workers Bob 60000 0-0 COUNT 1. With entry idle &gt;= 60000 ms, transfer the pending owner to Bob and return [0-0, [1000-0 plus payload], []].</p><p>The command resets entry idle and increments deliveries to 2. Its cursor ends this one-entry scan, not the business work.</p><p>Bob → Valkey command; local transfer; Valkey → Bob reply.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2; entry idle reset.</li><li>Alice: Process gone.</li><li>Bob: Has payload for 1000-0; owns its pending delivery.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li><h3>Bob applies the business effect</h3><p>Bob uses the returned payload and completes the application’s external work. The PEL still points to Bob.</p><p>Valkey cannot infer success from the claim reply. The application must decide when work is complete.</p><p>Application work outside Valkey; no stream command at this step.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2.</li><li>Alice: Process gone.</li><li>Bob: Business work returned successfully; XACK still needed.</li><li>External business effect: Applied 1 time. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li><h3>Bob acknowledges; Valkey returns 1</h3><p>Bob sends XACK orders workers 1000-0. Valkey deletes both PEL references, frees the pending record and returns integer 1. The retained stream entry is unchanged.</p><p>The integer counts pending records removed. It is not a transaction over Bob’s external business effect.</p><p>Bob → Valkey XACK; local removal; Valkey → Bob integer reply.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL empty; Alice PEL empty; Bob PEL empty; pending record freed.</li><li>Alice: Process gone.</li><li>Bob: Has received integer 1 from XACK.</li><li>External business effect: Applied 1 time. This count is an illustrative application fact, not a Valkey field.</li></ul></li></ol><h2>The same pending state can hide different work</h2><h3>Normal completion</h3><p>Alice receives the entry, completes its business work and acknowledges it. Bob remains idle; no claim or recovery is needed.</p><p>Source-derived illustration; a chosen sequential interleaving, not telemetry.</p><p>Alice and Bob were already registered with XGROUP CREATECONSUMER and start with empty consumer PELs.</p><p>Entry 1000-0 remains retained; Valkey and Alice keep running; no competing reads, claims or acknowledgements.</p><p>External work succeeds once as an explicit application fact. Alice then sends XACK and receives its reply; NOACK is absent.</p><ol><li>alice → valkey: XREADGROUP &gt;<p>Full command: XREADGROUP GROUP workers Alice COUNT 1 STREAMS orders &gt;. It requests the single new entry.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=0-0; group PEL empty; registered Alice PEL empty; registered Bob PEL empty.</li><li>Alice: Ready; no local entry.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>valkey → alice: 1000-0 + payload<p>Advance group last_id; add a pending record owned by Alice with delivery count 1; return the entry ID and fields.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1.</li><li>Alice: Has payload for 1000-0.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>alice → alice: Apply external effect<p>Alice processes the returned payload and the business work succeeds once, as assumed. Valkey still holds the pending record; it has not received XACK.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1.</li><li>Alice: Business work returned successfully; XACK still needed.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 1 time. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>alice → valkey: XACK orders workers 1000-0<p>After the business work succeeds, Alice sends the acknowledgement. Bob remains idle.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1.</li><li>Alice: Business work returned successfully; XACK still needed.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 1 time. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>valkey → alice: Integer 1<p>Remove the group and Alice PEL references and free the pending record. Return integer 1 to Alice. The stream payload remains; no recovery occurred.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL empty; Alice PEL empty; Bob PEL empty; pending record freed.</li><li>Alice: Has received integer 1 from XACK.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 1 time. This count is an illustrative application fact, not a Valkey field.</li></ul></li></ol><h3>Crash before work</h3><p>Alice stops before work. Bob explicitly recovers her retained pending entry, performs the work and acknowledges.</p><p>Source-derived illustration; a chosen sequential interleaving, not telemetry.</p><p>Alice and Bob were already registered with XGROUP CREATECONSUMER and start with empty consumer PELs.</p><p>Entry 1000-0 remains retained; Valkey keeps running; no competing reads, claims or acknowledgements.</p><p>The application schedules Bob’s claim when this entry’s idle reaches 60000 ms. No JUSTID or NOACK.</p><p>External work is non-idempotent and succeeds whenever shown; there is no atomic transaction joining it with XACK.</p><ol><li>alice → valkey: XREADGROUP &gt;<p>Full command: XREADGROUP GROUP workers Alice COUNT 1 STREAMS orders &gt;. It requests the single new entry.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=0-0; group PEL empty; registered Alice PEL empty; registered Bob PEL empty.</li><li>Alice: Ready; no local entry.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>valkey → alice: 1000-0 + payload<p>Advance group last_id; add a pending record owned by Alice; return its ID and fields.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1.</li><li>Alice: Has payload for 1000-0.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>alice → alice: Stop before work<p>Alice stops before applying the external effect and before XACK. The server-side pending record remains. The illustration continues until the entry is idle enough for the chosen claim threshold.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold.</li><li>Alice: Process gone; its server-side consumer record and PEL remain.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>bob → valkey: XAUTOCLAIM, idle ≥ 60000<p>Application waits until this entry is idle enough and calls XAUTOCLAIM orders workers Bob 60000 0-0 COUNT 1. There is no server-initiated recovery call.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold.</li><li>Alice: Process gone; its server-side consumer record and PEL remain.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>valkey → bob: [0-0, entry, []]<p>Transfer the shared pending record to Bob, reset idle, increment delivery count to 2 and return retained entry 1000-0 plus its payload. The empty third array means no deleted IDs were encountered.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2; entry idle reset.</li><li>Alice: Process gone.</li><li>Bob: Has payload for 1000-0; owns its pending delivery.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>bob → bob: Apply external effect<p>Bob processes the claimed payload. The external effect has now succeeded once; Valkey still has a pending record.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2.</li><li>Alice: Process gone.</li><li>Bob: Business work returned successfully; XACK still needed.</li><li>External business effect: Applied 1 time. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>bob → valkey: XACK orders workers 1000-0<p>Bob sends the acknowledgement after its business work succeeds.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2.</li><li>Alice: Process gone.</li><li>Bob: Business work returned successfully; XACK still needed.</li><li>External business effect: Applied 1 time. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>valkey → bob: Integer 1<p>Remove the group and Bob PEL references and free the pending record. Return the number removed. The stream entry remains; the external effect count is not part of this reply.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL empty; Alice PEL empty; Bob PEL empty; pending record freed.</li><li>Alice: Process gone.</li><li>Bob: Has received integer 1 from XACK.</li><li>External business effect: Applied 1 time. This count is an illustrative application fact, not a Valkey field.</li></ul></li></ol><h3>Effect succeeded; ACK absent</h3><p>Alice’s business effect succeeds but her XACK never reaches Valkey. Bob’s normal recovery can repeat the effect.</p><p>Source-derived illustration; a chosen sequential interleaving, not telemetry.</p><p>Alice and Bob were already registered with XGROUP CREATECONSUMER and start with empty consumer PELs.</p><p>Entry 1000-0 remains retained; Valkey keeps running; no competing reads, claims or acknowledgements.</p><p>The application schedules Bob’s claim when this entry’s idle reaches 60000 ms. No JUSTID or NOACK.</p><p>External work is non-idempotent and succeeds whenever shown; there is no atomic transaction joining it with XACK.</p><ol><li>alice → valkey: XREADGROUP &gt;<p>Full command: XREADGROUP GROUP workers Alice COUNT 1 STREAMS orders &gt;. It requests the single new entry.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=0-0; group PEL empty; registered Alice PEL empty; registered Bob PEL empty.</li><li>Alice: Ready; no local entry.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>valkey → alice: 1000-0 + payload<p>Advance group last_id; add a pending record owned by Alice; return its ID and fields.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1.</li><li>Alice: Has payload for 1000-0.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 0 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>alice → alice: Effect succeeds; then stop<p>Alice applies a non-idempotent external effect, then stops before XACK. The external count is an explicit scenario assumption. The illustration continues until the entry is idle enough for the chosen claim threshold.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold.</li><li>Alice: Process gone; its server-side consumer record and PEL remain.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 1 time. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>bob → valkey: XAUTOCLAIM, idle ≥ 60000<p>Application waits until this entry is idle enough and calls XAUTOCLAIM orders workers Bob 60000 0-0 COUNT 1. There is no server-initiated recovery call.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold.</li><li>Alice: Process gone; its server-side consumer record and PEL remain.</li><li>Bob: Ready; no local entry.</li><li>External business effect: Applied 1 time. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>valkey → bob: [0-0, entry, []]<p>Transfer the shared pending record to Bob, reset idle, increment delivery count to 2 and return retained entry 1000-0 plus its payload. The empty third array means no deleted IDs were encountered.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2; entry idle reset.</li><li>Alice: Process gone.</li><li>Bob: Has payload for 1000-0; owns its pending delivery.</li><li>External business effect: Applied 1 time. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>bob → bob: Apply external effect<p>Bob processes the claimed payload. The non-idempotent effect is now repeated; Valkey could not distinguish the earlier success from no work.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2.</li><li>Alice: Process gone.</li><li>Bob: Business work returned successfully; XACK still needed.</li><li>External business effect: Applied 2 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>bob → valkey: XACK orders workers 1000-0<p>Bob sends the acknowledgement after its business work succeeds.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2.</li><li>Alice: Process gone.</li><li>Bob: Business work returned successfully; XACK still needed.</li><li>External business effect: Applied 2 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li><li>valkey → bob: Integer 1<p>Remove the group and Bob PEL references and free the pending record. Return the number removed. The stream entry remains; the external effect count is not part of this reply.</p><ul><li>Stream orders: Entry 1000-0 and its payload remain in the stream.</li><li>Group workers (inside Valkey): last_id=1000-0; group PEL empty; Alice PEL empty; Bob PEL empty; pending record freed.</li><li>Alice: Process gone.</li><li>Bob: Has received integer 1 from XACK.</li><li>External business effect: Applied 2 times. This count is an illustrative application fact, not a Valkey field.</li></ul></li></ol><h2>Claims and sources</h2><p>The group holds a last-delivered cursor and a PEL. Its PEL and each consumer PEL reference the same pending record containing the last owner, delivery time and delivery count. These are logical structures within Valkey, not separate network services. XGROUP CREATECONSUMER can pre-register consumer records with empty PELs; this trace assumes that setup already completed for Alice and Bob. (source) <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/stream.h#L55-L97">stream.h · streamCG / streamConsumer / streamNACK</a> · <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2727-L2730">t_stream.c · XGROUP CREATECONSUMER</a> · <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2530-L2550">t_stream.c · streamCreateConsumer</a></p><p>With &gt;, XREADGROUP reads after the group last-delivered ID; a numeric ID instead reads only the named consumer’s pending history. Bob using &gt; does not recover Alice’s already-delivered entry in the stated configuration. (source) <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2339-L2400">t_stream.c · xreadCommand</a> · <a href="https://valkey.io/commands/xreadgroup/">Official XREADGROUP command reference</a></p><p>Normal delivery advances the group cursor and creates the pending record in both group and consumer PELs. The record starts with delivery count 1. NOACK skips PEL creation. Delivery is not a business-work receipt. (source) <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L1699-L1789">t_stream.c · streamReplyWithRange</a> · <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2454-L2470">t_stream.c · streamCreateNACK</a> · <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/stream.h#L55-L97">stream.h · streamCG / streamConsumer / streamNACK</a></p><p>A client crash can leave entries in its pending history. Another consumer needs explicit claiming to take that history; this trace assumes a surviving Valkey process and an application that invokes recovery. (source) <a href="https://valkey.io/commands/xreadgroup/">Official XREADGROUP command reference</a> · <a href="https://valkey.io/commands/xautoclaim/">Official XAUTOCLAIM command reference</a></p><p>XAUTOCLAIM scans the group PEL. A retained entry with per-entry idle &gt;= min-idle-time can transfer to Bob: remove the old consumer PEL reference, add Bob’s, reset delivery time and increment delivery count when JUSTID is absent. This does not check whether Alice’s process is dead. (source) <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L3405-L3520">t_stream.c · xautoclaimCommand</a> · <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/stream.h#L55-L97">stream.h · streamCG / streamConsumer / streamNACK</a></p><p>XAUTOCLAIM replies with a next cursor, the claimed entries, and IDs cleared because their payloads were deleted. A 0-0 cursor ends this scan; it does not prove all pending work has completed. In this one-entry trace the reply is [0-0, [1000-0 plus payload], []]. (source) <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L3405-L3520">t_stream.c · xautoclaimCommand</a> · <a href="https://valkey.io/commands/xautoclaim/">Official XAUTOCLAIM command reference</a></p><p>XACK removes an ID found in the group PEL from both group and current owner PEL, frees its pending record and returns the number removed. It does not delete the stream entry or check external business work; a repeated XACK returns 0 for the already-removed ID. (source) <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2822-L2877">t_stream.c · xackCommand</a> · <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/tests/unit/type/stream-cgroups.tcl#L127-L148">stream-cgroups.tcl · acknowledgement tests</a></p><p>If a non-idempotent external effect succeeds before Alice disappears without XACK, Bob can reclaim and repeat it. This is an application-level inference: the server sees the same pending record whether the external effect succeeded or never ran. Idempotency or transactional coordination must address that gap. (inference) <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2822-L2877">t_stream.c · xackCommand</a> · <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L3405-L3520">t_stream.c · xautoclaimCommand</a> · <a href="https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/stream.h#L55-L97">stream.h · streamCG / streamConsumer / streamNACK</a></p><h2>Limits</h2><p>This is a source-derived illustration, not a captured Valkey execution. Entry IDs, names and the application’s 60000 ms idle threshold are chosen for the explanation; no measured timings are implied.</p><p>Consumer disappearance means a process stops. It does not mean XGROUP DELCONSUMER, which removes tracking records and has different recovery implications.</p><p>The trace retains the payload. If trimming or XDEL removes it, XAUTOCLAIM clears that PEL record and returns its ID in the third reply element; it cannot recover the missing payload.</p><p>XAUTOCLAIM can return fewer entries than COUNT and requires cursor iteration for a larger PEL. Reaching cursor 0-0 ends a scan; later calls can find entries that have since become idle enough.</p><p>A claim changes a bookkeeping owner, not an execution fence. XACK has no consumer argument or owner check; a resumed old consumer can acknowledge by ID. Concurrent workers and deduplication design are outside this narrow trace.</p><p>No server restart is modeled. The guide makes no promise about AOF configuration, replica acknowledgement, failover or durable retention in a deployment.</p></article></noscript><script id="walkthrough-model" type="application/json">{"version":1,"navigation":[{"label":"System Walkthroughs","url":"../"},{"label":"evanoman.com","url":"https://evanoman.com/"}],"title":"An absent consumer leaves pending work","subtitle":"Valkey Streams: separate delivery, business work and acknowledgement before recovering one entry.","question":"When Alice disappears, what must Bob do to finish her pending entry—and when can that repeat a business effect?","scope":"For engineers using one existing stream orders and group workers, created at 0-0. Alice and Bob were already registered with XGROUP CREATECONSUMER and begin with empty consumer PELs. One retained entry 1000-0; no NOACK, JUSTID, trimming, consumer deletion or XGROUP SETID. The Valkey process remains available. The application chooses and runs recovery. Server restart, replication durability and production settings are outside this trace.","project":{"name":"Valkey","repository":"https://github.com/valkey-io/valkey","revision":"29173b67508b2de4c0f0ed551f3b47cf19fc3ca8","version":"9.1.3","license":"BSD-3-Clause. Original AI-assisted paraphrase; no upstream code or diagrams copied."},"sources":[{"id":"structures","label":"stream.h · streamCG / streamConsumer / streamNACK","url":"https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/stream.h#L55-L97"},{"id":"consumer-setup","label":"t_stream.c · XGROUP CREATECONSUMER","url":"https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2727-L2730"},{"id":"consumer-state","label":"t_stream.c · streamCreateConsumer","url":"https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2530-L2550"},{"id":"read-path","label":"t_stream.c · xreadCommand","url":"https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2339-L2400"},{"id":"deliver","label":"t_stream.c · streamReplyWithRange","url":"https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L1699-L1789"},{"id":"nack","label":"t_stream.c · streamCreateNACK","url":"https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2454-L2470"},{"id":"ack","label":"t_stream.c · xackCommand","url":"https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L2822-L2877"},{"id":"claim","label":"t_stream.c · xautoclaimCommand","url":"https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/src/t_stream.c#L3405-L3520"},{"id":"tests","label":"stream-cgroups.tcl · acknowledgement tests","url":"https://github.com/valkey-io/valkey/blob/29173b67508b2de4c0f0ed551f3b47cf19fc3ca8/tests/unit/type/stream-cgroups.tcl#L127-L148"},{"id":"doc-read","label":"Official XREADGROUP command reference","url":"https://valkey.io/commands/xreadgroup/","note":"Live documentation acquired 2026-10-30; reconciled against the pinned 9.1.3 implementation."},{"id":"doc-claim","label":"Official XAUTOCLAIM command reference","url":"https://valkey.io/commands/xautoclaim/","note":"Live documentation acquired 2026-10-30. Its strict greater-than wording differs at equality from pinned code, which skips only idle \u003c min-idle-time. This guide follows pinned code."}],"claims":[{"id":"ownership","text":"The group holds a last-delivered cursor and a PEL. Its PEL and each consumer PEL reference the same pending record containing the last owner, delivery time and delivery count. These are logical structures within Valkey, not separate network services. XGROUP CREATECONSUMER can pre-register consumer records with empty PELs; this trace assumes that setup already completed for Alice and Bob.","kind":"source","sources":["structures","consumer-setup","consumer-state"]},{"id":"new-read","text":"With >, XREADGROUP reads after the group last-delivered ID; a numeric ID instead reads only the named consumer’s pending history. Bob using > does not recover Alice’s already-delivered entry in the stated configuration.","kind":"source","sources":["read-path","doc-read"]},{"id":"delivery","text":"Normal delivery advances the group cursor and creates the pending record in both group and consumer PELs. The record starts with delivery count 1. NOACK skips PEL creation. Delivery is not a business-work receipt.","kind":"source","sources":["deliver","nack","structures"]},{"id":"pending-after-crash","text":"A client crash can leave entries in its pending history. Another consumer needs explicit claiming to take that history; this trace assumes a surviving Valkey process and an application that invokes recovery.","kind":"source","sources":["doc-read","doc-claim"]},{"id":"reclaim","text":"XAUTOCLAIM scans the group PEL. A retained entry with per-entry idle >= min-idle-time can transfer to Bob: remove the old consumer PEL reference, add Bob’s, reset delivery time and increment delivery count when JUSTID is absent. This does not check whether Alice’s process is dead.","kind":"source","sources":["claim","structures"]},{"id":"reply","text":"XAUTOCLAIM replies with a next cursor, the claimed entries, and IDs cleared because their payloads were deleted. A 0-0 cursor ends this scan; it does not prove all pending work has completed. In this one-entry trace the reply is [0-0, [1000-0 plus payload], []].","kind":"source","sources":["claim","doc-claim"]},{"id":"acknowledge","text":"XACK removes an ID found in the group PEL from both group and current owner PEL, frees its pending record and returns the number removed. It does not delete the stream entry or check external business work; a repeated XACK returns 0 for the already-removed ID.","kind":"source","sources":["ack","tests"]},{"id":"duplicates","text":"If a non-idempotent external effect succeeds before Alice disappears without XACK, Bob can reclaim and repeat it. This is an application-level inference: the server sees the same pending record whether the external effect succeeded or never ran. Idempotency or transactional coordination must address that gap.","kind":"inference","sources":["ack","claim","structures"]}],"roles":[{"id":"consumer","label":"Consumer process","color":"blue"},{"id":"server","label":"Valkey command handling","color":"teal"},{"id":"payload","label":"Retained stream payload","color":"violet"},{"id":"tracking","label":"Group delivery bookkeeping","color":"amber"}],"takeaways":[{"text":"The group cursor answers “what was delivered?”; the PEL answers “what is still unacknowledged?”","claims":["ownership","delivery"]},{"text":"A disappearing process does not hand its entries to Bob. Bob must run recovery and receive the claimed payload.","claims":["pending-after-crash","reclaim","reply"]},{"text":"XACK clears delivery bookkeeping. A business effect can already have happened before an unacknowledged entry is recovered.","claims":["acknowledge","duplicates"]}],"limits":["This is a source-derived illustration, not a captured Valkey execution. Entry IDs, names and the application’s 60000 ms idle threshold are chosen for the explanation; no measured timings are implied.","Consumer disappearance means a process stops. It does not mean XGROUP DELCONSUMER, which removes tracking records and has different recovery implications.","The trace retains the payload. If trimming or XDEL removes it, XAUTOCLAIM clears that PEL record and returns its ID in the third reply element; it cannot recover the missing payload.","XAUTOCLAIM can return fewer entries than COUNT and requires cursor iteration for a larger PEL. Reaching cursor 0-0 ends a scan; later calls can find entries that have since become idle enough.","A claim changes a bookkeeping owner, not an execution fence. XACK has no consumer argument or owner check; a resumed old consumer can acknowledge by ID. Concurrent workers and deduplication design are outside this narrow trace.","No server restart is modeled. The guide makes no promise about AOF configuration, replica acknowledgement, failover or durable retention in a deployment."],"map":{"title":"Payload and pending delivery are different state","description":"Alice and Bob are client processes. Command handling, the retained stream entry and the group structures are inside one Valkey process. Arrows to the two stores denote local access, not network messages.","width":1100,"height":500,"nodes":[{"id":"alice","label":"Alice","detail":"Original consumer process","role":"consumer","x":30,"y":70,"w":200,"h":86},{"id":"bob","label":"Bob","detail":"Recovery consumer process","role":"consumer","x":30,"y":340,"w":200,"h":86},{"id":"server","label":"Valkey commands","detail":"One server process","role":"server","x":410,"y":205,"w":220,"h":86},{"id":"stream","label":"Stream orders","detail":"1000-0 + retained payload","role":"payload","x":850,"y":70,"w":220,"h":86},{"id":"group","label":"Group workers","detail":"Cursor + shared PEL record","role":"tracking","x":850,"y":340,"w":220,"h":86}],"edges":[{"id":"read","from":"alice","to":"server","label":"XREADGROUP >","kind":"request","via":[{"x":520,"y":113}]},{"id":"read-reply","from":"server","to":"alice","label":"Entry + payload","kind":"return","via":[{"x":330,"y":248},{"x":330,"y":180},{"x":130,"y":180}]},{"id":"recover","from":"bob","to":"server","label":"XAUTOCLAIM / XACK","kind":"request","via":[{"x":330,"y":383},{"x":330,"y":300},{"x":520,"y":300}]},{"id":"recover-reply","from":"server","to":"bob","label":"Claim reply / ACK count","kind":"return","via":[{"x":680,"y":330},{"x":680,"y":465},{"x":400,"y":465},{"x":130,"y":465}]},{"id":"payload","from":"stream","to":"server","label":"Read payload locally","kind":"data","via":[{"x":740,"y":113},{"x":740,"y":248}]},{"id":"track","from":"server","to":"group","label":"Mutate PEL locally","kind":"data","via":[{"x":750,"y":248},{"x":750,"y":383}]}],"lenses":[{"id":"state","label":"State owners","title":"One entry, two kinds of server state","body":"The stream keeps the payload. The group cursor and shared pending record track delivery. A PEL entry is not a second payload copy.","nodes":["server","stream","group"],"edges":[],"claims":["ownership","delivery"]},{"id":"deliver","label":"Delivery","title":"Alice receives new work","body":"A normal > read returns a retained entry and adds pending bookkeeping. The cursor can move forward while this entry remains unacknowledged.","nodes":["alice","server","stream","group"],"edges":["read","read-reply","payload","track"],"claims":["new-read","delivery"]},{"id":"recover","label":"Recovery","title":"Bob explicitly takes pending work","body":"An application calls XAUTOCLAIM after the entry is idle enough. Server bookkeeping moves to Bob; its response contains the payload. XACK later removes the pending record.","nodes":["bob","server","stream","group"],"edges":["recover","recover-reply","payload","track"],"claims":["reclaim","reply","acknowledge"]}],"intents":[{"id":"try-new","label":"Try Bob’s > read","title":"New work is not Alice’s pending history","body":"In this fixed one-entry stream, the group cursor is already 1000-0. Bob requesting > gets no new entry; choosing a different consumer name does not transfer Alice’s PEL.","nodes":["bob","server","group"],"edges":[],"claims":["new-read"]},{"id":"finish","label":"Finish recovery","title":"Work first, then acknowledge","body":"The claim reply gives Bob the payload. After business work succeeds, XACK orders workers 1000-0 removes the pending record from both PEL indexes, then returns 1. The stream payload remains.","nodes":["bob","server","stream","group"],"edges":["recover","recover-reply","track"],"claims":["reply","acknowledge","duplicates"]}]},"walkthrough":{"title":"Recover 1000-0 after Alice stops","intro":"One retained entry, one vanished consumer, one explicit recovery. Each selection contains a complete relevant post-step snapshot.","steps":[{"id":"read","title":"Alice asks for new work","body":"XREADGROUP GROUP workers Alice COUNT 1 STREAMS orders >. Start from group last_id=0-0; entry 1000-0 is eligible.","why":"A consumer group must already exist. The > cursor uses group delivery progress, not acknowledgement progress.","boundary":"Alice → Valkey request.","nodes":["alice","server","stream","group"],"edges":["read"],"claims":["new-read"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=0-0; group PEL empty; registered Alice PEL empty; registered Bob PEL empty."},{"owner":"Alice","detail":"Ready; no local entry."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}]},{"id":"delivered","title":"Valkey returns the pending entry","body":"Return entry 1000-0 and its payload to Alice. The delivery path advances last_id and creates one shared pending record referenced by group and Alice PELs.","why":"Receiving a payload is separate from successfully applying its business effect.","boundary":"Local Valkey bookkeeping, then Valkey → Alice reply.","nodes":["alice","server","stream","group"],"edges":["read-reply","payload","track"],"claims":["delivery","ownership"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1."},{"owner":"Alice","detail":"Has payload for 1000-0."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}]},{"id":"gone","title":"Alice disappears before work","body":"Alice stops without doing the business work or issuing XACK. We advance the illustration until this entry’s delivery idle reaches the application’s chosen threshold.","why":"Valkey still records pending work for Alice. No automatic network failure notification or reassignment is implied.","boundary":"Local process stop and elapsed time; no network message.","nodes":["alice","group"],"edges":[],"claims":["pending-after-crash","reclaim"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold."},{"owner":"Alice","detail":"Process gone; its server-side consumer record and PEL remain."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}]},{"id":"claim","title":"Bob claims and receives the entry","body":"XAUTOCLAIM orders workers Bob 60000 0-0 COUNT 1. With entry idle >= 60000 ms, transfer the pending owner to Bob and return [0-0, [1000-0 plus payload], []].","why":"The command resets entry idle and increments deliveries to 2. Its cursor ends this one-entry scan, not the business work.","boundary":"Bob → Valkey command; local transfer; Valkey → Bob reply.","nodes":["bob","server","stream","group"],"edges":["recover","recover-reply","payload","track"],"claims":["reclaim","reply"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2; entry idle reset."},{"owner":"Alice","detail":"Process gone."},{"owner":"Bob","detail":"Has payload for 1000-0; owns its pending delivery."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}]},{"id":"work","title":"Bob applies the business effect","body":"Bob uses the returned payload and completes the application’s external work. The PEL still points to Bob.","why":"Valkey cannot infer success from the claim reply. The application must decide when work is complete.","boundary":"Application work outside Valkey; no stream command at this step.","nodes":["bob","group"],"edges":[],"claims":["duplicates","acknowledge"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2."},{"owner":"Alice","detail":"Process gone."},{"owner":"Bob","detail":"Business work returned successfully; XACK still needed."},{"owner":"External business effect","detail":"Applied 1 time. This count is an illustrative application fact, not a Valkey field."}]},{"id":"ack","title":"Bob acknowledges; Valkey returns 1","body":"Bob sends XACK orders workers 1000-0. Valkey deletes both PEL references, frees the pending record and returns integer 1. The retained stream entry is unchanged.","why":"The integer counts pending records removed. It is not a transaction over Bob’s external business effect.","boundary":"Bob → Valkey XACK; local removal; Valkey → Bob integer reply.","nodes":["bob","server","stream","group"],"edges":["recover","recover-reply","track"],"claims":["acknowledge"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL empty; Alice PEL empty; Bob PEL empty; pending record freed."},{"owner":"Alice","detail":"Process gone."},{"owner":"Bob","detail":"Has received integer 1 from XACK."},{"owner":"External business effect","detail":"Applied 1 time. This count is an illustrative application fact, not a Valkey field."}]}]},"sequence":{"title":"The same pending state can hide different work","intro":"Source-derived illustrative interleavings. Only Alice, Valkey and Bob are network actors. Self-loops describe local process events; external work is summarized as an application fact.","lanes":[{"id":"alice","label":"Alice","role":"consumer"},{"id":"valkey","label":"Valkey","role":"server"},{"id":"bob","label":"Bob","role":"consumer"}],"scenarios":[{"id":"normal-completion","label":"Normal completion","summary":"Alice receives the entry, completes its business work and acknowledges it. Bob remains idle; no claim or recovery is needed.","assumptions":["Source-derived illustration; a chosen sequential interleaving, not telemetry.","Alice and Bob were already registered with XGROUP CREATECONSUMER and start with empty consumer PELs.","Entry 1000-0 remains retained; Valkey and Alice keep running; no competing reads, claims or acknowledgements.","External work succeeds once as an explicit application fact. Alice then sends XACK and receives its reply; NOACK is absent."],"events":[{"id":"read","to":"valkey","label":"XREADGROUP >","kind":"request","body":"Full command: XREADGROUP GROUP workers Alice COUNT 1 STREAMS orders >. It requests the single new entry.","claims":["new-read"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=0-0; group PEL empty; registered Alice PEL empty; registered Bob PEL empty."},{"owner":"Alice","detail":"Ready; no local entry."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}],"from":"alice"},{"id":"delivery","to":"alice","label":"1000-0 + payload","kind":"return","body":"Advance group last_id; add a pending record owned by Alice with delivery count 1; return the entry ID and fields.","claims":["delivery","ownership"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1."},{"owner":"Alice","detail":"Has payload for 1000-0."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}],"from":"valkey"},{"id":"effect","to":"alice","label":"Apply external effect","kind":"control","body":"Alice processes the returned payload and the business work succeeds once, as assumed. Valkey still holds the pending record; it has not received XACK.","claims":["acknowledge"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1."},{"owner":"Alice","detail":"Business work returned successfully; XACK still needed."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 1 time. This count is an illustrative application fact, not a Valkey field."}],"from":"alice"},{"id":"ack","to":"valkey","label":"XACK orders workers 1000-0","kind":"request","body":"After the business work succeeds, Alice sends the acknowledgement. Bob remains idle.","claims":["acknowledge"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1."},{"owner":"Alice","detail":"Business work returned successfully; XACK still needed."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 1 time. This count is an illustrative application fact, not a Valkey field."}],"from":"alice"},{"id":"acked","to":"alice","label":"Integer 1","kind":"return","body":"Remove the group and Alice PEL references and free the pending record. Return integer 1 to Alice. The stream payload remains; no recovery occurred.","claims":["acknowledge"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL empty; Alice PEL empty; Bob PEL empty; pending record freed."},{"owner":"Alice","detail":"Has received integer 1 from XACK."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 1 time. This count is an illustrative application fact, not a Valkey field."}],"from":"valkey"}]},{"id":"crash-before-work","label":"Crash before work","summary":"Alice stops before work. Bob explicitly recovers her retained pending entry, performs the work and acknowledges.","assumptions":["Source-derived illustration; a chosen sequential interleaving, not telemetry.","Alice and Bob were already registered with XGROUP CREATECONSUMER and start with empty consumer PELs.","Entry 1000-0 remains retained; Valkey keeps running; no competing reads, claims or acknowledgements.","The application schedules Bob’s claim when this entry’s idle reaches 60000 ms. No JUSTID or NOACK.","External work is non-idempotent and succeeds whenever shown; there is no atomic transaction joining it with XACK."],"events":[{"id":"read","to":"valkey","label":"XREADGROUP >","kind":"request","body":"Full command: XREADGROUP GROUP workers Alice COUNT 1 STREAMS orders >. It requests the single new entry.","claims":["new-read"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=0-0; group PEL empty; registered Alice PEL empty; registered Bob PEL empty."},{"owner":"Alice","detail":"Ready; no local entry."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}],"from":"alice"},{"id":"delivery","to":"alice","label":"1000-0 + payload","kind":"return","body":"Advance group last_id; add a pending record owned by Alice; return its ID and fields.","claims":["delivery","ownership"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1."},{"owner":"Alice","detail":"Has payload for 1000-0."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}],"from":"valkey"},{"id":"stop","to":"alice","label":"Stop before work","kind":"control","body":"Alice stops before applying the external effect and before XACK. The server-side pending record remains. The illustration continues until the entry is idle enough for the chosen claim threshold.","claims":["duplicates","pending-after-crash"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold."},{"owner":"Alice","detail":"Process gone; its server-side consumer record and PEL remain."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}],"from":"alice"},{"id":"claim","to":"valkey","label":"XAUTOCLAIM, idle ≥ 60000","kind":"request","body":"Application waits until this entry is idle enough and calls XAUTOCLAIM orders workers Bob 60000 0-0 COUNT 1. There is no server-initiated recovery call.","claims":["reclaim"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold."},{"owner":"Alice","detail":"Process gone; its server-side consumer record and PEL remain."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}],"from":"bob"},{"id":"claimed","to":"bob","label":"[0-0, entry, []]","kind":"return","body":"Transfer the shared pending record to Bob, reset idle, increment delivery count to 2 and return retained entry 1000-0 plus its payload. The empty third array means no deleted IDs were encountered.","claims":["reclaim","reply"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2; entry idle reset."},{"owner":"Alice","detail":"Process gone."},{"owner":"Bob","detail":"Has payload for 1000-0; owns its pending delivery."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}],"from":"valkey"},{"id":"effect","to":"bob","label":"Apply external effect","kind":"control","body":"Bob processes the claimed payload. The external effect has now succeeded once; Valkey still has a pending record.","claims":["duplicates","acknowledge"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2."},{"owner":"Alice","detail":"Process gone."},{"owner":"Bob","detail":"Business work returned successfully; XACK still needed."},{"owner":"External business effect","detail":"Applied 1 time. This count is an illustrative application fact, not a Valkey field."}],"from":"bob"},{"id":"ack","to":"valkey","label":"XACK orders workers 1000-0","kind":"request","body":"Bob sends the acknowledgement after its business work succeeds.","claims":["acknowledge"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2."},{"owner":"Alice","detail":"Process gone."},{"owner":"Bob","detail":"Business work returned successfully; XACK still needed."},{"owner":"External business effect","detail":"Applied 1 time. This count is an illustrative application fact, not a Valkey field."}],"from":"bob"},{"id":"acked","to":"bob","label":"Integer 1","kind":"return","body":"Remove the group and Bob PEL references and free the pending record. Return the number removed. The stream entry remains; the external effect count is not part of this reply.","claims":["acknowledge","duplicates"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL empty; Alice PEL empty; Bob PEL empty; pending record freed."},{"owner":"Alice","detail":"Process gone."},{"owner":"Bob","detail":"Has received integer 1 from XACK."},{"owner":"External business effect","detail":"Applied 1 time. This count is an illustrative application fact, not a Valkey field."}],"from":"valkey"}]},{"id":"effect-before-ack","label":"Effect succeeded; ACK absent","summary":"Alice’s business effect succeeds but her XACK never reaches Valkey. Bob’s normal recovery can repeat the effect.","assumptions":["Source-derived illustration; a chosen sequential interleaving, not telemetry.","Alice and Bob were already registered with XGROUP CREATECONSUMER and start with empty consumer PELs.","Entry 1000-0 remains retained; Valkey keeps running; no competing reads, claims or acknowledgements.","The application schedules Bob’s claim when this entry’s idle reaches 60000 ms. No JUSTID or NOACK.","External work is non-idempotent and succeeds whenever shown; there is no atomic transaction joining it with XACK."],"events":[{"id":"read","to":"valkey","label":"XREADGROUP >","kind":"request","body":"Full command: XREADGROUP GROUP workers Alice COUNT 1 STREAMS orders >. It requests the single new entry.","claims":["new-read"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=0-0; group PEL empty; registered Alice PEL empty; registered Bob PEL empty."},{"owner":"Alice","detail":"Ready; no local entry."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}],"from":"alice"},{"id":"delivery","to":"alice","label":"1000-0 + payload","kind":"return","body":"Advance group last_id; add a pending record owned by Alice; return its ID and fields.","claims":["delivery","ownership"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1."},{"owner":"Alice","detail":"Has payload for 1000-0."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 0 times. This count is an illustrative application fact, not a Valkey field."}],"from":"valkey"},{"id":"stop","to":"alice","label":"Effect succeeds; then stop","kind":"control","body":"Alice applies a non-idempotent external effect, then stops before XACK. The external count is an explicit scenario assumption. The illustration continues until the entry is idle enough for the chosen claim threshold.","claims":["duplicates","pending-after-crash"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold."},{"owner":"Alice","detail":"Process gone; its server-side consumer record and PEL remain."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 1 time. This count is an illustrative application fact, not a Valkey field."}],"from":"alice"},{"id":"claim","to":"valkey","label":"XAUTOCLAIM, idle ≥ 60000","kind":"request","body":"Application waits until this entry is idle enough and calls XAUTOCLAIM orders workers Bob 60000 0-0 COUNT 1. There is no server-initiated recovery call.","claims":["reclaim"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Alice; Alice PEL has the same record; Bob PEL empty; deliveries=1; entry idle has reached the chosen threshold."},{"owner":"Alice","detail":"Process gone; its server-side consumer record and PEL remain."},{"owner":"Bob","detail":"Ready; no local entry."},{"owner":"External business effect","detail":"Applied 1 time. This count is an illustrative application fact, not a Valkey field."}],"from":"bob"},{"id":"claimed","to":"bob","label":"[0-0, entry, []]","kind":"return","body":"Transfer the shared pending record to Bob, reset idle, increment delivery count to 2 and return retained entry 1000-0 plus its payload. The empty third array means no deleted IDs were encountered.","claims":["reclaim","reply"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2; entry idle reset."},{"owner":"Alice","detail":"Process gone."},{"owner":"Bob","detail":"Has payload for 1000-0; owns its pending delivery."},{"owner":"External business effect","detail":"Applied 1 time. This count is an illustrative application fact, not a Valkey field."}],"from":"valkey"},{"id":"effect","to":"bob","label":"Apply external effect","kind":"control","body":"Bob processes the claimed payload. The non-idempotent effect is now repeated; Valkey could not distinguish the earlier success from no work.","claims":["duplicates","acknowledge"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2."},{"owner":"Alice","detail":"Process gone."},{"owner":"Bob","detail":"Business work returned successfully; XACK still needed."},{"owner":"External business effect","detail":"Applied 2 times. This count is an illustrative application fact, not a Valkey field."}],"from":"bob"},{"id":"ack","to":"valkey","label":"XACK orders workers 1000-0","kind":"request","body":"Bob sends the acknowledgement after its business work succeeds.","claims":["acknowledge"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL has 1000-0 → Bob; Alice PEL empty; Bob PEL has the same record; deliveries=2."},{"owner":"Alice","detail":"Process gone."},{"owner":"Bob","detail":"Business work returned successfully; XACK still needed."},{"owner":"External business effect","detail":"Applied 2 times. This count is an illustrative application fact, not a Valkey field."}],"from":"bob"},{"id":"acked","to":"bob","label":"Integer 1","kind":"return","body":"Remove the group and Bob PEL references and free the pending record. Return the number removed. The stream entry remains; the external effect count is not part of this reply.","claims":["acknowledge","duplicates"],"state":[{"owner":"Stream orders","detail":"Entry 1000-0 and its payload remain in the stream."},{"owner":"Group workers (inside Valkey)","detail":"last_id=1000-0; group PEL empty; Alice PEL empty; Bob PEL empty; pending record freed."},{"owner":"Alice","detail":"Process gone."},{"owner":"Bob","detail":"Has received integer 1 from XACK."},{"owner":"External business effect","detail":"Applied 2 times. This count is an illustrative application fact, not a Valkey field."}],"from":"valkey"}]}]}}</script><script>/* System Walkthrough — dependency-free, source-neutral components. MIT licensed. */
+(function (global) {
+  'use strict';
+  const NS = 'http://www.w3.org/2000/svg';
+  let serial = 0;
+  function el(tag, attrs, ...children) {
+    const node = document.createElement(tag);
+    for (const [key, value] of Object.entries(attrs || {})) {
+      if (value !== undefined && value !== null) node.setAttribute(key, String(value));
+    }
+    for (const child of children.flat(Infinity)) {
+      if (child !== undefined && child !== null) node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+    }
+    return node;
+  }
+  function svgEl(tag, attrs, ...children) {
+    const node = document.createElementNS(NS, tag);
+    for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, String(value));
+    for (const child of children.flat(Infinity)) node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+    return node;
+  }
+  const para = (text, className) => el('p', { class: className }, text);
+  const button = (label, attrs) => el('button', { type: 'button', ...attrs }, label);
+  const link = (label, url) => {
+    let allowed = typeof url === 'string' && url.startsWith('#');
+    try {
+      const parsed = new URL(url);
+      allowed ||= parsed.protocol === 'https:' && !parsed.username && !parsed.password;
+    } catch (_) { /* A fragment does not need to be an absolute URL. */ }
+    return allowed ? el('a', { href: url, rel: 'noreferrer' }, label) : el('span', {}, label);
+  };
+  const indexById = items => new Map((items || []).map(item => [item.id, item]));
+
+  function words(text, max) {
+    const lines = [''];
+    for (const word of String(text).split(/\s+/)) {
+      const last = lines.length - 1;
+      if (lines[last] && lines[last].length + word.length + 1 > max) lines.push(word);
+      else lines[last] += (lines[last] ? ' ' : '') + word;
+    }
+    return lines;
+  }
+  function svgText(text, x, y, attrs, max = 24, lineHeight = 18) {
+    const lines = words(text, max);
+    const node = svgEl('text', { x, y, ...attrs });
+    lines.forEach((line, i) => node.append(svgEl('tspan', { x, dy: i ? lineHeight : 0 }, line)));
+    return node;
+  }
+  function arrowDefs(svg, prefix) {
+    const defs = svgEl('defs');
+    for (const color of ['teal', 'blue', 'amber', 'violet', 'rose', 'slate']) {
+      const marker = svgEl('marker', { id: `${prefix}-${color}`, viewBox: '0 0 12 12', refX: 10, refY: 6, markerWidth: 9, markerHeight: 9, orient: 'auto', markerUnits: 'userSpaceOnUse' },
+        svgEl('path', { d: 'M1,1 L11,6 L1,11 Z', fill: `var(--sw-${color})` }));
+      defs.append(marker);
+    }
+    svg.append(defs);
+  }
+  function makeSvg(prefix, title, description, width, height) {
+    if (![width, height].every(value => Number.isFinite(value) && value > 0)) {
+      throw new TypeError('SVG width and height must be finite positive numbers.');
+    }
+    const svg = svgEl('svg', { viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-labelledby': `${prefix}-title ${prefix}-desc`, class: 'sw-diagram' });
+    svg.style.setProperty('--sw-diagram-width', `${width}px`);
+    svg.append(svgEl('title', { id: `${prefix}-title` }, title), svgEl('desc', { id: `${prefix}-desc` }, description));
+    arrowDefs(svg, prefix);
+    return svg;
+  }
+  function viewport(svg, label) {
+    return el('div', { class: 'sw-diagram-shell' },
+      para('Wide diagram · scroll inside this panel on a narrow screen. A full text version follows.', 'sw-scroll-hint'),
+      el('div', { class: 'sw-viewport', tabindex: '0', role: 'region', 'aria-label': label }, svg));
+  }
+  function statePanel(items) {
+    const list = el('dl', { class: 'sw-state' });
+    for (const item of items || []) list.append(el('div', {}, el('dt', {}, item.owner), el('dd', {}, item.detail)));
+    return el('div', { class: 'sw-state-panel' }, el('h4', {}, 'State after this step'), list);
+  }
+  function keyboardGroup(group, buttons, select, wrap = false) {
+    group.addEventListener('keydown', event => {
+      const current = buttons.indexOf(event.target.closest('button'));
+      if (current < 0 || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      let next = current;
+      if (event.key === 'Home') next = 0;
+      else if (event.key === 'End') next = buttons.length - 1;
+      else next += ['ArrowRight', 'ArrowDown'].includes(event.key) ? 1 : -1;
+      next = wrap ? (next + buttons.length) % buttons.length : Math.max(0, Math.min(buttons.length - 1, next));
+      select(next);
+      buttons[next].focus({ preventScroll: true });
+    });
+  }
+  function section(id, number, title, description) {
+    return el('section', { id, class: 'sw-section', 'aria-labelledby': `${id}-heading` },
+      el('div', { class: 'sw-section-heading' }, para(number, 'sw-kicker'), el('h2', { id: `${id}-heading` }, title), para(description, 'sw-section-intro')));
+  }
+  function mount(root, model) {
+    if (!root) throw new Error('SystemWalkthrough.mount needs a root element.');
+    const uid = `sw-${++serial}`;
+    const sources = indexById(model.sources), claims = indexById(model.claims), roles = indexById(model.roles);
+    root.replaceChildren();
+    root.classList.add('sw');
+    root.dataset.version = '1';
+    const sourceLinks = ids => el('span', { class: 'sw-source-links' }, (ids || []).map(id => {
+      const source = sources.get(id);
+      return source ? link(source.label, source.url) : el('span', {}, `Unknown source: ${id}`);
+    }));
+    function evidence(ids) {
+      const list = el('ul', { class: 'sw-evidence-list' });
+      for (const id of ids || []) {
+        const claim = claims.get(id);
+        if (claim) list.append(el('li', {}, el('span', { class: 'sw-claim-kind' }, claim.kind === 'inference' ? 'Inference' : 'Source-backed'), para(claim.text), sourceLinks(claim.sources)));
+      }
+      return el('details', { class: 'sw-evidence' }, el('summary', {}, `Evidence (${(ids || []).length})`), list);
+    }
+    function inspector(item, ordinal) {
+      const box = el('div', { class: 'sw-inspector', 'aria-live': 'polite', 'aria-atomic': 'true' });
+      if (ordinal) box.append(para(ordinal, 'sw-kicker'));
+      box.append(el('h3', {}, item.title || item.label), para(item.body));
+      if (item.why) box.append(el('h4', {}, 'Why it matters'), para(item.why));
+      if (item.boundary) box.append(el('p', { class: 'sw-boundary' }, el('strong', {}, 'Boundary · '), item.boundary));
+      if (item.state) box.append(statePanel(item.state));
+      box.append(evidence(item.claims));
+      return box;
+    }
+    function textAlternative(title, children) {
+      return el('details', { class: 'sw-text-alternative' }, el('summary', {}, title), el('div', { class: 'sw-text-body' }, children));
+    }
+    const theme = button(document.documentElement.dataset.swTheme === 'light' ? 'Dark mode' : 'Light mode', { class: 'sw-theme', 'aria-label': 'Switch color theme' });
+    theme.addEventListener('click', () => {
+      const next = document.documentElement.dataset.swTheme === 'light' ? 'dark' : 'light';
+      document.documentElement.dataset.swTheme = next;
+      try { localStorage.setItem('system-walkthrough-theme', next); } catch (_) { /* Reading remains available. */ }
+      theme.textContent = next === 'light' ? 'Dark mode' : 'Light mode';
+    });
+    const navigation = el('nav', { class: 'sw-nav', 'aria-label': 'Walkthrough sections' });
+    if (model.map) navigation.append(link('System map', `#${uid}-map`));
+    if (model.walkthrough) navigation.append(link('Walkthrough', `#${uid}-walk`));
+    if (model.sequence) navigation.append(link('Scenarios', `#${uid}-sequence`));
+    navigation.append(link('Sources & limits', `#${uid}-sources`));
+    root.append(el('header', { class: 'sw-hero' },
+      el('div', { class: 'sw-topline' }, para('SYSTEM WALKTHROUGH · SOURCE-DERIVED', 'sw-kicker'), theme),
+      el('h1', {}, model.title), para(model.subtitle, 'sw-subtitle'),
+      para(model.question, 'sw-question'),
+      el('div', { class: 'sw-snapshot' }, link(`${model.project.name} · ${model.project.version}`, `${model.project.repository}/tree/${model.project.revision}`), el('code', {}, model.project.revision.slice(0, 12))),
+      el('p', { class: 'sw-scope' }, el('strong', {}, 'Scope · '), model.scope), navigation));
+    if (model.takeaways?.length) {
+      root.append(el('ol', { class: 'sw-takeaways' }, model.takeaways.map(item => el('li', {}, para(item.text), evidence(item.claims)))));
+    }
+    function legend() {
+      return el('ul', { class: 'sw-legend', 'aria-label': 'Semantic roles' }, model.roles.map(role => el('li', { 'data-color': role.color }, el('span', { class: 'sw-dot', 'aria-hidden': 'true' }), role.label)));
+    }
+    function mapDiagram(prefix) {
+      const map = model.map;
+      const nodeIndex = indexById(map.nodes);
+      const svg = makeSvg(prefix, map.title, `${map.description} Arrowheads show the destination. Inactive context remains visible.`, map.width, map.height);
+      const edgeElements = new Map(), nodeElements = new Map();
+      function clip(node, toward) {
+        const cx = node.x + node.w / 2, cy = node.y + node.h / 2;
+        const dx = toward.x - cx, dy = toward.y - cy;
+        const scale = Math.min(dx ? node.w / 2 / Math.abs(dx) : Infinity, dy ? node.h / 2 / Math.abs(dy) : Infinity);
+        return { x: cx + dx * scale, y: cy + dy * scale };
+      }
+      for (const edge of map.edges) {
+        const from = nodeIndex.get(edge.from), to = nodeIndex.get(edge.to);
+        const center = node => ({ x: node.x + node.w / 2, y: node.y + node.h / 2 });
+        const via = edge.via || [];
+        let points;
+        if (from.id === to.id && !via.length) {
+          points = [{ x: from.x + from.w, y: from.y + from.h * .35 }, { x: from.x + from.w + 32, y: from.y + from.h * .35 }, { x: from.x + from.w + 32, y: from.y + from.h * .8 }, { x: from.x + from.w, y: from.y + from.h * .8 }];
+        } else points = [clip(from, via[0] || center(to)), ...via, clip(to, via.at(-1) || center(from))];
+        const color = roles.get(from.role).color;
+        const group = svgEl('g', { class: 'sw-map-edge', 'data-edge': edge.id, 'data-from': edge.from, 'data-to': edge.to, 'data-kind': edge.kind, 'data-color': color });
+        group.append(svgEl('title', {}, `${from.label} → ${to.label}: ${edge.label}`), svgEl('polyline', { points: points.map(p => `${p.x},${p.y}`).join(' '), 'marker-end': `url(#${prefix}-${color})` }));
+        const a = points[Math.floor((points.length - 1) / 2)], b = points[Math.ceil((points.length - 1) / 2)];
+        const edgeLines = words(edge.label, 24).length;
+        group.append(svgText(edge.label, (a.x + b.x) / 2, (a.y + b.y) / 2 - 10 - (edgeLines - 1) * 16, { class: 'sw-edge-label', 'text-anchor': 'middle' }, 24, 16));
+        svg.append(group); edgeElements.set(edge.id, group);
+      }
+      for (const node of map.nodes) {
+        const group = svgEl('g', { class: 'sw-map-node', 'data-node': node.id, 'data-color': roles.get(node.role).color });
+        const labelLines = words(node.label, Math.max(12, Math.floor((node.w - 28) / 8)));
+        group.append(svgEl('title', {}, `${node.label}. ${node.detail}`), svgEl('rect', { x: node.x, y: node.y, width: node.w, height: node.h, rx: 9 }),
+          svgText(node.label, node.x + 16, node.y + 27, { class: 'sw-node-label' }, Math.max(12, Math.floor((node.w - 28) / 8)), 19),
+          svgText(node.detail, node.x + 16, node.y + 28 + labelLines.length * 20, { class: 'sw-node-detail' }, Math.max(12, Math.floor((node.w - 28) / 7)), 17));
+        svg.append(group); nodeElements.set(node.id, group);
+      }
+      function highlight(selection) {
+        const nodes = new Set(selection.nodes || []), edges = new Set(selection.edges || []);
+        for (const edge of map.edges) if (edges.has(edge.id)) { nodes.add(edge.from); nodes.add(edge.to); }
+        for (const [id, node] of nodeElements) node.dataset.active = String(nodes.has(id));
+        for (const [id, edge] of edgeElements) edge.dataset.active = String(edges.has(id));
+      }
+      return { view: viewport(svg, `${map.title}, horizontally scrollable`), highlight };
+    }
+    if (model.map) {
+      const map = model.map;
+      const block = section(`${uid}-map`, '01 · ONE MODEL, SEVERAL QUESTIONS', map.title, map.description);
+      block.dataset.view = 'map';
+      const controls = el('div', { class: 'sw-controls', role: 'group', 'aria-label': 'Map lenses' });
+      const diagram = mapDiagram(`${uid}-map-svg`), host = el('div', { class: 'sw-inspector-host' });
+      const allButtons = [];
+      function select(item, active) {
+        for (const control of allButtons) control.setAttribute('aria-pressed', String(control === active));
+        diagram.highlight(item); host.replaceChildren(inspector(item));
+        block.dataset.selection = item.id;
+      }
+      const lenses = map.lenses.map(item => {
+        const control = button(item.label, { 'data-lens': item.id, 'aria-pressed': 'false' });
+        control.addEventListener('click', () => select(item, control)); controls.append(control); allButtons.push(control); return control;
+      });
+      keyboardGroup(controls, lenses, i => select(map.lenses[i], lenses[i]), true);
+      block.append(controls);
+      if (map.intents?.length) {
+        const intentControls = el('div', { class: 'sw-controls sw-intents', role: 'group', 'aria-label': 'Feature intents' }, el('span', { class: 'sw-control-label' }, 'Follow an action'));
+        const intents = map.intents.map(item => {
+          const control = button(item.label, { 'data-intent': item.id, 'aria-pressed': 'false' });
+          control.addEventListener('click', () => select(item, control)); intentControls.append(control); allButtons.push(control); return control;
+        });
+        keyboardGroup(intentControls, intents, i => select(map.intents[i], intents[i]), true);
+        block.append(intentControls);
+      }
+      const layout = el('div', { class: 'sw-map-layout' }, diagram.view, host);
+      layout.style.setProperty('--sw-map-width', `${map.width + 2}px`);
+      block.append(legend(), layout, textAlternative('Read the map as text', [
+        el('h3', {}, 'Components'), el('dl', { class: 'sw-state' }, map.nodes.map(node => el('div', {}, el('dt', {}, node.label), el('dd', {}, node.detail)))),
+        el('h3', {}, 'Directed relationships'), el('ul', {}, map.edges.map(edge => el('li', {}, `${map.nodes.find(n => n.id === edge.from).label} → ${map.nodes.find(n => n.id === edge.to).label}: ${edge.label} (${edge.kind})`))),
+        ...[...map.lenses, ...(map.intents || [])].map(item => el('article', {}, el('h3', {}, item.title), para(item.body), evidence(item.claims)))
+      ]));
+      root.append(block); select(map.lenses[0], lenses[0]);
+    }
+    if (model.walkthrough) {
+      const walk = model.walkthrough;
+      const block = section(`${uid}-walk`, '02 · FOLLOW ONE CONCRETE PATH', walk.title, walk.intro);
+      block.dataset.view = 'walkthrough';
+      const diagram = mapDiagram(`${uid}-walk-svg`);
+      const list = el('ol', { class: 'sw-step-list', role: 'list', 'aria-label': 'Walkthrough steps' });
+      const host = el('div', { class: 'sw-inspector-host' });
+      const previous = button('← Previous'), next = button('Next →');
+      const position = el('span', { class: 'sw-position', 'aria-live': 'off' });
+      let current = 0;
+      const buttons = walk.steps.map((step, i) => {
+        const control = button([String(i + 1).padStart(2, '0'), ' · ', step.title].join(''), { 'data-step': step.id });
+        control.addEventListener('click', () => select(i)); list.append(el('li', {}, control)); return control;
+      });
+      function select(i) {
+        current = Math.max(0, Math.min(walk.steps.length - 1, i));
+        const step = walk.steps[current];
+        buttons.forEach((control, index) => { control.setAttribute('aria-current', index === current ? 'step' : 'false'); control.dataset.active = String(index === current); });
+        previous.disabled = current === 0; next.disabled = current === walk.steps.length - 1;
+        position.textContent = `${current + 1} / ${walk.steps.length}`;
+        diagram.highlight(step); host.replaceChildren(inspector(step, `STEP ${current + 1}`)); block.dataset.selection = step.id;
+      }
+      previous.addEventListener('click', () => select(current - 1)); next.addEventListener('click', () => select(current + 1));
+      keyboardGroup(list, buttons, select);
+      block.append(legend(), diagram.view, el('div', { class: 'sw-step-navigation', role: 'group', 'aria-label': 'Walkthrough navigation' }, previous, position, next),
+        el('div', { class: 'sw-walk-layout' }, list, host),
+        textAlternative('Read every walkthrough step', walk.steps.map((step, i) => el('article', {}, el('h3', {}, `${i + 1}. ${step.title}`), para(step.body), para(`Why: ${step.why}`), para(`Boundary: ${step.boundary}`), statePanel(step.state), evidence(step.claims)))));
+      root.append(block); select(0);
+    }
+    if (model.sequence) {
+      const sequence = model.sequence;
+      const lanes = indexById(sequence.lanes);
+      const block = section(`${uid}-sequence`, '03 · CHANGE THE CONDITIONS', sequence.title, sequence.intro);
+      block.dataset.view = 'sequence';
+      const scenarioControls = el('div', { class: 'sw-controls', role: 'group', 'aria-label': 'Sequence scenarios' });
+      const summary = el('div', { class: 'sw-scenario-summary' });
+      const diagramHost = el('div');
+      const eventList = el('ol', { class: 'sw-step-list', 'aria-label': 'Sequence events' });
+      const host = el('div', { class: 'sw-inspector-host' });
+      const previous = button('← Previous'), next = button('Next →'), position = el('span', { class: 'sw-position' });
+      let scenarioIndex = 0, eventIndex = 0, eventButtons = [], eventGroups = [], scrollPanel, laneHeader;
+      const scenarioButtons = sequence.scenarios.map((scenario, i) => {
+        const control = button(scenario.label, { 'data-scenario': scenario.id, 'aria-pressed': 'false' });
+        control.addEventListener('click', () => selectScenario(i)); scenarioControls.append(control); return control;
+      });
+      const laneX = new Map(sequence.lanes.map((lane, i) => [lane.id, 125 + i * 195]));
+      function drawScenario(scenario) {
+        const width = Math.max(480, 180 + sequence.lanes.length * 195), height = 105 + scenario.events.length * 86;
+        const prefix = `${uid}-sequence-${scenario.id}`;
+        const svg = makeSvg(prefix, `${sequence.title}: ${scenario.label}`, `${scenario.summary} Time runs downward. Arrowheads point to receivers. Numbered rows correspond to the event controls below.`, width, height);
+        laneHeader = makeSvg(`${prefix}-lanes`, 'Sequence lane owners', 'Lane labels stay aligned with the sequence while its content scrolls.', width, 64);
+        laneHeader.dataset.sequenceHeader = '';
+        sequence.lanes.forEach(lane => {
+          const x = laneX.get(lane.id), color = roles.get(lane.role).color;
+          svg.append(svgEl('line', { x1: x, y1: 64, x2: x, y2: height - 22, class: 'sw-lifeline' }));
+          laneHeader.append(svgEl('g', { 'data-lane': lane.id, 'data-color': color },
+            svgEl('rect', { x: x - 88, y: 9, width: 176, height: 49, rx: 8, class: 'sw-lane-box', 'data-color': color }),
+            svgText(lane.label, x, 30, { class: 'sw-lane-label', 'text-anchor': 'middle' }, 20, 17)));
+        });
+        eventGroups = scenario.events.map((event, i) => {
+          const from = laneX.get(event.from), to = laneX.get(event.to), y = 105 + i * 86;
+          const color = roles.get(lanes.get(event.from).role).color;
+          const group = svgEl('g', { class: 'sw-sequence-event', 'data-event': event.id, 'data-edge': event.id, 'data-from': event.from, 'data-to': event.to, 'data-kind': event.kind, 'data-color': color });
+          group.append(svgEl('title', {}, `${i + 1}. ${lanes.get(event.from).label} → ${lanes.get(event.to).label}: ${event.label}`),
+            svgEl('rect', { class: 'sw-sequence-row', x: 10, y: y - 34, width: width - 20, height: 75, rx: 7 }),
+            svgEl('text', { x: 25, y: y + 5, class: 'sw-row-number' }, String(i + 1).padStart(2, '0')));
+          const path = from === to ? `M${from},${y} h68 v26 h-68` : `M${from},${y} H${to}`;
+          const lineLimit = from === to ? 20 : Math.max(18, Math.floor(Math.abs(to - from) / 8));
+          const labelLines = words(event.label, lineLimit).length;
+          group.append(svgEl('path', { d: path, class: 'sw-message', 'marker-end': `url(#${prefix}-${color})` }),
+            svgText(event.label, from === to ? from + 85 : (from + to) / 2, y - 12 - (labelLines - 1) * 17, { class: 'sw-edge-label', 'text-anchor': from === to ? 'start' : 'middle' }, lineLimit, 17));
+          svg.append(group); return group;
+        });
+        const view = viewport(svg, `${scenario.label} sequence, scrollable`);
+        view.querySelector('.sw-viewport').classList.add('sw-sequence-viewport');
+        scrollPanel = view.querySelector('.sw-viewport');
+        scrollPanel.prepend(el('div', { class: 'sw-sequence-sticky' }, laneHeader));
+        diagramHost.replaceChildren(view);
+      }
+      function selectEvent(i, scroll = false) {
+        const scenario = sequence.scenarios[scenarioIndex];
+        eventIndex = Math.max(0, Math.min(scenario.events.length - 1, i));
+        const event = scenario.events[eventIndex];
+        eventGroups.forEach((group, index) => { group.dataset.active = String(index === eventIndex); group.dataset.past = String(index < eventIndex); });
+        eventButtons.forEach((control, index) => { control.setAttribute('aria-current', index === eventIndex ? 'step' : 'false'); control.dataset.active = String(index === eventIndex); });
+        previous.disabled = eventIndex === 0; next.disabled = eventIndex === scenario.events.length - 1;
+        position.textContent = `${eventIndex + 1} / ${scenario.events.length}`;
+        host.replaceChildren(inspector({ ...event, title: event.label }, `EVENT ${eventIndex + 1} · ${lanes.get(event.from).label} → ${lanes.get(event.to).label}`));
+        block.dataset.selection = event.id;
+        if (scroll) {
+          const row = eventGroups[eventIndex].getBoundingClientRect();
+          const panel = scrollPanel.getBoundingClientRect();
+          const headerHeight = laneHeader.getBoundingClientRect().height;
+          if (row.top < panel.top + headerHeight + 12 || row.bottom > panel.bottom) scrollPanel.scrollTop += row.top - panel.top - headerHeight - 18;
+          const path = eventGroups[eventIndex].querySelector('.sw-message');
+          const message = path.getBoundingClientRect();
+          const label = eventGroups[eventIndex].querySelector('.sw-edge-label').getBoundingClientRect();
+          let left = Math.min(message.left, label.left), right = Math.max(message.right, label.right);
+          const margin = 24, visibleRight = panel.left + scrollPanel.clientWidth;
+          const owners = [...laneHeader.querySelectorAll('[data-lane]')]
+            .filter(lane => lane.dataset.lane === event.from || lane.dataset.lane === event.to)
+            .map(lane => lane.querySelector('text').getBoundingClientRect());
+          const ownerLeft = Math.min(left, ...owners.map(owner => owner.left));
+          const ownerRight = Math.max(right, ...owners.map(owner => owner.right));
+          if (ownerRight - ownerLeft <= scrollPanel.clientWidth - margin * 2) {
+            left = ownerLeft; right = ownerRight;
+          }
+          if (right - left <= scrollPanel.clientWidth - margin * 2) {
+            if (left < panel.left + margin) scrollPanel.scrollLeft += left - panel.left - margin;
+            else if (right > visibleRight - margin) scrollPanel.scrollLeft += right - visibleRight + margin;
+          } else {
+            const end = path.getPointAtLength(path.getTotalLength());
+            const destination = new DOMPoint(end.x, end.y).matrixTransform(path.getScreenCTM());
+            if (destination.x < panel.left + margin) scrollPanel.scrollLeft += destination.x - panel.left - margin;
+            else if (destination.x > visibleRight - margin) scrollPanel.scrollLeft += destination.x - visibleRight + margin;
+          }
+        }
+      }
+      function selectScenario(i) {
+        scenarioIndex = i;
+        const scenario = sequence.scenarios[i];
+        scenarioButtons.forEach((control, index) => control.setAttribute('aria-pressed', String(index === i)));
+        summary.replaceChildren(para('Source-derived illustrative scenario · no measured timing', 'sw-kicker'), para(scenario.summary), el('ul', { class: 'sw-assumptions' }, scenario.assumptions.map(item => el('li', {}, item))));
+        drawScenario(scenario); eventList.replaceChildren();
+        eventButtons = scenario.events.map((event, index) => {
+          const control = button(`${String(index + 1).padStart(2, '0')} · ${event.label}`, { 'data-event-select': event.id });
+          control.addEventListener('click', () => selectEvent(index, true)); eventList.append(el('li', {}, control)); return control;
+        });
+        block.dataset.scenario = scenario.id; selectEvent(0);
+      }
+      previous.addEventListener('click', () => selectEvent(eventIndex - 1, true)); next.addEventListener('click', () => selectEvent(eventIndex + 1, true));
+      eventList.addEventListener('keydown', event => {
+        const current = eventButtons.indexOf(event.target.closest('button'));
+        if (current < 0 || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? eventButtons.length - 1 : Math.max(0, Math.min(eventButtons.length - 1, current + (['ArrowRight', 'ArrowDown'].includes(event.key) ? 1 : -1)));
+        selectEvent(nextIndex, true); eventButtons[nextIndex].focus({ preventScroll: true });
+      });
+      keyboardGroup(scenarioControls, scenarioButtons, selectScenario, true);
+      block.append(scenarioControls, summary, legend(), diagramHost,
+        el('div', { class: 'sw-step-navigation', role: 'group', 'aria-label': 'Sequence navigation' }, previous, position, next),
+        el('div', { class: 'sw-walk-layout' }, eventList, host),
+        textAlternative('Read all scenarios and directed exchanges', sequence.scenarios.map(scenario => el('article', {}, el('h3', {}, scenario.label), para(scenario.summary), el('ul', {}, scenario.assumptions.map(item => el('li', {}, item))), el('ol', {}, scenario.events.map(event => el('li', {}, el('h4', {}, `${lanes.get(event.from).label} → ${lanes.get(event.to).label}: ${event.label}`), para(event.body), statePanel(event.state), evidence(event.claims))))))));
+      root.append(block); selectScenario(0);
+    }
+    const sourceSection = section(`${uid}-sources`, 'EVIDENCE & BOUNDARIES', 'Sources and limits', 'This is a source-derived explanation. Scenarios illustrate supported behavior; they are not recorded execution traces.');
+    sourceSection.append(el('h3', {}, 'Pinned project'), para(`${model.project.name} ${model.project.version} · ${model.project.license}`), link(model.project.revision, `${model.project.repository}/tree/${model.project.revision}`),
+      el('h3', {}, 'Primary evidence'), el('ol', { class: 'sw-source-catalog' }, model.sources.map(source => el('li', { id: `${uid}-source-${source.id}` }, link(source.label, source.url), source.note ? para(source.note) : null))),
+      el('h3', {}, 'What this model leaves out'), el('ul', {}, model.limits.map(item => el('li', {}, item))),
+      textAlternative('Inspect every claim and its evidence', model.claims.map(claim => el('article', {}, el('h4', {}, claim.text), para(claim.kind === 'inference' ? 'Inference from the sources below.' : 'Source-backed assertion.'), sourceLinks(claim.sources)))));
+    root.append(sourceSection, el('footer', { class: 'sw-footer' }, para('Created with AI assistance and checked against the linked primary sources. Interpret the model within its stated scope and assumptions.'), link('System Walkthrough skill & reusable components', 'https://github.com/EvanOman/claude-skills-public/tree/main/skills/system-walkthrough')));
+    let printClosed = [];
+    function beforePrint() {
+      printClosed = [...root.querySelectorAll('details:not([open])')];
+      printClosed.forEach(item => { item.open = true; });
+    }
+    function afterPrint() { printClosed.forEach(item => { item.open = false; }); printClosed = []; }
+    global.addEventListener('beforeprint', beforePrint);
+    global.addEventListener('afterprint', afterPrint);
+    return { destroy() {
+      global.removeEventListener('beforeprint', beforePrint);
+      global.removeEventListener('afterprint', afterPrint);
+      root.replaceChildren(); root.classList.remove('sw');
+    } };
+  }
+  global.SystemWalkthrough = Object.freeze({ mount });
+})(window);
+</script><script>SystemWalkthrough.mount(document.getElementById('walkthrough'),JSON.parse(document.getElementById('walkthrough-model').textContent));</script></body></html>
