@@ -60,8 +60,13 @@ Publish only within the user's authorization and the destination's normal workfl
 Read [quality.md](references/quality.md) before delivery. Open the actual output in
 a browser and exercise every lens, intent, step, scenario and return path, direct
 selection, keyboard navigation, theme persistence and text alternatives. Inspect at
-1440, 900 and 390 widths; label fit and directionality need visual inspection, not
-just a schema pass. Dense diagrams may scroll internally; the document must not.
+1440, 900 and 390 widths, including short laptop/panel heights. A reader must be
+able to see the highlighted diagram, read its current explanation and reach
+Previous/Next together. Use the bundled reading stage; do not stack an unbounded
+diagram above the explanation or make readers scroll the document between each
+step. Long state/evidence content and dense diagrams can scroll inside their own
+panels. Verify this physical-viewport relationship with real input; correct DOM
+state and zero page overflow alone do not establish usable navigation.
 
 For a substantial guide, give an independent reviewer the model and primary sources.
 Ask for counterexamples, unsupported causality and misleading arrows. Fix material

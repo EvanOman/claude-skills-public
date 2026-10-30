@@ -1,40 +1,36 @@
 {
   "input": "index.html",
-  "sha256": "99abb1b8076f7741abcc2992958c659eaab3cd31f4c0f2e93a60df4c2eb968a8",
-  "checkedAt": "2026-10-30T20:09:50.555Z",
+  "sha256": "79b8b5396073c7bf785da2f3d6ee7fd60f1afcd676437cae848edf825892a825",
+  "checkedAt": "2026-10-30T22:17:04.017Z",
   "browser": "Chrome/156.0.8078.79",
   "viewports": [
     {
       "title": "An absent consumer leaves pending work",
       "revision": "29173b67508b2de4c0f0ed551f3b47cf19fc3ca8",
       "width": 1440,
+      "height": 800,
       "screenshots": [
-        "map-1440.png",
-        "sequence-1440.png"
+        "valkey-desktop.png"
       ],
-      "checks": 854,
+      "checks": 1038,
       "failures": []
     },
     {
       "title": "An absent consumer leaves pending work",
       "revision": "29173b67508b2de4c0f0ed551f3b47cf19fc3ca8",
       "width": 900,
-      "screenshots": [
-        "map-900.png",
-        "sequence-900.png"
-      ],
-      "checks": 854,
+      "height": 700,
+      "screenshots": [],
+      "checks": 1038,
       "failures": []
     },
     {
       "title": "An absent consumer leaves pending work",
       "revision": "29173b67508b2de4c0f0ed551f3b47cf19fc3ca8",
       "width": 390,
-      "screenshots": [
-        "map-390.png",
-        "sequence-390.png"
-      ],
-      "checks": 854,
+      "height": 844,
+      "screenshots": [],
+      "checks": 1038,
       "failures": []
     }
   ],
@@ -57,8 +53,8 @@
     "Source hrefs and rendered evidence are checked locally; remote target availability is separate."
   ],
   "summary": {
-    "checks": 2565,
-    "passed": 2565,
+    "checks": 3117,
+    "passed": 3117,
     "failed": 0
   }
 }

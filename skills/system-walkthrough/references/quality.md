@@ -7,6 +7,33 @@ coordinates deliberately. No layout service is required. Give requests and retur
 separate routes where they would overlap. Check arrowheads at BOTH active and muted
 states. Do not trade readable SVG text for fitting every diagram on a phone.
 
+## Read while looking at the diagram
+
+Treat the diagram, active explanation and navigation as one reading task. They
+must remain available together at the actual viewport height. A diagram that fits
+its own scroll panel can still push the explanation or Next button off the screen.
+Do not enlarge an SVG merely to fill a wide document column; use native readable
+scale and a bounded viewport when the diagram is dense.
+
+The shared renderer budgets a reading stage for the viewport: diagram/reader
+columns where space permits, bounded rows on narrow screens, and navigation outside
+the scrolling panels. Keep the active title and explanation first. Put long state,
+evidence, assumptions and the full step index behind scrolling or disclosures that
+preserve access to the diagram and navigation. Reset the reader to its new heading
+on selection; reveal relevant diagram content without scrolling the outer document.
+Primary section links should reach this usable reading area.
+
+For very short windows or large browser zoom, allow document scrolling rather
+than crushing both panels into unusable strips. Verify that this fallback leaves
+all content and controls reachable; test a short landscape viewport as well.
+
+Test a reader task, not just isolated controls: read a highlighted step, advance
+three times with the pointer, move back with the keyboard, inspect state/evidence,
+then choose a distant step or another scenario. The diagram, current explanation
+and Previous/Next must be visible together throughout the task. Avoid overlays
+that cover the active diagram, tiny text, or a toolbar that consumes the whole
+mobile screen. Preserve full text and unbounded print alternatives.
+
 ## Browser checks
 
 For output built by the bundled helper, run the optional dependency-free verifier
@@ -27,12 +54,18 @@ Its mutation test proves that removing a real arrowhead is detected:
 RUN_BROWSER_TESTS=1 node --test <skill>/tests/browser-check.test.mjs
 ```
 
-At 1440, 900 and 390 widths:
+Use realistic width **and height** pairs, including 1440×800, 900×700 and 390×844:
 
 - Visit every lens and intent. Confirm stable node positions and the intended active
   nodes/edges, including return direction. Inspect long labels, crossings and clipping.
 - Select first, middle and last steps directly and via Previous/Next. Try arrows,
   Home and End from the step controls. Focus and the active inspector must agree.
+- Anchor the reading stage and verify that the diagram viewport, active title/body
+  and navigation intersect the physical screen together. Exercise real pointer or
+  keyboard input without a preparatory page scroll before every Next click. Scroll
+  the reader into long state/evidence, then advance: the next heading must reappear
+  while the diagram and navigation remain available. Check actual hit targets and
+  clipping; injected `.click()` calls can activate invisible controls.
 - Visit every scenario and event, including return paths and failure endings. Change
   scenarios after reaching their last event; state must reset to the new first event.
   Jump backward/directly to prove snapshots do not depend on visit history.

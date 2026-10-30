@@ -40,6 +40,9 @@ state store at the chosen level of abstraction.
 
 Keep box heights large enough for wrapped detail text; inspect the built glyphs.
 Start with short labels, then use an extra row or more width when it is earned.
+The reading stage keeps the diagram beside or above its explanation within a
+viewport budget. Large coordinates mean internal panning, not automatic enlargement
+or text shrinking. Keep the selected path understandable in that bounded view.
 
 Edges are `{id, from, to, label, kind, via?}`. Endpoints are node IDs; `kind` is
 `request`, `return`, `data`, or `control`. The renderer clips straight edges to
@@ -63,6 +66,9 @@ the map and claim IDs. `boundary` says what boundary is crossed, or explicitly
 that this is local work. `state` is an array of `{owner, detail}` strings describing
 the state AFTER this step. Use explicit full snapshots of relevant state, not
 an ambiguous patch carried over from whichever step the reader visited last.
+Lead `body` with the explanation a reader needs while viewing the highlight. Keep
+supporting `why`, state and evidence available without making the primary text or
+navigation depend on scrolling past the diagram.
 Titles omit numeric prefixes; the controls number them automatically. State snapshots
 must distinguish an empty object from one that has not yet been created, and receipt
 of a request from its completion or reply.
